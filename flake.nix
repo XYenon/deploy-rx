@@ -35,8 +35,15 @@
 
           cargoLock.lockFile = ./Cargo.lock;
 
+          nativeBuildInputs = [ final.makeWrapper ];
+
+          postFixup = ''
+            wrapProgram "$out/bin/deploy" \
+              --prefix PATH : ${final.lib.makeBinPath [ final."nix-output-monitor" ]}
+          '';
+
           meta = {
-            description = "A Simple multi-profile Nix-flake deploy tool"; 
+            description = "A Simple multi-profile Nix-flake deploy tool";
             mainProgram = "deploy";
           };
         };

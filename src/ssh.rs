@@ -177,11 +177,7 @@ impl SshMultiplexer {
         ssh_user: Option<&str>,
         ssh_opts: &[String],
     ) -> Result<Arc<SshControlMaster>, SshError> {
-        let key = format!(
-            "{}@{}",
-            ssh_user.unwrap_or(""),
-            hostname
-        );
+        let key = format!("{}@{}", ssh_user.unwrap_or(""), hostname);
 
         let mut masters = self.masters.lock().await;
 

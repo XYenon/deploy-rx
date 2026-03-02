@@ -4,7 +4,7 @@
 //
 // SPDX-License-Identifier: MPL-2.0
 
-use log::{debug, info, trace};
+use log::{debug, info, trace, warn};
 use std::path::Path;
 use thiserror::Error;
 use tokio::{io::AsyncWriteExt, process::Command};
@@ -144,7 +144,10 @@ fn build_wait_command(data: &WaitCommandData) -> String {
         data.temp_path.display(),
     );
     if let Some(activation_timeout) = data.activation_timeout {
-        self_activate_command = format!("{} --activation-timeout {}", self_activate_command, activation_timeout);
+        self_activate_command = format!(
+            "{} --activation-timeout {}",
+            self_activate_command, activation_timeout
+        );
     }
 
     if let Some(sudo_cmd) = &data.sudo {
@@ -242,20 +245,236 @@ fn test_revoke_command_builder() {
     );
 }
 
-async fn handle_sudo_stdin(ssh_activate_child: &mut tokio::process::Child, deploy_defs: &DeployDefs) -> Result<(), std::io::Error> {
+fn build_review_changes_command(
+    sudo: &Option<String>,
+    profile_info: &ProfileInfo,
+    closure: &str,
+) -> String {
+    let mut command = format!("{}/activate-rs dry-diff", closure);
+
+    match profile_info {
+        ProfileInfo::ProfilePath { profile_path } => {
+            command.push_str(&format!(" --profile-path '{}'", profile_path));
+        }
+        ProfileInfo::ProfileUserAndName {
+            profile_user,
+            profile_name,
+        } => {
+            command.push_str(&format!(
+                " --profile-user '{}' --profile-name '{}'",
+                profile_user, profile_name
+            ));
+        }
+    }
+
+    command.push_str(&format!(" '{}'", closure));
+
+    if let Some(sudo_cmd) = sudo {
+        command = format!("{} {}", sudo_cmd, command);
+    }
+
+    command
+}
+
+fn ansi_wrap(use_colors: bool, style: &str, text: &str) -> String {
+    if use_colors {
+        format!("\x1b[{}m{}\x1b[0m", style, text)
+    } else {
+        text.to_string()
+    }
+}
+
+fn review_colors_enabled() -> bool {
+    std::env::var_os("NO_COLOR").is_none()
+}
+
+fn highlight_review_line(line: &str, use_colors: bool) -> String {
+    if line.starts_with("Derivation changes for ") {
+        return ansi_wrap(use_colors, "1;36", line);
+    }
+
+    if line.starts_with("No existing generation found")
+        || line.starts_with("No derivation changes detected")
+        || line.starts_with("Unable to resolve profile path")
+        || line.starts_with("Unable to run 'nix store diff-closures'")
+    {
+        return ansi_wrap(use_colors, "33", line);
+    }
+
+    if line.starts_with("warning:") {
+        return ansi_wrap(use_colors, "33", line);
+    }
+
+    if line.starts_with("error:") {
+        return ansi_wrap(use_colors, "31", line);
+    }
+
+    line.to_string()
+}
+
+fn highlight_review_output(output: &str, use_colors: bool) -> String {
+    let mut rendered = String::with_capacity(output.len());
+
+    for chunk in output.split_inclusive('\n') {
+        if let Some(line) = chunk.strip_suffix('\n') {
+            rendered.push_str(&highlight_review_line(line, use_colors));
+            rendered.push('\n');
+        } else {
+            rendered.push_str(&highlight_review_line(chunk, use_colors));
+        }
+    }
+
+    rendered
+}
+
+fn print_review_output(output: &[u8], use_colors: bool, stderr: bool) {
+    if output.is_empty() {
+        return;
+    }
+
+    let highlighted = highlight_review_output(&String::from_utf8_lossy(output), use_colors);
+
+    if stderr {
+        eprint!("{}", highlighted);
+    } else {
+        print!("{}", highlighted);
+    }
+}
+
+#[test]
+fn test_review_changes_command_builder_with_explicit_profile_path() {
+    let command = build_review_changes_command(
+        &None,
+        &ProfileInfo::ProfilePath {
+            profile_path: "/nix/var/nix/profiles/system".to_string(),
+        },
+        "/nix/store/new-profile",
+    );
+
+    assert!(command.contains("/nix/store/new-profile/activate-rs dry-diff"));
+    assert!(command.contains("--profile-path '/nix/var/nix/profiles/system'"));
+    assert!(command.contains("'/nix/store/new-profile'"));
+}
+
+#[test]
+fn test_review_changes_command_builder_with_system_manager_profile() {
+    let command = build_review_changes_command(
+        &None,
+        &ProfileInfo::ProfileUserAndName {
+            profile_user: "root".to_string(),
+            profile_name: "system-manager".to_string(),
+        },
+        "/nix/store/new-profile",
+    );
+
+    assert!(command.contains("/nix/store/new-profile/activate-rs dry-diff"));
+    assert!(command.contains("--profile-user 'root'"));
+    assert!(command.contains("--profile-name 'system-manager'"));
+    assert!(command.contains("'/nix/store/new-profile'"));
+}
+
+#[test]
+fn test_highlight_review_output_preserves_newlines() {
+    assert_eq!(
+        highlight_review_output("line1\nline2\n", false),
+        "line1\nline2\n".to_string()
+    );
+}
+
+#[derive(Error, Debug)]
+pub enum ReviewProfileChangesError {
+    #[error("Failed to spawn change-review command over SSH: {0}")]
+    SSHReviewSpawn(std::io::Error),
+    #[error("Failed to run change-review command over SSH: {0}")]
+    SSHReview(std::io::Error),
+}
+
+async fn review_profile_changes(
+    deploy_data: &super::DeployData<'_>,
+    deploy_defs: &super::DeployDefs,
+    profile_info: &ProfileInfo,
+    ssh_addr: &str,
+) -> Result<(), ReviewProfileChangesError> {
+    info!(
+        "Reviewing derivation changes before activation for profile `{}` on node `{}`",
+        deploy_data.profile_name, deploy_data.node_name
+    );
+
+    let review_command = build_review_changes_command(
+        &deploy_defs.sudo,
+        profile_info,
+        &deploy_data.profile.profile_settings.path,
+    );
+
+    debug!("Constructed change-review command: {}", review_command);
+
+    let mut ssh_review_command = Command::new("ssh");
+    ssh_review_command
+        .arg(ssh_addr)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+
+    for ssh_opt in &deploy_data.merged_settings.ssh_opts {
+        ssh_review_command.arg(ssh_opt);
+    }
+
+    let mut ssh_review_child = ssh_review_command
+        .arg(review_command)
+        .spawn()
+        .map_err(ReviewProfileChangesError::SSHReviewSpawn)?;
+
+    if deploy_data
+        .merged_settings
+        .interactive_sudo
+        .unwrap_or(false)
+    {
+        trace!("[review] Piping in sudo password");
+        handle_sudo_stdin(&mut ssh_review_child, deploy_defs)
+            .await
+            .map_err(ReviewProfileChangesError::SSHReview)?;
+    }
+
+    let ssh_review_output = ssh_review_child
+        .wait_with_output()
+        .await
+        .map_err(ReviewProfileChangesError::SSHReview)?;
+
+    let use_colors = review_colors_enabled();
+    print_review_output(&ssh_review_output.stdout, use_colors, false);
+    print_review_output(&ssh_review_output.stderr, use_colors, true);
+
+    if ssh_review_output.status.code() != Some(0) {
+        warn!(
+            "Change-review command exited with status {:?}; continuing deployment",
+            ssh_review_output.status.code()
+        );
+    }
+
+    Ok(())
+}
+
+async fn handle_sudo_stdin(
+    ssh_activate_child: &mut tokio::process::Child,
+    deploy_defs: &DeployDefs,
+) -> Result<(), std::io::Error> {
     match ssh_activate_child.stdin.as_mut() {
         Some(stdin) => {
-            let _ = stdin.write_all(format!("{}\n",deploy_defs.sudo_password.clone().unwrap_or("".to_string())).as_bytes()).await;
+            let _ = stdin
+                .write_all(
+                    format!(
+                        "{}\n",
+                        deploy_defs.sudo_password.clone().unwrap_or("".to_string())
+                    )
+                    .as_bytes(),
+                )
+                .await;
             Ok(())
         }
-        None => {
-            Err(
-                std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "Failed to open stdin for sudo command",
-                )
-            )
-        }
+        None => Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "Failed to open stdin for sudo command",
+        )),
     }
 }
 
@@ -300,8 +519,12 @@ pub async fn confirm_profile(
         .arg(confirm_command)
         .spawn()
         .map_err(ConfirmProfileError::SSHConfirm)?;
-    
-    if deploy_data.merged_settings.interactive_sudo.unwrap_or(false) {
+
+    if deploy_data
+        .merged_settings
+        .interactive_sudo
+        .unwrap_or(false)
+    {
         trace!("[confirm] Piping in sudo password");
         handle_sudo_stdin(&mut ssh_confirm_child, deploy_defs)
             .await
@@ -311,7 +534,7 @@ pub async fn confirm_profile(
     let ssh_confirm_exit_status = ssh_confirm_child
         .wait()
         .await
-        .map_err(ConfirmProfileError::SSHConfirm)?; 
+        .map_err(ConfirmProfileError::SSHConfirm)?;
 
     match ssh_confirm_exit_status.code() {
         Some(0) => (),
@@ -355,6 +578,7 @@ pub async fn deploy_profile(
     dry_activate: bool,
     boot: bool,
     rollback_fresh_connection: bool,
+    review_changes: bool,
 ) -> Result<(), DeployProfileError> {
     if !dry_activate {
         info!(
@@ -376,9 +600,11 @@ pub async fn deploy_profile(
 
     let auto_rollback = deploy_data.merged_settings.auto_rollback.unwrap_or(true);
 
+    let profile_info = deploy_data.get_profile_info()?;
+
     let self_activate_command = build_activate_command(&ActivateCommandData {
         sudo: &deploy_defs.sudo,
-        profile_info: &deploy_data.get_profile_info()?,
+        profile_info: &profile_info,
         closure: &deploy_data.profile.profile_settings.path,
         auto_rollback,
         temp_path: temp_path,
@@ -399,6 +625,17 @@ pub async fn deploy_profile(
 
     let ssh_addr = format!("{}@{}", deploy_defs.ssh_user, hostname);
 
+    if review_changes {
+        if let Err(err) =
+            review_profile_changes(deploy_data, deploy_defs, &profile_info, &ssh_addr).await
+        {
+            warn!(
+                "Failed to review derivation changes before activation for `{}` on `{}`: {}",
+                deploy_data.profile_name, deploy_data.node_name, err
+            );
+        }
+    }
+
     let mut ssh_activate_command = Command::new("ssh");
     ssh_activate_command
         .arg(&ssh_addr)
@@ -414,7 +651,11 @@ pub async fn deploy_profile(
             .spawn()
             .map_err(DeployProfileError::SSHSpawnActivate)?;
 
-        if deploy_data.merged_settings.interactive_sudo.unwrap_or(false) {
+        if deploy_data
+            .merged_settings
+            .interactive_sudo
+            .unwrap_or(false)
+        {
             trace!("[activate] Piping in sudo password");
             handle_sudo_stdin(&mut ssh_activate_child, deploy_defs)
                 .await
@@ -455,7 +696,11 @@ pub async fn deploy_profile(
             .spawn()
             .map_err(DeployProfileError::SSHSpawnActivate)?;
 
-        if deploy_data.merged_settings.interactive_sudo.unwrap_or(false) {
+        if deploy_data
+            .merged_settings
+            .interactive_sudo
+            .unwrap_or(false)
+        {
             trace!("[activate] Piping in sudo password");
             handle_sudo_stdin(&mut ssh_activate_child, deploy_defs)
                 .await
@@ -468,7 +713,7 @@ pub async fn deploy_profile(
         ssh_wait_command
             .arg(&ssh_addr)
             .stdin(std::process::Stdio::piped());
-        
+
         if rollback_fresh_connection {
             let ssh_opts = &deploy_data.merged_settings.ssh_opts;
             let mut i = 0;
@@ -521,7 +766,11 @@ pub async fn deploy_profile(
             .spawn()
             .map_err(DeployProfileError::SSHWait)?;
 
-        if deploy_data.merged_settings.interactive_sudo.unwrap_or(false) {
+        if deploy_data
+            .merged_settings
+            .interactive_sudo
+            .unwrap_or(false)
+        {
             trace!("[wait] Piping in sudo password");
             handle_sudo_stdin(&mut ssh_wait_child, deploy_defs)
                 .await
@@ -545,7 +794,9 @@ pub async fn deploy_profile(
         info!("Success activating, attempting to confirm activation");
 
         let c = confirm_profile(deploy_data, deploy_defs, temp_path, &ssh_addr).await;
-        recv_activated.await.map_err(|x| DeployProfileError::SSHActivateTimeout(x))?;
+        recv_activated
+            .await
+            .map_err(|x| DeployProfileError::SSHActivateTimeout(x))?;
         c?;
 
         thread
@@ -604,7 +855,11 @@ pub async fn revoke(
         .spawn()
         .map_err(RevokeProfileError::SSHSpawnRevoke)?;
 
-    if deploy_data.merged_settings.interactive_sudo.unwrap_or(false) {
+    if deploy_data
+        .merged_settings
+        .interactive_sudo
+        .unwrap_or(false)
+    {
         trace!("[revoke] Piping in sudo password");
         handle_sudo_stdin(&mut ssh_revoke_child, deploy_defs)
             .await

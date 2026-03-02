@@ -194,7 +194,7 @@ fn parse_fragment(fragment: &str) -> Result<(Option<String>, Option<String>), Pa
 
     let first_child = match ast.root().node().first_child() {
         Some(x) => x,
-        None => return Ok((None, None))
+        None => return Ok((None, None)),
     };
 
     let mut node_over = false;
@@ -233,7 +233,7 @@ fn parse_fragment(fragment: &str) -> Result<(Option<String>, Option<String>), Pa
     Ok((node, profile))
 }
 
-pub fn parse_flake(flake: &str) -> Result<DeployFlake, ParseFlakeError> {
+pub fn parse_flake(flake: &str) -> Result<DeployFlake<'_>, ParseFlakeError> {
     let flake_fragment_start = flake.find('#');
     let (repo, maybe_fragment) = match flake_fragment_start {
         Some(s) => (&flake[..s], Some(&flake[s + 1..])),
@@ -320,7 +320,10 @@ fn test_parse_flake() {
     );
 }
 
-pub fn parse_file<'a>(file: &'a str, attribute: &'a str) -> Result<DeployFlake<'a>, ParseFlakeError> {
+pub fn parse_file<'a>(
+    file: &'a str,
+    attribute: &'a str,
+) -> Result<DeployFlake<'a>, ParseFlakeError> {
     let (node, profile) = parse_fragment(attribute)?;
 
     Ok(DeployFlake {
@@ -414,12 +417,23 @@ impl<'a> DeployData<'a> {
     }
 
     fn get_profile_info(&'a self) -> Result<ProfileInfo, DeployDataDefsError> {
-        match self.profile.profile_settings.profile_path {
-            Some(ref profile_path) => Ok(ProfileInfo::ProfilePath { profile_path: profile_path.to_string() }),
+        match self
+            .profile
+            .profile_settings
+            .profile_path
+            .as_ref()
+            .filter(|profile_path| !profile_path.trim().is_empty())
+        {
+            Some(profile_path) => Ok(ProfileInfo::ProfilePath {
+                profile_path: profile_path.to_string(),
+            }),
             None => {
                 let profile_user = self.get_profile_user()?;
-                Ok(ProfileInfo::ProfileUserAndName { profile_user, profile_name: self.profile_name.to_string() })
-            },
+                Ok(ProfileInfo::ProfileUserAndName {
+                    profile_user,
+                    profile_name: self.profile_name.to_string(),
+                })
+            }
         }
     }
 }
@@ -479,5 +493,98 @@ pub fn make_deploy_data<'a, 's>(
         merged_settings,
         debug_logs,
         log_dir,
+    }
+}
+
+#[cfg(test)]
+mod deploy_data_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn empty_settings() -> data::GenericSettings {
+        data::GenericSettings {
+            ssh_user: None,
+            user: None,
+            ssh_opts: vec![],
+            fast_connection: None,
+            auto_rollback: None,
+            confirm_timeout: None,
+            activation_timeout: None,
+            temp_path: None,
+            magic_rollback: None,
+            sudo: None,
+            remote_build: None,
+            interactive_sudo: None,
+        }
+    }
+
+    fn empty_cmd_overrides() -> CmdOverrides {
+        CmdOverrides {
+            ssh_user: None,
+            profile_user: None,
+            ssh_opts: None,
+            fast_connection: None,
+            auto_rollback: None,
+            hostname: None,
+            magic_rollback: None,
+            temp_path: None,
+            confirm_timeout: None,
+            activation_timeout: None,
+            sudo: None,
+            interactive_sudo: None,
+            dry_activate: false,
+            remote_build: false,
+        }
+    }
+
+    #[test]
+    fn test_empty_profile_path_falls_back_to_profile_user_and_name() {
+        let top_settings = empty_settings();
+        let node = data::Node {
+            generic_settings: empty_settings(),
+            node_settings: data::NodeSettings {
+                hostname: "example".to_string(),
+                profiles: HashMap::new(),
+                profiles_order: vec![],
+            },
+        };
+        let profile = data::Profile {
+            profile_settings: data::ProfileSettings {
+                path: "/nix/store/new-profile".to_string(),
+                profile_path: Some("".to_string()),
+            },
+            generic_settings: data::GenericSettings {
+                user: Some("root".to_string()),
+                ..empty_settings()
+            },
+        };
+        let cmd_overrides = empty_cmd_overrides();
+
+        let deploy_data = make_deploy_data(
+            &top_settings,
+            &node,
+            "node",
+            &profile,
+            "system-manager",
+            &cmd_overrides,
+            false,
+            None,
+        );
+
+        match deploy_data.get_profile_info().unwrap() {
+            ProfileInfo::ProfileUserAndName {
+                profile_user,
+                profile_name,
+            } => {
+                assert_eq!(profile_user, "root".to_string());
+                assert_eq!(profile_name, "system-manager".to_string());
+            }
+            ProfileInfo::ProfilePath { profile_path } => {
+                panic!(
+                    "expected profile user/name fallback, got explicit profile path {}",
+                    profile_path
+                );
+            }
+        }
     }
 }

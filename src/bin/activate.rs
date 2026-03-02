@@ -44,6 +44,7 @@ enum SubCommand {
     Activate(ActivateOpts),
     Wait(WaitOpts),
     Revoke(RevokeOpts),
+    DryDiff(DryDiffOpts),
 }
 
 /// Activate a profile
@@ -110,6 +111,22 @@ struct WaitOpts {
 /// Revoke profile activation
 #[derive(Parser, Debug)]
 struct RevokeOpts {
+    /// The profile path to install into
+    #[arg(long)]
+    profile_path: Option<String>,
+    /// The profile user if explicit profile path is not specified
+    #[arg(long, requires = "profile_name")]
+    profile_user: Option<String>,
+    /// The profile name
+    #[arg(long, requires = "profile_user")]
+    profile_name: Option<String>,
+}
+
+/// Show derivation changes before activation
+#[derive(Parser, Debug)]
+pub struct DryDiffOpts {
+    /// The new closure to compare against
+    new_closure: String,
     /// The profile path to install into
     #[arg(long)]
     profile_path: Option<String>,
@@ -315,7 +332,11 @@ pub enum WaitError {
     #[error("Error waiting for activation: {0}")]
     Waiting(#[from] DangerZoneError),
 }
-pub async fn wait(temp_path: PathBuf, closure: String, activation_timeout: Option<u16>) -> Result<(), WaitError> {
+pub async fn wait(
+    temp_path: PathBuf,
+    closure: String,
+    activation_timeout: Option<u16>,
+) -> Result<(), WaitError> {
     let lock_path = deploy::make_lock_path(&temp_path, &closure);
 
     let (created, done) = mpsc::channel(1);
@@ -573,6 +594,71 @@ mod tests {
     }
 }
 
+#[derive(Error, Debug)]
+pub enum DryDiffError {
+    #[error("Failed to resolve profile path: {0}")]
+    ProfilePath(#[from] GetProfilePathError),
+    #[error("Failed to read current profile: {0}")]
+    ReadProfile(std::io::Error),
+    #[error("Failed to compute closure size: {0}")]
+    SizeDiff(anyhow::Error),
+    #[error("Failed to write package diff: {0}")]
+    PackageDiff(anyhow::Error),
+}
+
+pub async fn dry_diff(opts: DryDiffOpts) -> Result<(), DryDiffError> {
+    let profile_path = get_profile_path(
+        opts.profile_path,
+        opts.profile_user,
+        opts.profile_name,
+    )?;
+
+    if !Path::new(&profile_path).exists() {
+        warn!("No existing generation found at {}, skipping derivation diff.", profile_path);
+        return Ok(());
+    }
+
+    let old_generation = Path::new(&profile_path)
+        .canonicalize()
+        .map_err(DryDiffError::ReadProfile)?;
+    let new_generation = PathBuf::from(opts.new_closure)
+        .canonicalize()
+        .map_err(DryDiffError::ReadProfile)?;
+
+    println!("Derivation changes for {}:", profile_path);
+
+    // Use dix for the diff
+    let size_handle = dix::spawn_size_diff(old_generation.clone(), new_generation.clone(), true);
+
+    struct StdoutWriter;
+    impl std::fmt::Write for StdoutWriter {
+        fn write_str(&mut self, s: &str) -> std::fmt::Result {
+            print!("{}", s);
+            Ok(())
+        }
+    }
+    let mut out = StdoutWriter;
+
+    let wrote = dix::write_package_diff(&mut out, &old_generation, &new_generation, true)
+        .map_err(|e| DryDiffError::PackageDiff(e.into()))?;
+
+    if let Ok(Ok((size_old, size_new))) = size_handle.join() {
+        if size_old == size_new {
+            if wrote == 0 {
+                info!("No version or size changes.");
+            }
+        } else {
+            if wrote > 0 {
+                println!();
+            }
+            dix::write_size_diff(&mut out, size_old, size_new)
+                .map_err(|e| DryDiffError::SizeDiff(e.into()))?;
+        }
+    }
+
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Ensure that this process stays alive after the SSH connection dies
@@ -592,6 +678,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             SubCommand::Activate(_) => deploy::LoggerType::Activate,
             SubCommand::Wait(_) => deploy::LoggerType::Wait,
             SubCommand::Revoke(_) => deploy::LoggerType::Revoke,
+            SubCommand::DryDiff(_) => deploy::LoggerType::Activate,
         },
     )?;
 
@@ -613,9 +700,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await
         .map_err(|x| Box::new(x) as Box<dyn std::error::Error>),
 
-        SubCommand::Wait(wait_opts) => wait(wait_opts.temp_path, wait_opts.closure, wait_opts.activation_timeout)
-            .await
-            .map_err(|x| Box::new(x) as Box<dyn std::error::Error>),
+        SubCommand::Wait(wait_opts) => wait(
+            wait_opts.temp_path,
+            wait_opts.closure,
+            wait_opts.activation_timeout,
+        )
+        .await
+        .map_err(|x| Box::new(x) as Box<dyn std::error::Error>),
 
         SubCommand::Revoke(revoke_opts) => revoke(get_profile_path(
             revoke_opts.profile_path,
@@ -624,6 +715,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )?)
         .await
         .map_err(|x| Box::new(x) as Box<dyn std::error::Error>),
+
+        SubCommand::DryDiff(dry_diff_opts) => dry_diff(dry_diff_opts)
+            .await
+            .map_err(|x| Box::new(x) as Box<dyn std::error::Error>),
     };
 
     match r {

@@ -4,7 +4,7 @@
 
 use log::{debug, info, warn};
 use std::path::Path;
-use std::process::Stdio;
+use std::process::{Command as StdCommand, Stdio};
 use thiserror::Error;
 use tokio::process::Command;
 
@@ -56,9 +56,105 @@ pub struct PushProfileData<'a> {
     pub keep_result: bool,
     pub result_path: Option<&'a str>,
     pub extra_build_args: &'a [String],
+    pub build_tree: bool,
 }
 
-pub async fn build_profile_locally(data: &PushProfileData<'_>, derivation_name: &str) -> Result<(), PushProfileError> {
+async fn command_exists(command: &str) -> bool {
+    Command::new(command)
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await
+        .is_ok()
+}
+
+async fn run_build_command(
+    mut build_command: Command,
+    build_tree: bool,
+) -> Result<(), PushProfileError> {
+    debug!("build command: {:?}", build_command);
+
+    if build_tree {
+        if !command_exists("nom").await {
+            warn!(
+                "Build tree visualization requested but `nom` is not available in PATH; falling back to regular build logs"
+            );
+        } else {
+            info!("Streaming build tree with nix-output-monitor (`nom`)");
+
+            build_command
+                .arg("--log-format")
+                .arg("internal-json")
+                .arg("--verbose")
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped());
+
+            let (nix_status, nom_status) =
+                tokio::task::spawn_blocking(move || -> Result<_, PushProfileError> {
+                    let mut nix_child = build_command
+                        .into_std()
+                        .spawn()
+                        .map_err(PushProfileError::Build)?;
+
+                    let nix_stderr = nix_child.stderr.take().ok_or_else(|| {
+                        PushProfileError::Build(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            "failed to capture nix build stderr for nom",
+                        ))
+                    })?;
+
+                    let nom_status = StdCommand::new("nom")
+                        .arg("--json")
+                        .stdin(Stdio::from(nix_stderr))
+                        .stdout(Stdio::inherit())
+                        .stderr(Stdio::inherit())
+                        .status()
+                        .map_err(PushProfileError::Build)?;
+
+                    let nix_status = nix_child.wait().map_err(PushProfileError::Build)?;
+
+                    Ok((nix_status, nom_status))
+                })
+                .await
+                .map_err(|err| {
+                    PushProfileError::Build(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("failed waiting for build tree process: {}", err),
+                    ))
+                })??;
+
+            if nom_status.code() != Some(0) {
+                warn!(
+                    "`nom` exited with status {:?}; continuing based on Nix build result",
+                    nom_status.code()
+                );
+            }
+
+            return match nix_status.code() {
+                Some(0) => Ok(()),
+                a => Err(PushProfileError::BuildExit(a)),
+            };
+        }
+    }
+
+    let build_exit_status = build_command
+        // Logging should be in stderr, this just stops the store path from printing for no reason
+        .stdout(Stdio::null())
+        .status()
+        .await
+        .map_err(PushProfileError::Build)?;
+
+    match build_exit_status.code() {
+        Some(0) => Ok(()),
+        a => Err(PushProfileError::BuildExit(a)),
+    }
+}
+
+pub async fn build_profile_locally(
+    data: &PushProfileData<'_>,
+    derivation_name: &str,
+) -> Result<(), PushProfileError> {
     info!(
         "Building profile `{}` for node `{}`",
         data.deploy_data.profile_name, data.deploy_data.node_name
@@ -91,17 +187,13 @@ pub async fn build_profile_locally(data: &PushProfileData<'_>, derivation_name: 
 
     build_command.args(data.extra_build_args);
 
-    let build_exit_status = build_command
-        // Logging should be in stderr, this just stops the store path from printing for no reason
-        .stdout(Stdio::null())
-        .status()
-        .await
-        .map_err(PushProfileError::Build)?;
+    if data.build_tree && !data.supports_flakes {
+        warn!(
+            "Build tree visualization currently requires flake-capable nix builds; continuing without tree output"
+        );
+    }
 
-    match build_exit_status.code() {
-        Some(0) => (),
-        a => return Err(PushProfileError::BuildExit(a)),
-    };
+    run_build_command(build_command, data.build_tree && data.supports_flakes).await?;
 
     if !Path::new(
         format!(
@@ -151,7 +243,10 @@ pub async fn build_profile_locally(data: &PushProfileData<'_>, derivation_name: 
     Ok(())
 }
 
-pub async fn build_profile_remotely(data: &PushProfileData<'_>, derivation_name: &str) -> Result<(), PushProfileError> {
+pub async fn build_profile_remotely(
+    data: &PushProfileData<'_>,
+    derivation_name: &str,
+) -> Result<(), PushProfileError> {
     info!(
         "Building profile `{}` for node `{}` on remote host",
         data.deploy_data.profile_name, data.deploy_data.node_name
@@ -166,14 +261,16 @@ pub async fn build_profile_remotely(data: &PushProfileData<'_>, derivation_name:
 
     let ssh_opts_str = data.deploy_data.merged_settings.ssh_opts.join(" ");
 
-
     // copy the derivation to remote host so it can be built there
     let copy_command_status = Command::new("nix")
-        .arg("--experimental-features").arg("nix-command")
+        .arg("--experimental-features")
+        .arg("nix-command")
         .arg("copy")
-        .arg("-s")  // fetch dependencies from substitures, not localhost
-        .arg("--to").arg(&store_address)
-        .arg("--derivation").arg(derivation_name)
+        .arg("-s") // fetch dependencies from substitures, not localhost
+        .arg("--to")
+        .arg(&store_address)
+        .arg("--derivation")
+        .arg(derivation_name)
         .env("NIX_SSHOPTS", ssh_opts_str.clone())
         .stdout(Stdio::null())
         .status()
@@ -187,27 +284,18 @@ pub async fn build_profile_remotely(data: &PushProfileData<'_>, derivation_name:
 
     let mut build_command = Command::new("nix");
     build_command
-        .arg("--experimental-features").arg("nix-command")
-        .arg("build").arg(derivation_name)
-        .arg("--eval-store").arg("auto")
-        .arg("--store").arg(&store_address)
+        .arg("--experimental-features")
+        .arg("nix-command")
+        .arg("build")
+        .arg(derivation_name)
+        .arg("--eval-store")
+        .arg("auto")
+        .arg("--store")
+        .arg(&store_address)
         .args(data.extra_build_args)
         .env("NIX_SSHOPTS", ssh_opts_str.clone());
 
-    debug!("build command: {:?}", build_command);
-
-    let build_exit_status = build_command
-        // Logging should be in stderr, this just stops the store path from printing for no reason
-        .stdout(Stdio::null())
-        .status()
-        .await
-        .map_err(PushProfileError::Build)?;
-
-    match build_exit_status.code() {
-        Some(0) => (),
-        a => return Err(PushProfileError::BuildExit(a)),
-    };
-
+    run_build_command(build_command, data.build_tree && data.supports_flakes).await?;
 
     Ok(())
 }
@@ -220,7 +308,8 @@ pub async fn build_profile(data: PushProfileData<'_>) -> Result<(), PushProfileE
 
     // `nix-store --query --deriver` doesn't work on invalid paths, so we parse output of show-derivation :(
     let show_derivation_output = Command::new("nix")
-        .arg("--experimental-features").arg("nix-command")
+        .arg("--experimental-features")
+        .arg("nix-command")
         .arg("show-derivation")
         .arg(&data.deploy_data.profile.profile_settings.path)
         .output()
@@ -258,7 +347,13 @@ pub async fn build_profile(data: PushProfileData<'_>) -> Result<(), PushProfileE
         format!("/nix/store/{}", deriver_key)
     };
 
-    let new_deriver = if data.supports_flakes || data.deploy_data.merged_settings.remote_build.unwrap_or(false) {
+    let new_deriver = if data.supports_flakes
+        || data
+            .deploy_data
+            .merged_settings
+            .remote_build
+            .unwrap_or(false)
+    {
         // Since nix 2.15.0 'nix build <path>.drv' will build only the .drv file itself, not the
         // derivation outputs, '^out' is used to refer to outputs explicitly
         deriver.clone() + "^out"
@@ -267,13 +362,17 @@ pub async fn build_profile(data: PushProfileData<'_>) -> Result<(), PushProfileE
     };
 
     let path_info_output = Command::new("nix")
-        .arg("--experimental-features").arg("nix-command")
+        .arg("--experimental-features")
+        .arg("nix-command")
         .arg("path-info")
         .arg(&deriver)
-        .output().await
+        .output()
+        .await
         .map_err(PushProfileError::PathInfo)?;
 
-    let deriver = if std::str::from_utf8(&path_info_output.stdout).map(|s| s.trim()) == Ok(deriver.as_str()) {
+    let deriver = if std::str::from_utf8(&path_info_output.stdout).map(|s| s.trim())
+        == Ok(deriver.as_str())
+    {
         // In this case we're on 2.15.0 or newer, because 'nix path-info <...>.drv'
         // returns the same '<...>.drv' path.
         // If 'nix path-info <...>.drv' returns a different path, then we're on pre 2.15.0 nix and
@@ -288,7 +387,12 @@ pub async fn build_profile(data: PushProfileData<'_>) -> Result<(), PushProfileE
         // 'error: path '...' is not valid'.
         deriver
     };
-    if data.deploy_data.merged_settings.remote_build.unwrap_or(false) {
+    if data
+        .deploy_data
+        .merged_settings
+        .remote_build
+        .unwrap_or(false)
+    {
         if !data.supports_flakes {
             warn!("remote builds using non-flake nix are experimental");
         }
@@ -314,7 +418,12 @@ pub async fn push_profile(data: PushProfileData<'_>) -> Result<(), PushProfileEr
 
     // remote building guarantees that the resulting derivation is stored on the target system
     // no need to copy after building
-    if !data.deploy_data.merged_settings.remote_build.unwrap_or(false) {
+    if !data
+        .deploy_data
+        .merged_settings
+        .remote_build
+        .unwrap_or(false)
+    {
         info!(
             "Copying profile `{}` to node `{}`",
             data.deploy_data.profile_name, data.deploy_data.node_name
