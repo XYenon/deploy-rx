@@ -44,7 +44,7 @@
         lib = rec {
 
           setActivate = builtins.trace
-            "deploy-rs#lib.setActivate is deprecated, use activate.noop, activate.nixos or activate.custom instead"
+            "deploy-rs#lib.setActivate is deprecated, use activate.noop, activate.nixos, activate.darwin, activate.home-manager, activate.system-manager or activate.custom instead"
             activate.custom;
 
           activate = rec {
@@ -107,6 +107,9 @@
               '';
 
             home-manager = base: custom base.activationPackage "$PROFILE/activate";
+
+            # Activation script for `system-manager.lib.makeSystemConfig`.
+            system-manager = base: custom base "$PROFILE/bin/activate";
 
             # Activation script for 'darwinSystem' from nix-darwin.
             # 'HOME=/var/root' is needed because 'sudo' on darwin doesn't change 'HOME' directory,
