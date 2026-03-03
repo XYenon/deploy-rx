@@ -491,6 +491,11 @@ fn get_profile_path(
                     match &profile_name[..] {
                         // NixOS system profile belongs to the root user, but isn't stored in the 'per-user/root'
                         "system" => Ok(format!("{}/profiles/system", nix_state_dir)),
+                        // system-manager stores generations in a dedicated global profile path.
+                        "system-manager" => Ok(format!(
+                            "{}/profiles/system-manager-profiles/system-manager",
+                            nix_state_dir
+                        )),
                         _ => Ok(format!(
                             "{}/profiles/per-user/root/{}",
                             nix_state_dir, profile_name
@@ -522,6 +527,49 @@ fn get_profile_path(
             }
         }
         _ => panic!("impossible"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::get_profile_path;
+    use std::env;
+
+    #[test]
+    fn test_get_profile_path_for_root_system_profile() {
+        let nix_state_dir = env::var("NIX_STATE_DIR").unwrap_or("/nix/var/nix".to_string());
+        assert_eq!(
+            get_profile_path(None, Some("root".to_string()), Some("system".to_string())).unwrap(),
+            format!("{}/profiles/system", nix_state_dir)
+        );
+    }
+
+    #[test]
+    fn test_get_profile_path_for_root_system_manager_profile() {
+        let nix_state_dir = env::var("NIX_STATE_DIR").unwrap_or("/nix/var/nix".to_string());
+        assert_eq!(
+            get_profile_path(
+                None,
+                Some("root".to_string()),
+                Some("system-manager".to_string())
+            )
+            .unwrap(),
+            format!("{}/profiles/system-manager-profiles/system-manager", nix_state_dir)
+        );
+    }
+
+    #[test]
+    fn test_get_profile_path_for_other_root_profile() {
+        let nix_state_dir = env::var("NIX_STATE_DIR").unwrap_or("/nix/var/nix".to_string());
+        assert_eq!(
+            get_profile_path(
+                None,
+                Some("root".to_string()),
+                Some("custom-profile".to_string())
+            )
+            .unwrap(),
+            format!("{}/profiles/per-user/root/custom-profile", nix_state_dir)
+        );
     }
 }
 
