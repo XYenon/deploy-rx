@@ -5,6 +5,43 @@ SPDX-FileCopyrightText: 2021 Yannik Sander <contact@ysndr.de>
 SPDX-License-Identifier: MPL-2.0
 -->
 
+# deploy-rx
+
+**deploy-rx** is an extended fork of the excellent [deploy-rs](https://github.com/serokell/deploy-rs) project. This fork aims to add new features and significantly optimize the user experience.
+
+## Features & Enhancements
+
+`deploy-rx` introduces several functional improvements and capabilities over the original `deploy-rs`:
+
+### SSH Connection Multiplexing
+
+Reuses SSH connections when deploying multiple profiles to the same node, significantly reducing connection overhead and speeding up deployments.
+
+- Added `--no-rollback-fresh-connection` flag to control rollback connection behavior.
+
+### `system-manager` Support
+
+First-class support for deploying [system-manager](https://github.com/numtide/system-manager).
+
+- Automatic handling of profile paths (`/nix/var/nix/profiles/system-manager-profiles/system-manager`).
+- Provides a dedicated activation helper (`activate.system-manager`):
+
+```nix
+{
+  # For outputs from `system-manager.lib.makeSystemConfig`
+  path = deploy-rs.lib.x86_64-linux.activate.system-manager self.systemConfigs.some-random-system;
+}
+```
+
+### Modern Deployment UX
+
+- **Build-tree Visualization**: Streams the build process visually using `nix-output-monitor` (`nom`). Enabled by default (bypass with `--no-build-tree`).
+- **Diff & Change Review**: Integrated, super-fast diffing (`dix`) of derivation changes before activation or switch. Enabled by default (bypass with `--no-review-changes`).
+
+---
+
+*Below is the original documentation for `deploy-rs`. The core functionality and architecture largely apply to `deploy-rx` as well:*
+
 ![deploy-rs logo](./docs/logo.svg "deploy-rs")
 
 ---
