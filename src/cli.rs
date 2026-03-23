@@ -613,8 +613,9 @@ async fn run_deploy(
         print_deployment(&parts[..])?;
     }
 
-    for (deploy_flake, deploy_data, deploy_defs) in &parts {
-        let data = deploy::push::PushProfileData {
+    let push_profile_datas: Vec<_> = parts
+        .iter()
+        .map(|(deploy_flake, deploy_data, deploy_defs)| deploy::push::PushProfileData {
             supports_flakes,
             check_sigs,
             repo: deploy_flake.repo,
@@ -624,12 +625,19 @@ async fn run_deploy(
             result_path,
             extra_build_args,
             build_tree,
-        };
-        let node_name: String = deploy_data.node_name.to_string();
-        deploy::push::build_profile(data)
-            .await
-            .map_err(|e| RunDeployError::BuildProfile(node_name, e))?;
-    }
+        })
+        .collect();
+
+    // Resolve derivations, then build all profiles (remote individually, local batched)
+    deploy::push::build_profiles(&push_profile_datas)
+        .await
+        .map_err(|e| {
+            let node_names: Vec<_> = push_profile_datas
+                .iter()
+                .map(|d| d.deploy_data.node_name.to_string())
+                .collect();
+            RunDeployError::BuildProfile(node_names.join(", "), e)
+        })?;
 
     let ssh_multiplexer = if ssh_multiplexing {
         let multiplexer = deploy::ssh::SshMultiplexer::new();

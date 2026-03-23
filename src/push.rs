@@ -151,98 +151,6 @@ async fn run_build_command(
     }
 }
 
-pub async fn build_profile_locally(
-    data: &PushProfileData<'_>,
-    derivation_name: &str,
-) -> Result<(), PushProfileError> {
-    info!(
-        "Building profile `{}` for node `{}`",
-        data.deploy_data.profile_name, data.deploy_data.node_name
-    );
-
-    let mut build_command = if data.supports_flakes {
-        Command::new("nix")
-    } else {
-        Command::new("nix-build")
-    };
-
-    if data.supports_flakes {
-        build_command.arg("build").arg(derivation_name)
-    } else {
-        build_command.arg(derivation_name)
-    };
-
-    match (data.keep_result, data.supports_flakes) {
-        (true, _) => {
-            let result_path = data.result_path.unwrap_or("./.deploy-gc");
-
-            build_command.arg("--out-link").arg(format!(
-                "{}/{}/{}",
-                result_path, data.deploy_data.node_name, data.deploy_data.profile_name
-            ))
-        }
-        (false, false) => build_command.arg("--no-out-link"),
-        (false, true) => build_command.arg("--no-link"),
-    };
-
-    build_command.args(data.extra_build_args);
-
-    if data.build_tree && !data.supports_flakes {
-        warn!(
-            "Build tree visualization currently requires flake-capable nix builds; continuing without tree output"
-        );
-    }
-
-    run_build_command(build_command, data.build_tree && data.supports_flakes).await?;
-
-    if !Path::new(
-        format!(
-            "{}/deploy-rx-activate",
-            data.deploy_data.profile.profile_settings.path
-        )
-        .as_str(),
-    )
-    .exists()
-    {
-        return Err(PushProfileError::DeployRsActivateDoesntExist);
-    }
-
-    if !Path::new(
-        format!(
-            "{}/activate-rs",
-            data.deploy_data.profile.profile_settings.path
-        )
-        .as_str(),
-    )
-    .exists()
-    {
-        return Err(PushProfileError::ActivateRsDoesntExist);
-    }
-
-    if let Ok(local_key) = std::env::var("LOCAL_KEY") {
-        info!(
-            "Signing key present! Signing profile `{}` for node `{}`",
-            data.deploy_data.profile_name, data.deploy_data.node_name
-        );
-
-        let sign_exit_status = Command::new("nix")
-            .arg("sign-paths")
-            .arg("-r")
-            .arg("-k")
-            .arg(local_key)
-            .arg(&data.deploy_data.profile.profile_settings.path)
-            .status()
-            .await
-            .map_err(PushProfileError::Sign)?;
-
-        match sign_exit_status.code() {
-            Some(0) => (),
-            a => return Err(PushProfileError::SignExit(a)),
-        };
-    }
-    Ok(())
-}
-
 pub async fn build_profile_remotely(
     data: &PushProfileData<'_>,
     derivation_name: &str,
@@ -300,7 +208,8 @@ pub async fn build_profile_remotely(
     Ok(())
 }
 
-pub async fn build_profile(data: PushProfileData<'_>) -> Result<(), PushProfileError> {
+/// Resolve the derivation path for a profile, returning the derivation name suitable for building.
+pub async fn resolve_derivation(data: &PushProfileData<'_>) -> Result<String, PushProfileError> {
     debug!(
         "Finding the deriver of store path for {}",
         &data.deploy_data.profile.profile_settings.path
@@ -373,36 +282,223 @@ pub async fn build_profile(data: PushProfileData<'_>) -> Result<(), PushProfileE
     let deriver = if std::str::from_utf8(&path_info_output.stdout).map(|s| s.trim())
         == Ok(deriver.as_str())
     {
-        // In this case we're on 2.15.0 or newer, because 'nix path-info <...>.drv'
-        // returns the same '<...>.drv' path.
-        // If 'nix path-info <...>.drv' returns a different path, then we're on pre 2.15.0 nix and
-        // derivation build result is already present in the /nix/store.
         new_deriver
     } else {
-        // If 'nix path-info <...>.drv' returns a different path, then we're on pre 2.15.0 nix and
-        // derivation build result is already present in the /nix/store.
-        //
-        // Alternatively, the result of the derivation build may not be yet present
-        // in the /nix/store. In this case, 'nix path-info' returns
-        // 'error: path '...' is not valid'.
         deriver
     };
-    if data
-        .deploy_data
-        .merged_settings
-        .remote_build
-        .unwrap_or(false)
-    {
-        if !data.supports_flakes {
-            warn!("remote builds using non-flake nix are experimental");
-        }
 
-        build_profile_remotely(&data, &deriver).await?;
-    } else {
-        build_profile_locally(&data, &deriver).await?;
+    Ok(deriver)
+}
+
+/// Check that the built profile contains the expected activation scripts, and sign if needed.
+pub async fn check_and_sign_profile(data: &PushProfileData<'_>) -> Result<(), PushProfileError> {
+    if !Path::new(
+        format!(
+            "{}/deploy-rx-activate",
+            data.deploy_data.profile.profile_settings.path
+        )
+        .as_str(),
+    )
+    .exists()
+    {
+        return Err(PushProfileError::DeployRsActivateDoesntExist);
+    }
+
+    if !Path::new(
+        format!(
+            "{}/activate-rs",
+            data.deploy_data.profile.profile_settings.path
+        )
+        .as_str(),
+    )
+    .exists()
+    {
+        return Err(PushProfileError::ActivateRsDoesntExist);
+    }
+
+    if let Ok(local_key) = std::env::var("LOCAL_KEY") {
+        info!(
+            "Signing key present! Signing profile `{}` for node `{}`",
+            data.deploy_data.profile_name, data.deploy_data.node_name
+        );
+
+        let sign_exit_status = Command::new("nix")
+            .arg("sign-paths")
+            .arg("-r")
+            .arg("-k")
+            .arg(local_key)
+            .arg(&data.deploy_data.profile.profile_settings.path)
+            .status()
+            .await
+            .map_err(PushProfileError::Sign)?;
+
+        match sign_exit_status.code() {
+            Some(0) => (),
+            a => return Err(PushProfileError::SignExit(a)),
+        };
     }
 
     Ok(())
+}
+
+struct BuildCommandInfo<'a> {
+    node_name: &'a str,
+    profile_name: &'a str,
+}
+
+fn make_build_command(
+    supports_flakes: bool,
+    keep_result: bool,
+    result_path: Option<&str>,
+    extra_build_args: &[String],
+    derivations: &[&str],
+    profiles: &[BuildCommandInfo],
+) -> Command {
+    let mut build_command = if supports_flakes {
+        Command::new("nix")
+    } else {
+        Command::new("nix-build")
+    };
+
+    if supports_flakes {
+        build_command.arg("build");
+    }
+
+    for derivation in derivations {
+        build_command.arg(*derivation);
+    }
+
+    if !keep_result {
+        if supports_flakes {
+            build_command.arg("--no-link");
+        } else {
+            build_command.arg("--no-out-link");
+        }
+    } else {
+        let result_path = result_path.unwrap_or("./.deploy-gc");
+        for info in profiles {
+            build_command.arg("--out-link").arg(format!(
+                "{}/{}/{}",
+                result_path, info.node_name, info.profile_name
+            ));
+        }
+    }
+
+    build_command.args(extra_build_args);
+
+    build_command
+}
+
+/// Build multiple profiles locally in a single nix build invocation.
+pub async fn build_profiles_locally(
+    items: &[(&PushProfileData<'_>, &str)],
+) -> Result<(), PushProfileError> {
+    if items.is_empty() {
+        return Ok(());
+    }
+
+    let data = items[0].0;
+
+    // Validate that global build options are consistent across all items
+    for (d, _) in &items[1..] {
+        debug_assert_eq!(
+            d.supports_flakes, data.supports_flakes,
+            "All items must share the same supports_flakes value"
+        );
+        debug_assert_eq!(
+            d.keep_result, data.keep_result,
+            "All items must share the same keep_result value"
+        );
+        debug_assert_eq!(
+            d.result_path, data.result_path,
+            "All items must share the same result_path value"
+        );
+        debug_assert_eq!(
+            d.extra_build_args, data.extra_build_args,
+            "All items must share the same extra_build_args value"
+        );
+    }
+
+    for (d, _) in items {
+        info!(
+            "Building profile `{}` for node `{}`",
+            d.deploy_data.profile_name, d.deploy_data.node_name
+        );
+    }
+
+    let derivations: Vec<&str> = items.iter().map(|&(_, d)| d).collect();
+    let profiles: Vec<BuildCommandInfo> = items
+        .iter()
+        .map(|&(d, _)| BuildCommandInfo {
+            node_name: d.deploy_data.node_name,
+            profile_name: d.deploy_data.profile_name,
+        })
+        .collect();
+
+    let build_command = make_build_command(
+        data.supports_flakes,
+        data.keep_result,
+        data.result_path,
+        data.extra_build_args,
+        &derivations,
+        &profiles,
+    );
+
+    if data.build_tree && !data.supports_flakes {
+        warn!(
+            "Build tree visualization currently requires flake-capable nix builds; continuing without tree output"
+        );
+    }
+
+    run_build_command(build_command, data.build_tree && data.supports_flakes).await?;
+
+    for &(d, _) in items {
+        check_and_sign_profile(d).await?;
+    }
+
+    Ok(())
+}
+
+/// Resolve derivations, then build all profiles (dispatching remote vs local).
+///
+/// Remote profiles are built individually; local profiles are batched into a
+/// single `nix build` invocation for efficiency.
+pub async fn build_profiles(datas: &[PushProfileData<'_>]) -> Result<(), PushProfileError> {
+    // Resolve derivations for every profile
+    let mut derivations: Vec<String> = Vec::with_capacity(datas.len());
+    for data in datas {
+        let deriver = resolve_derivation(data).await?;
+        derivations.push(deriver);
+    }
+
+    // Separate remote vs local, building remote ones immediately
+    let mut local_builds: Vec<(&PushProfileData<'_>, &str)> = Vec::new();
+    for (data, deriver) in datas.iter().zip(derivations.iter()) {
+        if data
+            .deploy_data
+            .merged_settings
+            .remote_build
+            .unwrap_or(false)
+        {
+            if !data.supports_flakes {
+                warn!("remote builds using non-flake nix are experimental");
+            }
+            build_profile_remotely(data, deriver).await?;
+        } else {
+            local_builds.push((data, deriver.as_str()));
+        }
+    }
+
+    // Build all local profiles in a single nix build invocation
+    if !local_builds.is_empty() {
+        build_profiles_locally(&local_builds).await?;
+    }
+
+    Ok(())
+}
+
+pub async fn build_profile(data: PushProfileData<'_>) -> Result<(), PushProfileError> {
+    build_profiles(&[data]).await
 }
 
 pub async fn push_profile(data: PushProfileData<'_>) -> Result<(), PushProfileError> {
@@ -461,4 +557,331 @@ pub async fn push_profile(data: PushProfileData<'_>) -> Result<(), PushProfileEr
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn get_args(cmd: &Command) -> Vec<String> {
+        let std_cmd = cmd.as_std();
+        std::iter::once(std_cmd.get_program())
+            .chain(std_cmd.get_args())
+            .map(|s| s.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn test_make_build_command_flakes_single_derivation() {
+        let cmd = make_build_command(
+            true,
+            false,
+            None,
+            &[],
+            &["/nix/store/abc.drv^out"],
+            &[],
+        );
+        assert_eq!(
+            get_args(&cmd),
+            vec!["nix", "build", "/nix/store/abc.drv^out", "--no-link"]
+        );
+    }
+
+    #[test]
+    fn test_make_build_command_flakes_multiple_derivations() {
+        let cmd = make_build_command(
+            true,
+            false,
+            None,
+            &[],
+            &["/nix/store/abc.drv^out", "/nix/store/def.drv^out"],
+            &[],
+        );
+        assert_eq!(
+            get_args(&cmd),
+            vec![
+                "nix",
+                "build",
+                "/nix/store/abc.drv^out",
+                "/nix/store/def.drv^out",
+                "--no-link"
+            ]
+        );
+    }
+
+    #[test]
+    fn test_make_build_command_no_flakes_multiple_derivations() {
+        let cmd = make_build_command(
+            false,
+            false,
+            None,
+            &[],
+            &["/nix/store/abc.drv", "/nix/store/def.drv"],
+            &[],
+        );
+        assert_eq!(
+            get_args(&cmd),
+            vec![
+                "nix-build",
+                "/nix/store/abc.drv",
+                "/nix/store/def.drv",
+                "--no-out-link"
+            ]
+        );
+    }
+
+    #[test]
+    fn test_make_build_command_keep_result() {
+        let profiles = vec![
+            BuildCommandInfo {
+                node_name: "node1",
+                profile_name: "system",
+            },
+            BuildCommandInfo {
+                node_name: "node2",
+                profile_name: "system",
+            },
+        ];
+        let cmd = make_build_command(
+            true,
+            true,
+            Some("./results"),
+            &[],
+            &["/nix/store/abc.drv^out", "/nix/store/def.drv^out"],
+            &profiles,
+        );
+        assert_eq!(
+            get_args(&cmd),
+            vec![
+                "nix",
+                "build",
+                "/nix/store/abc.drv^out",
+                "/nix/store/def.drv^out",
+                "--out-link",
+                "./results/node1/system",
+                "--out-link",
+                "./results/node2/system",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_make_build_command_keep_result_default_path() {
+        let profiles = vec![BuildCommandInfo {
+            node_name: "mynode",
+            profile_name: "web",
+        }];
+        let cmd = make_build_command(
+            true,
+            true,
+            None,
+            &[],
+            &["/nix/store/abc.drv^out"],
+            &profiles,
+        );
+        assert_eq!(
+            get_args(&cmd),
+            vec![
+                "nix",
+                "build",
+                "/nix/store/abc.drv^out",
+                "--out-link",
+                "./.deploy-gc/mynode/web",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_make_build_command_extra_args() {
+        let extra = vec!["--option".to_string(), "foo".to_string(), "bar".to_string()];
+        let cmd = make_build_command(
+            true,
+            false,
+            None,
+            &extra,
+            &["/nix/store/abc.drv^out"],
+            &[],
+        );
+        assert_eq!(
+            get_args(&cmd),
+            vec![
+                "nix",
+                "build",
+                "/nix/store/abc.drv^out",
+                "--no-link",
+                "--option",
+                "foo",
+                "bar"
+            ]
+        );
+    }
+
+    fn empty_settings() -> crate::data::GenericSettings {
+        crate::data::GenericSettings {
+            ssh_user: None,
+            user: None,
+            ssh_opts: vec![],
+            fast_connection: None,
+            auto_rollback: None,
+            confirm_timeout: None,
+            activation_timeout: None,
+            temp_path: None,
+            magic_rollback: None,
+            sudo: None,
+            remote_build: None,
+            interactive_sudo: None,
+        }
+    }
+
+    fn empty_cmd_overrides() -> crate::CmdOverrides {
+        crate::CmdOverrides {
+            ssh_user: None,
+            profile_user: None,
+            ssh_opts: None,
+            fast_connection: None,
+            auto_rollback: None,
+            hostname: None,
+            magic_rollback: None,
+            temp_path: None,
+            confirm_timeout: None,
+            activation_timeout: None,
+            sudo: None,
+            interactive_sudo: None,
+            dry_activate: false,
+            remote_build: false,
+        }
+    }
+
+    fn test_node() -> crate::data::Node {
+        crate::data::Node {
+            generic_settings: empty_settings(),
+            node_settings: crate::data::NodeSettings {
+                hostname: "example.com".to_string(),
+                profiles: HashMap::new(),
+                profiles_order: vec![],
+            },
+        }
+    }
+
+    fn test_deploy_defs() -> crate::DeployDefs {
+        crate::DeployDefs {
+            ssh_user: "root".to_string(),
+            profile_user: "root".to_string(),
+            sudo: None,
+            sudo_password: None,
+        }
+    }
+
+    #[test]
+    fn test_check_and_sign_profile_missing_deploy_rx_activate() {
+        let settings = empty_settings();
+        let node = test_node();
+        let profile = crate::data::Profile {
+            profile_settings: crate::data::ProfileSettings {
+                path: "/nonexistent/path".to_string(),
+                profile_path: None,
+            },
+            generic_settings: empty_settings(),
+        };
+        let cmd_overrides = empty_cmd_overrides();
+        let deploy_data = crate::make_deploy_data(
+            &settings, &node, "testnode", &profile, "system", &cmd_overrides, false, None,
+        );
+        let deploy_defs = test_deploy_defs();
+        let data = PushProfileData {
+            supports_flakes: true,
+            check_sigs: false,
+            repo: ".",
+            deploy_data: &deploy_data,
+            deploy_defs: &deploy_defs,
+            keep_result: false,
+            result_path: None,
+            extra_build_args: &[],
+            build_tree: false,
+        };
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(check_and_sign_profile(&data));
+        assert!(matches!(
+            result,
+            Err(PushProfileError::DeployRsActivateDoesntExist)
+        ));
+    }
+
+    #[test]
+    fn test_check_and_sign_profile_missing_activate_rs() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("deploy-rx-activate"), "").unwrap();
+
+        let settings = empty_settings();
+        let node = test_node();
+        let profile = crate::data::Profile {
+            profile_settings: crate::data::ProfileSettings {
+                path: dir.path().to_string_lossy().into_owned(),
+                profile_path: None,
+            },
+            generic_settings: empty_settings(),
+        };
+        let cmd_overrides = empty_cmd_overrides();
+        let deploy_data = crate::make_deploy_data(
+            &settings, &node, "testnode", &profile, "system", &cmd_overrides, false, None,
+        );
+        let deploy_defs = test_deploy_defs();
+        let data = PushProfileData {
+            supports_flakes: true,
+            check_sigs: false,
+            repo: ".",
+            deploy_data: &deploy_data,
+            deploy_defs: &deploy_defs,
+            keep_result: false,
+            result_path: None,
+            extra_build_args: &[],
+            build_tree: false,
+        };
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(check_and_sign_profile(&data));
+        assert!(matches!(
+            result,
+            Err(PushProfileError::ActivateRsDoesntExist)
+        ));
+    }
+
+    #[test]
+    fn test_check_and_sign_profile_success() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("deploy-rx-activate"), "").unwrap();
+        std::fs::write(dir.path().join("activate-rs"), "").unwrap();
+
+        let settings = empty_settings();
+        let node = test_node();
+        let profile = crate::data::Profile {
+            profile_settings: crate::data::ProfileSettings {
+                path: dir.path().to_string_lossy().into_owned(),
+                profile_path: None,
+            },
+            generic_settings: empty_settings(),
+        };
+        let cmd_overrides = empty_cmd_overrides();
+        let deploy_data = crate::make_deploy_data(
+            &settings, &node, "testnode", &profile, "system", &cmd_overrides, false, None,
+        );
+        let deploy_defs = test_deploy_defs();
+        let data = PushProfileData {
+            supports_flakes: true,
+            check_sigs: false,
+            repo: ".",
+            deploy_data: &deploy_data,
+            deploy_defs: &deploy_defs,
+            keep_result: false,
+            result_path: None,
+            extra_build_args: &[],
+            build_tree: false,
+        };
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(check_and_sign_profile(&data));
+        assert!(result.is_ok());
+    }
 }
