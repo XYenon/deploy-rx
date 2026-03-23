@@ -11,7 +11,7 @@ use clap::{ArgMatches, FromArgMatches, Parser};
 use crate as deploy;
 
 use self::deploy::{DeployFlake, ParseFlakeError};
-use futures_util::stream::{StreamExt, TryStreamExt};
+use futures_util::future::try_join_all;
 use log::{debug, error, info, warn};
 use serde::Serialize;
 use std::path::PathBuf;
@@ -204,98 +204,170 @@ pub enum GetDeploymentDataError {
     ProfileNoNode,
 }
 
+#[derive(Serialize, Debug, PartialEq, Eq)]
+struct NodeReq<'a> {
+    all_profiles: bool,
+    profiles: std::collections::HashSet<&'a str>,
+}
+
+#[derive(Serialize, Debug, PartialEq, Eq)]
+struct RepoReq<'a> {
+    all_nodes: bool,
+    nodes: std::collections::HashMap<&'a str, NodeReq<'a>>,
+}
+
+fn build_repo_reqs<'a>(
+    flakes: &'a [deploy::DeployFlake<'_>],
+) -> Result<HashMap<&'a str, RepoReq<'a>>, GetDeploymentDataError> {
+    let mut repo_reqs: HashMap<&str, RepoReq<'_>> = HashMap::new();
+    for f in flakes {
+        let req = repo_reqs.entry(f.repo).or_insert_with(|| RepoReq {
+            all_nodes: false,
+            nodes: HashMap::new(),
+        });
+        match (&f.node, &f.profile) {
+            (Some(node), Some(profile)) => {
+                let n_req = req.nodes.entry(node.as_str()).or_insert_with(|| NodeReq {
+                    all_profiles: false,
+                    profiles: std::collections::HashSet::new(),
+                });
+                n_req.profiles.insert(profile.as_str());
+            }
+            (Some(node), None) => {
+                let n_req = req.nodes.entry(node.as_str()).or_insert_with(|| NodeReq {
+                    all_profiles: false,
+                    profiles: std::collections::HashSet::new(),
+                });
+                n_req.all_profiles = true;
+            }
+            (None, None) => {
+                req.all_nodes = true;
+            }
+            (None, Some(_)) => return Err(GetDeploymentDataError::ProfileNoNode),
+        }
+    }
+    Ok(repo_reqs)
+}
+
 /// Evaluates the Nix in the given `repo` and return the processed Data from it
 async fn get_deployment_data(
     supports_flakes: bool,
     flakes: &[deploy::DeployFlake<'_>],
     extra_build_args: &[String],
 ) -> Result<Vec<deploy::data::Data>, GetDeploymentDataError> {
-    futures_util::stream::iter(flakes).then(|flake| async move {
+    if flakes.is_empty() {
+        return Ok(Vec::new());
+    }
 
-    info!("Evaluating flake in {}", flake.repo);
-
-    let mut c = if supports_flakes {
-        Command::new("nix")
-    } else {
-        Command::new("nix-instantiate")
-    };
-
-    if supports_flakes {
-        c.arg("eval")
-            .arg("--json")
-            .arg(format!("{}#deploy", flake.repo))
-            // We use --apply instead of --expr so that we don't have to deal with builtins.getFlake
-            .arg("--apply");
-        match (&flake.node, &flake.profile) {
-            (Some(node), Some(profile)) => {
-                // Ignore all nodes and all profiles but the one we're evaluating
-                c.arg(format!(
-                    r#"
-                      deploy:
-                      (deploy // {{
-                        nodes = {{
-                          "{0}" = deploy.nodes."{0}" // {{
-                            profiles = {{
-                              inherit (deploy.nodes."{0}".profiles) "{1}";
-                            }};
-                          }};
-                        }};
-                      }})
-                     "#,
-                    node, profile
-                ))
+    let flakes_str = flakes
+        .iter()
+        .map(|f| {
+            let mut name = f.repo.to_string();
+            if let Some(node) = &f.node {
+                name.push_str(&format!("#{}", node));
+                if let Some(profile) = &f.profile {
+                    name.push_str(&format!(".{}", profile));
+                }
             }
-            (Some(node), None) => {
-                // Ignore all nodes but the one we're evaluating
-                c.arg(format!(
-                    r#"
-                      deploy:
-                      (deploy // {{
-                        nodes = {{
-                          inherit (deploy.nodes) "{}";
-                        }};
-                      }})
-                    "#,
-                    node
-                ))
-            }
-            (None, None) => {
-                // We need to evaluate all profiles of all nodes anyway, so just do it strictly
-                c.arg("deploy: deploy")
-            }
-            (None, Some(_)) => return Err(GetDeploymentDataError::ProfileNoNode),
-        }
-    } else {
-        c
-            .arg("--strict")
-            .arg("--read-write-mode")
-            .arg("--json")
-            .arg("--eval")
-            .arg("-E")
-            .arg(format!("let r = import {}/.; in if builtins.isFunction r then (r {{}}).deploy else r.deploy", flake.repo))
-    };
+            format!("`{}`", name)
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    info!(
+        "Evaluating {} {}: {}",
+        flakes.len(),
+        if flakes.len() > 1 { "flakes" } else { "flake" },
+        flakes_str
+    );
 
-    c.args(extra_build_args);
+    let repo_reqs = build_repo_reqs(flakes)?;
 
-    let build_child = c
-        .stdout(Stdio::piped())
-        .spawn()
-        .map_err(GetDeploymentDataError::NixEval)?;
+    let mut repo_data_futures = Vec::new();
+    for (repo, req) in repo_reqs {
+        let extra_build_args = extra_build_args.to_vec();
+        repo_data_futures.push(async move {
+            let mut c = if supports_flakes {
+                let req_json = serde_json::to_string(&req).expect("failed to serialize request");
+                let filter_expr = r#"
+req: deploy:
+let
+  filterNode = name: node:
+    if builtins.hasAttr name req.nodes then
+      let
+        nReq = req.nodes.${name};
+      in
+        if nReq.all_profiles then
+          node
+        else
+          node // {
+            profiles = builtins.intersectAttrs
+              (builtins.listToAttrs (map (p: { name = p; value = true; }) nReq.profiles))
+              node.profiles;
+          }
+    else
+      {};
+in
+  if req.all_nodes then
+    deploy
+  else
+    deploy // {
+      nodes = builtins.intersectAttrs
+        (builtins.listToAttrs (map (n: { name = n; value = true; }) (builtins.attrNames req.nodes)))
+        (builtins.mapAttrs filterNode deploy.nodes);
+    }
+"#;
 
-    let build_output = build_child
-        .wait_with_output()
-        .await
-        .map_err(GetDeploymentDataError::NixEvalOut)?;
+                let mut c = Command::new("nix");
+                c.arg("eval")
+                    .arg("--json")
+                    .arg(format!("{}#deploy", repo))
+                    .arg("--apply")
+                    .arg(format!("({}) (builtins.fromJSON ''{}'')", filter_expr, req_json));
+                c
+            } else {
+                let mut c = Command::new("nix-instantiate");
+                c.arg("--strict")
+                    .arg("--read-write-mode")
+                    .arg("--json")
+                    .arg("--eval")
+                    .arg("-E")
+                    .arg(format!("let r = import {}/.; in if builtins.isFunction r then (r {{}}).deploy else r.deploy", repo));
+                c
+            };
+            c.args(extra_build_args);
 
-    match build_output.status.code() {
-        Some(0) => (),
-        a => return Err(GetDeploymentDataError::NixEvalExit(a)),
-    };
+            let build_child = c
+                .stdout(Stdio::piped())
+                .spawn()
+                .map_err(GetDeploymentDataError::NixEval)?;
 
-    let data_json = String::from_utf8(build_output.stdout)?;
+            let build_output = build_child
+                .wait_with_output()
+                .await
+                .map_err(GetDeploymentDataError::NixEvalOut)?;
 
-    Ok(serde_json::from_str(&data_json)?)
-}).try_collect().await
+            match build_output.status.code() {
+                Some(0) => (),
+                a => return Err(GetDeploymentDataError::NixEvalExit(a)),
+            };
+
+            let data_json = String::from_utf8(build_output.stdout)?;
+            let parsed_data: deploy::data::Data = serde_json::from_str(&data_json)?;
+            Ok::<(&str, deploy::data::Data), GetDeploymentDataError>((repo, parsed_data))
+        });
+    }
+
+    let repo_data: HashMap<&str, deploy::data::Data> = try_join_all(repo_data_futures)
+        .await?
+        .into_iter()
+        .collect();
+
+    let output = flakes
+        .iter()
+        .map(|f| repo_data.get(f.repo).unwrap().clone())
+        .collect();
+
+    Ok(output)
 }
 
 #[derive(Serialize)]
@@ -735,6 +807,218 @@ async fn run_deploy(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::DeployFlake;
+    use std::collections::HashSet;
+
+    #[test]
+    fn test_build_repo_reqs_single_target() {
+        let flakes = vec![DeployFlake {
+            repo: "repo1",
+            node: Some("node1".to_string()),
+            profile: Some("profile1".to_string()),
+        }];
+        let reqs = build_repo_reqs(&flakes).unwrap();
+
+        assert_eq!(reqs.len(), 1);
+        let req = reqs.get("repo1").unwrap();
+        assert!(!req.all_nodes);
+        assert_eq!(req.nodes.len(), 1);
+        let n_req = req.nodes.get("node1").unwrap();
+        assert!(!n_req.all_profiles);
+        assert_eq!(n_req.profiles, vec!["profile1"].into_iter().collect::<HashSet<_>>());
+    }
+
+    #[test]
+    fn test_build_repo_reqs_multiple_targets_same_repo() {
+        let flakes = vec![
+            DeployFlake {
+                repo: "repo1",
+                node: Some("node1".to_string()),
+                profile: Some("profile1".to_string()),
+            },
+            DeployFlake {
+                repo: "repo1",
+                node: Some("node1".to_string()),
+                profile: Some("profile2".to_string()),
+            },
+            DeployFlake {
+                repo: "repo1",
+                node: Some("node2".to_string()),
+                profile: None,
+            },
+        ];
+        let reqs = build_repo_reqs(&flakes).unwrap();
+
+        assert_eq!(reqs.len(), 1);
+        let req = reqs.get("repo1").unwrap();
+        assert_eq!(req.nodes.len(), 2);
+
+        let n1_req = req.nodes.get("node1").unwrap();
+        assert_eq!(n1_req.profiles.len(), 2);
+        assert!(n1_req.profiles.contains("profile1"));
+        assert!(n1_req.profiles.contains("profile2"));
+
+        let n2_req = req.nodes.get("node2").unwrap();
+        assert!(n2_req.all_profiles);
+    }
+
+    #[test]
+    fn test_build_repo_reqs_all_nodes() {
+        let flakes = vec![DeployFlake {
+            repo: "repo1",
+            node: None,
+            profile: None,
+        }];
+        let reqs = build_repo_reqs(&flakes).unwrap();
+
+        assert_eq!(reqs.len(), 1);
+        let req = reqs.get("repo1").unwrap();
+        assert!(req.all_nodes);
+    }
+
+    #[test]
+    fn test_build_repo_reqs_multiple_repos() {
+        let flakes = vec![
+            DeployFlake {
+                repo: "repo1",
+                node: Some("node1".to_string()),
+                profile: None,
+            },
+            DeployFlake {
+                repo: "repo2",
+                node: Some("node2".to_string()),
+                profile: None,
+            },
+        ];
+        let reqs = build_repo_reqs(&flakes).unwrap();
+
+        assert_eq!(reqs.len(), 2);
+        assert!(reqs.contains_key("repo1"));
+        assert!(reqs.contains_key("repo2"));
+    }
+
+    #[test]
+    fn test_build_repo_reqs_invalid_profile_no_node() {
+        let flakes = vec![DeployFlake {
+            repo: "repo1",
+            node: None,
+            profile: Some("profile1".to_string()),
+        }];
+        let res = build_repo_reqs(&flakes);
+        assert!(matches!(res, Err(GetDeploymentDataError::ProfileNoNode)));
+    }
+
+    #[tokio::test]
+    async fn test_get_deployment_data_integration() {
+        // This test requires 'nix' to be installed.
+        if std::process::Command::new("nix").arg("--version").status().is_err() {
+            return;
+        }
+
+        use std::fs;
+        let dir = tempfile::tempdir().unwrap();
+        let flake_path = dir.path().join("flake.nix");
+        let flake_content = r#"
+{
+  outputs = { self }: {
+    deploy = {
+      nodes = {
+        node1 = {
+          hostname = "node1-host";
+          profiles = {
+            p1 = { path = "/nix/store/p1"; };
+            p2 = { path = "/nix/store/p2"; };
+          };
+        };
+        node2 = {
+          hostname = "node2-host";
+          profiles = {
+            pA = { path = "/nix/store/pA"; };
+          };
+        };
+      };
+    };
+  };
+}
+"#;
+        fs::write(&flake_path, flake_content).unwrap();
+
+        let repo = dir.path().to_str().unwrap();
+
+        // Branch 1: req.all_nodes = true
+        let flakes = vec![DeployFlake {
+            repo,
+            node: None,
+            profile: None,
+        }];
+        let data = get_deployment_data(true, &flakes, &[]).await.unwrap();
+        assert_eq!(data.len(), 1);
+        assert_eq!(data[0].nodes.len(), 2);
+        assert!(data[0].nodes.contains_key("node1"));
+        assert!(data[0].nodes.contains_key("node2"));
+
+        // Branch 2: req.all_nodes = false
+        // Branch 2a: node1 in req.nodes
+        // Branch 2a-i: node1.all_profiles = true (node1 has both p1 and p2)
+        let flakes = vec![DeployFlake {
+            repo,
+            node: Some("node1".to_string()),
+            profile: None,
+        }];
+        let data = get_deployment_data(true, &flakes, &[]).await.unwrap();
+        assert_eq!(data.len(), 1);
+        assert_eq!(data[0].nodes.len(), 1);
+        assert!(data[0].nodes.contains_key("node1"));
+        assert_eq!(data[0].nodes["node1"].node_settings.profiles.len(), 2);
+
+        // Branch 2a-ii: node1.all_profiles = false (node1 only has p1)
+        let flakes = vec![DeployFlake {
+            repo,
+            node: Some("node1".to_string()),
+            profile: Some("p1".to_string()),
+        }];
+        let data = get_deployment_data(true, &flakes, &[]).await.unwrap();
+        assert_eq!(data.len(), 1);
+        assert_eq!(data[0].nodes.len(), 1);
+        assert_eq!(data[0].nodes["node1"].node_settings.profiles.len(), 1);
+        assert!(data[0].nodes["node1"].node_settings.profiles.contains_key("p1"));
+        assert!(!data[0].nodes["node1"].node_settings.profiles.contains_key("p2"));
+
+        // Branch 2b: Multiple repos and mixed targets (implicitly tests filtering out node2 when only node1 is requested)
+        // Branch 2b: Multiple repos and mixed targets
+        // Note: Currently, all targets for the same repo get the same combined batched result.
+        let flakes = vec![
+            DeployFlake {
+                repo,
+                node: Some("node1".to_string()),
+                profile: Some("p1".to_string()),
+            },
+            DeployFlake {
+                repo,
+                node: Some("node2".to_string()),
+                profile: None,
+            },
+        ];
+        let data = get_deployment_data(true, &flakes, &[]).await.unwrap();
+        assert_eq!(data.len(), 2);
+        // Both targets share the same combined result for the repo
+        for d in data {
+            assert_eq!(d.nodes.len(), 2);
+            assert!(d.nodes.contains_key("node1"));
+            assert!(d.nodes.contains_key("node2"));
+            // node1 should have reached here with only p1 (filtered by Nix)
+            assert_eq!(d.nodes["node1"].node_settings.profiles.len(), 1);
+            assert!(d.nodes["node1"].node_settings.profiles.contains_key("p1"));
+            // node2 should have all its profiles (pA)
+            assert_eq!(d.nodes["node2"].node_settings.profiles.len(), 1);
+            assert!(d.nodes["node2"].node_settings.profiles.contains_key("pA"));
+        }
+    }
 }
 
 #[derive(Error, Debug)]
