@@ -29,7 +29,7 @@ First-class support for deploying [system-manager](https://github.com/numtide/sy
 ```nix
 {
   # For outputs from `system-manager.lib.makeSystemConfig`
-  path = deploy-rs.lib.x86_64-linux.activate.system-manager self.systemConfigs.some-random-system;
+  path = deploy-rx.lib.x86_64-linux.activate.system-manager self.systemConfigs.some-random-system;
 }
 ```
 

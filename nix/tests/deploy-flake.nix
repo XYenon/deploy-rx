@@ -8,7 +8,7 @@
 ##inputs##
   };
 
-  outputs = { self, nixpkgs, deploy-rs, ... }@inputs: let
+  outputs = { self, nixpkgs, deploy-rx, ... }@inputs: let
     system = "x86_64-linux";
     pkgs = inputs.nixpkgs.legacyPackages.${system};
     user = "deploy";
@@ -36,7 +36,7 @@
           "-o" "StrictHostKeyChecking=no"
           "-o" "StrictHostKeyChecking=no"
         ];
-        profiles.system.path = deploy-rs.lib."${system}".activate.nixos self.nixosConfigurations.server;
+        profiles.system.path = deploy-rx.lib."${system}".activate.nixos self.nixosConfigurations.server;
       };
       server-override = {
         hostname = "override";
@@ -46,7 +46,7 @@
         sshOpts = [ ];
         confirmTimeout = 0;
         activationTimeout = 0;
-        profiles.system.path = deploy-rs.lib."${system}".activate.nixos self.nixosConfigurations.server;
+        profiles.system.path = deploy-rx.lib."${system}".activate.nixos self.nixosConfigurations.server;
       };
       profile = {
         hostname = "server";
@@ -64,7 +64,7 @@
               ln -s ${pkgs.hello}/bin/hello /home/${user}/.nix-profile/bin/hello
               ln -s ${pkgs.figlet}/bin/figlet /home/${user}/.nix-profile/bin/figlet
             '';
-          in deploy-rs.lib.${system}.activate.custom activateProfile "$PROFILE/bin/activate";
+          in deploy-rx.lib.${system}.activate.custom activateProfile "$PROFILE/bin/activate";
         };
       };
     };

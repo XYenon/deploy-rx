@@ -3,9 +3,9 @@
 # SPDX-License-Identifier: MPL-2.0
 
 [package]
-name = "deploy-rs"
+name = "deploy-rx"
 version = "0.1.0"
-authors = ["notgne2 <gen2@gen2.space>", "Serokell <hi@serokell.io>"]
+authors = ["notgne2 <gen2@gen2.space>", "Serokell <hi@serokell.io>", "XYenon <i@xyenon.bid>"]
 edition = "2018"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html

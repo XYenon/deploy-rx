@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 pub fn make_lock_path(temp_path: &Path, closure: &str) -> PathBuf {
     let lock_hash =
         &closure["/nix/store/".len()..closure.find('-').unwrap_or_else(|| closure.len())];
-    temp_path.join(format!("deploy-rs-canary-{}", lock_hash))
+    temp_path.join(format!("deploy-rx-canary-{}", lock_hash))
 }
 
 const fn make_emoji(level: log::Level) -> &'static str {

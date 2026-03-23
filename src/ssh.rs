@@ -13,18 +13,18 @@ use tokio::sync::Mutex;
 
 fn get_runtime_dir() -> PathBuf {
     if let Ok(runtime_dir) = env::var("XDG_RUNTIME_DIR") {
-        return PathBuf::from(runtime_dir).join("deploy-rs");
+        return PathBuf::from(runtime_dir).join("deploy-rx");
     }
 
     if let Ok(tmpdir) = env::var("TMPDIR") {
-        return PathBuf::from(tmpdir).join("deploy-rs");
+        return PathBuf::from(tmpdir).join("deploy-rx");
     }
 
     if let Some(home) = dirs::home_dir() {
-        return home.join(".cache").join("deploy-rs");
+        return home.join(".cache").join("deploy-rx");
     }
 
-    PathBuf::from("/tmp").join("deploy-rs")
+    PathBuf::from("/tmp").join("deploy-rx")
 }
 
 #[derive(Error, Debug)]
@@ -53,7 +53,7 @@ impl SshControlMaster {
         ssh_opts: &[String],
         temp_path: &Path,
     ) -> Self {
-        let control_path = temp_path.join(format!("deploy-rs-ssh-{}", hostname));
+        let control_path = temp_path.join(format!("deploy-rx-ssh-{}", hostname));
 
         Self {
             control_path,

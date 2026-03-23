@@ -19,10 +19,10 @@
   {
     overlays.default = final: prev:
     {
-      deploy-rs = {
+      deploy-rx = {
 
-        deploy-rs = final.rustPlatform.buildRustPackage {
-          pname = "deploy-rs";
+        deploy-rx = final.rustPlatform.buildRustPackage {
+          pname = "deploy-rx";
           version = "0.1.0";
 
           src = final.lib.sourceByRegex ./. [
@@ -51,7 +51,7 @@
         lib = rec {
 
           setActivate = builtins.trace
-            "deploy-rs#lib.setActivate is deprecated, use activate.noop, activate.nixos, activate.darwin, activate.home-manager, activate.system-manager or activate.custom instead"
+            "deploy-rx#lib.setActivate is deprecated, use activate.noop, activate.nixos, activate.darwin, activate.home-manager, activate.system-manager or activate.custom instead"
             activate.custom;
 
           activate = rec {
@@ -80,13 +80,13 @@
                             fi
                           '';
                           executable = true;
-                          destination = "/deploy-rs-activate";
+                          destination = "/deploy-rx-activate";
                         })
                         (final.writeTextFile {
                             name = base.name + "-activate-rs";
                             text = ''
                             #!${final.runtimeShell}
-                            exec ${final.deploy-rs.deploy-rs}/bin/activate "$@"
+                            exec ${final.deploy-rx.deploy-rx}/bin/activate "$@"
                           '';
                           executable = true;
                           destination = "/activate-rs";
@@ -137,13 +137,13 @@
               let
                 profiles = builtins.concatLists (final.lib.mapAttrsToList (nodeName: node: final.lib.mapAttrsToList (profileName: profile: [ (toString profile.path) nodeName profileName ]) node.profiles) deploy.nodes);
               in
-              final.runCommand "deploy-rs-check-activate" { } ''
+              final.runCommand "deploy-rx-check-activate" { } ''
                 for x in ${builtins.concatStringsSep " " (map (p: builtins.concatStringsSep ":" p) profiles)}; do
                   profile_path=$(echo $x | cut -f1 -d:)
                   node_name=$(echo $x | cut -f2 -d:)
                   profile_name=$(echo $x | cut -f3 -d:)
 
-                  test -f "$profile_path/deploy-rs-activate" || (echo "#$node_name.$profile_name is missing the deploy-rs-activate activation script" && exit 1);
+                  test -f "$profile_path/deploy-rx-activate" || (echo "#$node_name.$profile_name is missing the deploy-rx-activate activation script" && exit 1);
 
                   test -f "$profile_path/activate-rs" || (echo "#$node_name.$profile_name is missing the activate-rs activation script" && exit 1);
                 done
@@ -168,17 +168,17 @@
         };
       in
       {
-        packages.default = self.packages."${system}".deploy-rs;
-        packages.deploy-rs = pkgs.deploy-rs.deploy-rs;
+        packages.default = self.packages."${system}".deploy-rx;
+        packages.deploy-rx = pkgs.deploy-rx.deploy-rx;
 
-        apps.default = self.apps."${system}".deploy-rs;
-        apps.deploy-rs = {
+        apps.default = self.apps."${system}".deploy-rx;
+        apps.deploy-rx = {
           type = "app";
           program = "${self.packages."${system}".default}/bin/deploy";
         };
 
         devShells.default = pkgs.mkShell {
-          inputsFrom = [ self.packages.${system}.deploy-rs ];
+          inputsFrom = [ self.packages.${system}.deploy-rx ];
           RUST_SRC_PATH = "${pkgs.rust.packages.stable.rustPlatform.rustLibSrc}";
           buildInputs = with pkgs; [
             nix
@@ -193,12 +193,12 @@
         };
 
         checks = {
-          deploy-rs = self.packages.${system}.default.overrideAttrs (super: { doCheck = true; });
+          deploy-rx = self.packages.${system}.default.overrideAttrs (super: { doCheck = true; });
         } // (pkgs.lib.optionalAttrs (pkgs.lib.elem system ["x86_64-linux"]) (import ./nix/tests {
           inherit inputs pkgs;
         }));
 
-        inherit (pkgs.deploy-rs) lib;
+        inherit (pkgs.deploy-rx) lib;
 
         check-matrix = mkMatrix "check" self.checks.${system};
       });
