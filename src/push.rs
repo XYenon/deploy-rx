@@ -81,7 +81,6 @@ async fn run_build_command(
                 "Build tree visualization requested but `nom` is not available in PATH; falling back to regular build logs"
             );
         } else {
-            info!("Streaming build tree with nix-output-monitor (`nom`)");
 
             build_command
                 .arg("--log-format")
@@ -419,12 +418,22 @@ pub async fn build_profiles_locally(
         );
     }
 
-    for (d, _) in items {
-        info!(
-            "Building profile `{}` for node `{}`",
-            d.deploy_data.profile_name, d.deploy_data.node_name
-        );
-    }
+    let profiles_str = items
+        .iter()
+        .map(|(d, _)| {
+            format!(
+                "`{}` for `{}`",
+                d.deploy_data.profile_name, d.deploy_data.node_name
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    info!(
+        "Building {} {}: {}",
+        items.len(),
+        if items.len() > 1 { "profiles" } else { "profile" },
+        profiles_str
+    );
 
     let derivations: Vec<&str> = items.iter().map(|&(_, d)| d).collect();
     let profiles: Vec<BuildCommandInfo> = items
