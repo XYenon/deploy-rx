@@ -464,12 +464,9 @@ pub async fn build_profiles_locally(
 /// Remote profiles are built individually; local profiles are batched into a
 /// single `nix build` invocation for efficiency.
 pub async fn build_profiles(datas: &[PushProfileData<'_>]) -> Result<(), PushProfileError> {
-    // Resolve derivations for every profile
-    let mut derivations: Vec<String> = Vec::with_capacity(datas.len());
-    for data in datas {
-        let deriver = resolve_derivation(data).await?;
-        derivations.push(deriver);
-    }
+    // Resolve derivations for every profile concurrently
+    let derivations: Vec<String> =
+        futures_util::future::try_join_all(datas.iter().map(resolve_derivation)).await?;
 
     // Separate remote vs local, building remote ones immediately
     let mut local_builds: Vec<(&PushProfileData<'_>, &str)> = Vec::new();
