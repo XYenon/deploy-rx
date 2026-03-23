@@ -5,16 +5,15 @@
 
 use deploy::cli;
 use log::error;
+use std::process::ExitCode;
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> ExitCode {
     match cli::run(None).await {
-        Ok(()) => (),
+        Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             error!("{}", err);
-            std::process::exit(1);
+            ExitCode::FAILURE
         }
     }
-
-    Ok(())
 }
