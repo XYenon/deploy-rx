@@ -37,6 +37,7 @@ First-class support for deploying [system-manager](https://github.com/numtide/sy
 
 - **Build-tree Visualization**: Streams the build process visually using `nix-output-monitor` (`nom`). Enabled by default (bypass with `--no-build-tree`).
 - **Diff & Change Review**: Integrated, super-fast diffing (`dix`) of derivation changes before activation or switch. Enabled by default (bypass with `--no-review-changes`).
+- **Batched Nix Builds**: Intelligently groups multiple deployment targets into a single nix build invocation, reducing derivation evaluation overhead and improving overall build speed.
 
 ---
 
