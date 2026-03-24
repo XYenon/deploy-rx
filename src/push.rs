@@ -155,8 +155,8 @@ pub async fn build_profile_remotely(
     derivation_name: &str,
 ) -> Result<(), PushProfileError> {
     info!(
-        "Building profile `{}` for node `{}` on remote host",
-        data.deploy_data.profile_name, data.deploy_data.node_name
+        "Building profile `{}.{}` on remote host",
+        data.deploy_data.node_name, data.deploy_data.profile_name
     );
 
     // TODO: this should probably be handled more nicely during 'data' construction
@@ -420,12 +420,7 @@ pub async fn build_profiles_locally(
 
     let profiles_str = items
         .iter()
-        .map(|(d, _)| {
-            format!(
-                "`{}` for `{}`",
-                d.deploy_data.profile_name, d.deploy_data.node_name
-            )
-        })
+        .map(|(d, _)| {format!("`{}.{}`", d.deploy_data.node_name, d.deploy_data.profile_name)})
         .collect::<Vec<_>>()
         .join(", ");
     info!(
