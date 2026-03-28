@@ -81,7 +81,6 @@ async fn run_build_command(
                 "Build tree visualization requested but `nom` is not available in PATH; falling back to regular build logs"
             );
         } else {
-
             build_command
                 .arg("--log-format")
                 .arg("internal-json")
@@ -420,13 +419,22 @@ pub async fn build_profiles_locally(
 
     let profiles_str = items
         .iter()
-        .map(|(d, _)| {format!("`{}.{}`", d.deploy_data.node_name, d.deploy_data.profile_name)})
+        .map(|(d, _)| {
+            format!(
+                "`{}.{}`",
+                d.deploy_data.node_name, d.deploy_data.profile_name
+            )
+        })
         .collect::<Vec<_>>()
         .join(", ");
     info!(
         "Building {} {}: {}",
         items.len(),
-        if items.len() > 1 { "profiles" } else { "profile" },
+        if items.len() > 1 {
+            "profiles"
+        } else {
+            "profile"
+        },
         profiles_str
     );
 
@@ -575,14 +583,7 @@ mod tests {
 
     #[test]
     fn test_make_build_command_flakes_single_derivation() {
-        let cmd = make_build_command(
-            true,
-            false,
-            None,
-            &[],
-            &["/nix/store/abc.drv^out"],
-            &[],
-        );
+        let cmd = make_build_command(true, false, None, &[], &["/nix/store/abc.drv^out"], &[]);
         assert_eq!(
             get_args(&cmd),
             vec!["nix", "build", "/nix/store/abc.drv^out", "--no-link"]
@@ -696,14 +697,7 @@ mod tests {
     #[test]
     fn test_make_build_command_extra_args() {
         let extra = vec!["--option".to_string(), "foo".to_string(), "bar".to_string()];
-        let cmd = make_build_command(
-            true,
-            false,
-            None,
-            &extra,
-            &["/nix/store/abc.drv^out"],
-            &[],
-        );
+        let cmd = make_build_command(true, false, None, &extra, &["/nix/store/abc.drv^out"], &[]);
         assert_eq!(
             get_args(&cmd),
             vec![
@@ -782,12 +776,20 @@ mod tests {
             profile_settings: crate::data::ProfileSettings {
                 path: "/nonexistent/path".to_string(),
                 profile_path: None,
+                tags: vec![],
             },
             generic_settings: empty_settings(),
         };
         let cmd_overrides = empty_cmd_overrides();
         let deploy_data = crate::make_deploy_data(
-            &settings, &node, "testnode", &profile, "system", &cmd_overrides, false, None,
+            &settings,
+            &node,
+            "testnode",
+            &profile,
+            "system",
+            &cmd_overrides,
+            false,
+            None,
         );
         let deploy_defs = test_deploy_defs();
         let data = PushProfileData {
@@ -821,12 +823,20 @@ mod tests {
             profile_settings: crate::data::ProfileSettings {
                 path: dir.path().to_string_lossy().into_owned(),
                 profile_path: None,
+                tags: vec![],
             },
             generic_settings: empty_settings(),
         };
         let cmd_overrides = empty_cmd_overrides();
         let deploy_data = crate::make_deploy_data(
-            &settings, &node, "testnode", &profile, "system", &cmd_overrides, false, None,
+            &settings,
+            &node,
+            "testnode",
+            &profile,
+            "system",
+            &cmd_overrides,
+            false,
+            None,
         );
         let deploy_defs = test_deploy_defs();
         let data = PushProfileData {
@@ -861,12 +871,20 @@ mod tests {
             profile_settings: crate::data::ProfileSettings {
                 path: dir.path().to_string_lossy().into_owned(),
                 profile_path: None,
+                tags: vec![],
             },
             generic_settings: empty_settings(),
         };
         let cmd_overrides = empty_cmd_overrides();
         let deploy_data = crate::make_deploy_data(
-            &settings, &node, "testnode", &profile, "system", &cmd_overrides, false, None,
+            &settings,
+            &node,
+            "testnode",
+            &profile,
+            "system",
+            &cmd_overrides,
+            false,
+            None,
         );
         let deploy_defs = test_deploy_defs();
         let data = PushProfileData {

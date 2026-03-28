@@ -552,6 +552,7 @@ mod deploy_data_tests {
             profile_settings: data::ProfileSettings {
                 path: "/nix/store/new-profile".to_string(),
                 profile_path: Some("".to_string()),
+                tags: vec![],
             },
             generic_settings: data::GenericSettings {
                 user: Some("root".to_string()),
