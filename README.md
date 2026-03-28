@@ -44,7 +44,7 @@ First-class support for deploying [system-manager](https://github.com/numtide/sy
 Profiles can now declare `tags`, and the CLI can deploy every matching profile across all nodes in one command.
 
 - Use `deploy --tag <tag> <flake>` to deploy all profiles carrying that tag.
-- Pass `--tag` multiple times to match any of the requested tags.
+- Pass `--tag` multiple times to match only profiles carrying **all** of the requested tags.
 
 ```nix
 profiles.system = {

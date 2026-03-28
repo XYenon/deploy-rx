@@ -30,7 +30,7 @@ pub struct Opts {
     /// A list of flakes to deploy alternatively
     #[arg(long, group = "deploy", num_args = 1..)]
     targets: Option<Vec<String>>,
-    /// Only deploy profiles matching at least one of the given tags
+    /// Only deploy profiles matching all of the given tags
     #[arg(short = 't', long = "tag")]
     tags: Vec<String>,
     /// Treat targets as files instead of flakes
@@ -513,12 +513,8 @@ type ToDeploy<'a> = Vec<(
 )>;
 
 fn profile_matches_tags(profile: &deploy::data::Profile, tags: &HashSet<&str>) -> bool {
-    tags.is_empty()
-        || profile
-            .profile_settings
-            .tags
-            .iter()
-            .any(|tag| tags.contains(tag.as_str()))
+    tags.iter()
+        .all(|tag| profile.profile_settings.tags.iter().any(|t| t == *tag))
 }
 
 fn ordered_profiles_for_node<'a>(
@@ -526,23 +522,25 @@ fn ordered_profiles_for_node<'a>(
     tags: &HashSet<&str>,
 ) -> Result<Vec<(&'a str, &'a deploy::data::Profile)>, RunDeployError> {
     let mut profiles_list = Vec::new();
+    let mut seen = HashSet::new();
 
-    for profile_name in [
-        node.node_settings.profiles_order.iter().collect(),
-        node.node_settings.profiles.keys().collect::<Vec<&String>>(),
-    ]
-    .concat()
+    for profile_name in node
+        .node_settings
+        .profiles_order
+        .iter()
+        .map(|s| s.as_str())
+        .chain(node.node_settings.profiles.keys().map(|s| s.as_str()))
     {
-        let profile_name = profile_name.as_str();
-        let profile = match node.node_settings.profiles.get(profile_name) {
-            Some(x) => x,
-            None => return Err(RunDeployError::ProfileNotFound(profile_name.to_string())),
-        };
+        if seen.insert(profile_name) {
+            let profile = node
+                .node_settings
+                .profiles
+                .get(profile_name)
+                .ok_or_else(|| RunDeployError::ProfileNotFound(profile_name.to_string()))?;
 
-        if !profiles_list.iter().any(|(name, _)| *name == profile_name)
-            && profile_matches_tags(profile, tags)
-        {
-            profiles_list.push((profile_name, profile));
+            if profile_matches_tags(profile, tags) {
+                profiles_list.push((profile_name, profile));
+            }
         }
     }
 
@@ -1051,12 +1049,16 @@ mod tests {
     }
 
     #[test]
-    fn test_profile_matches_tags_supports_empty_matching_and_non_matching_sets() {
+    fn test_profile_matches_tags_supports_empty_matching_all_matching_and_non_matching_sets() {
         let profile = profile_with_tags(&["prod", "blue"]);
 
         assert!(profile_matches_tags(&profile, &HashSet::new()));
         assert!(profile_matches_tags(&profile, &HashSet::from(["prod"])));
         assert!(profile_matches_tags(
+            &profile,
+            &HashSet::from(["blue", "prod"])
+        ));
+        assert!(!profile_matches_tags(
             &profile,
             &HashSet::from(["missing", "blue"])
         ));
