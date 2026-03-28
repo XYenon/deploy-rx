@@ -39,6 +39,20 @@ First-class support for deploying [system-manager](https://github.com/numtide/sy
 - **Diff & Change Review**: Integrated, super-fast diffing (`dix`) of derivation changes before activation or switch. Enabled by default (bypass with `--no-review-changes`).
 - **Batched Nix Evaluation & Builds**: Intelligently groups multiple deployment targets from the same flake into a single `nix eval` and a single `nix build` invocation, reducing Nix overhead and improving deployment speed.
 
+### Tag-Based Profile Selection
+
+Profiles can now declare `tags`, and the CLI can deploy every matching profile across all nodes in one command.
+
+- Use `deploy --tag <tag> <flake>` to deploy all profiles carrying that tag.
+- Pass `--tag` multiple times to match any of the requested tags.
+
+```nix
+profiles.system = {
+  path = deploy-rx.lib.x86_64-linux.activate.nixos self.nixosConfigurations.some-random-system;
+  tags = [ "production" "system" ];
+};
+```
+
 ---
 
 *Below is the original documentation for `deploy-rs`. The core functionality and architecture largely apply to `deploy-rx` as well:*

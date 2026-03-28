@@ -3,7 +3,7 @@
 //
 // SPDX-License-Identifier: MPL-2.0
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{stdin, stdout, Write};
 
 use clap::{ArgMatches, FromArgMatches, Parser};
@@ -30,6 +30,9 @@ pub struct Opts {
     /// A list of flakes to deploy alternatively
     #[arg(long, group = "deploy", num_args = 1..)]
     targets: Option<Vec<String>>,
+    /// Only deploy profiles matching at least one of the given tags
+    #[arg(short = 't', long = "tag")]
+    tags: Vec<String>,
     /// Treat targets as files instead of flakes
     #[clap(short, long)]
     file: Option<String>,
@@ -357,10 +360,8 @@ in
         });
     }
 
-    let repo_data: HashMap<&str, deploy::data::Data> = try_join_all(repo_data_futures)
-        .await?
-        .into_iter()
-        .collect();
+    let repo_data: HashMap<&str, deploy::data::Data> =
+        try_join_all(repo_data_futures).await?.into_iter().collect();
 
     let output = flakes
         .iter()
@@ -500,6 +501,8 @@ pub enum RunDeployError {
     Rollback(String),
     #[error("Failed to establish SSH control master: {0}")]
     SshControlMaster(#[from] deploy::ssh::SshError),
+    #[error("No profiles matched the requested tags: {0}")]
+    NoProfilesMatchedTags(String),
 }
 
 type ToDeploy<'a> = Vec<(
@@ -508,6 +511,113 @@ type ToDeploy<'a> = Vec<(
     (&'a str, &'a deploy::data::Node),
     (&'a str, &'a deploy::data::Profile),
 )>;
+
+fn profile_matches_tags(profile: &deploy::data::Profile, tags: &HashSet<&str>) -> bool {
+    tags.is_empty()
+        || profile
+            .profile_settings
+            .tags
+            .iter()
+            .any(|tag| tags.contains(tag.as_str()))
+}
+
+fn ordered_profiles_for_node<'a>(
+    node: &'a deploy::data::Node,
+    tags: &HashSet<&str>,
+) -> Result<Vec<(&'a str, &'a deploy::data::Profile)>, RunDeployError> {
+    let mut profiles_list = Vec::new();
+
+    for profile_name in [
+        node.node_settings.profiles_order.iter().collect(),
+        node.node_settings.profiles.keys().collect::<Vec<&String>>(),
+    ]
+    .concat()
+    {
+        let profile_name = profile_name.as_str();
+        let profile = match node.node_settings.profiles.get(profile_name) {
+            Some(x) => x,
+            None => return Err(RunDeployError::ProfileNotFound(profile_name.to_string())),
+        };
+
+        if !profiles_list.iter().any(|(name, _)| *name == profile_name)
+            && profile_matches_tags(profile, tags)
+        {
+            profiles_list.push((profile_name, profile));
+        }
+    }
+
+    Ok(profiles_list)
+}
+
+fn collect_to_deploy<'a>(
+    deploy_flakes: &'a [deploy::DeployFlake<'a>],
+    data: &'a [deploy::data::Data],
+    tags: &[String],
+) -> Result<ToDeploy<'a>, RunDeployError> {
+    let requested_tags: HashSet<&str> = tags.iter().map(|tag| tag.as_str()).collect();
+
+    let to_deploy = deploy_flakes
+        .iter()
+        .zip(data)
+        .map(|(deploy_flake, data)| {
+            let to_deploys: ToDeploy = match (&deploy_flake.node, &deploy_flake.profile) {
+                (Some(node_name), Some(profile_name)) => {
+                    let node = match data.nodes.get(node_name) {
+                        Some(x) => x,
+                        None => return Err(RunDeployError::NodeNotFound(node_name.clone())),
+                    };
+                    let profile = match node.node_settings.profiles.get(profile_name) {
+                        Some(x) => x,
+                        None => return Err(RunDeployError::ProfileNotFound(profile_name.clone())),
+                    };
+
+                    if profile_matches_tags(profile, &requested_tags) {
+                        vec![(
+                            deploy_flake,
+                            data,
+                            (node_name.as_str(), node),
+                            (profile_name.as_str(), profile),
+                        )]
+                    } else {
+                        Vec::new()
+                    }
+                }
+                (Some(node_name), None) => {
+                    let node = match data.nodes.get(node_name) {
+                        Some(x) => x,
+                        None => return Err(RunDeployError::NodeNotFound(node_name.clone())),
+                    };
+
+                    ordered_profiles_for_node(node, &requested_tags)?
+                        .into_iter()
+                        .map(|x| (deploy_flake, data, (node_name.as_str(), node), x))
+                        .collect()
+                }
+                (None, None) => {
+                    let mut l = Vec::new();
+
+                    for (node_name, node) in &data.nodes {
+                        let ll: ToDeploy = ordered_profiles_for_node(node, &requested_tags)?
+                            .into_iter()
+                            .map(|x| (deploy_flake, data, (node_name.as_str(), node), x))
+                            .collect();
+
+                        l.extend(ll);
+                    }
+
+                    l
+                }
+                (None, Some(_)) => return Err(RunDeployError::ProfileWithoutNode),
+            };
+            Ok(to_deploys)
+        })
+        .collect::<Result<Vec<ToDeploy>, RunDeployError>>()?
+        .into_iter()
+        .flatten()
+        .collect();
+
+    Ok(to_deploy)
+}
 
 async fn run_deploy(
     deploy_flakes: Vec<deploy::DeployFlake<'_>>,
@@ -528,104 +638,13 @@ async fn run_deploy(
     rollback_fresh_connection: bool,
     build_tree: bool,
     review_changes: bool,
+    tags: &[String],
 ) -> Result<(), RunDeployError> {
-    let to_deploy: ToDeploy = deploy_flakes
-        .iter()
-        .zip(&data)
-        .map(|(deploy_flake, data)| {
-            let to_deploys: ToDeploy = match (&deploy_flake.node, &deploy_flake.profile) {
-                (Some(node_name), Some(profile_name)) => {
-                    let node = match data.nodes.get(node_name) {
-                        Some(x) => x,
-                        None => return Err(RunDeployError::NodeNotFound(node_name.clone())),
-                    };
-                    let profile = match node.node_settings.profiles.get(profile_name) {
-                        Some(x) => x,
-                        None => return Err(RunDeployError::ProfileNotFound(profile_name.clone())),
-                    };
+    let to_deploy = collect_to_deploy(&deploy_flakes, &data, tags)?;
 
-                    vec![(
-                        deploy_flake,
-                        data,
-                        (node_name.as_str(), node),
-                        (profile_name.as_str(), profile),
-                    )]
-                }
-                (Some(node_name), None) => {
-                    let node = match data.nodes.get(node_name) {
-                        Some(x) => x,
-                        None => return Err(RunDeployError::NodeNotFound(node_name.clone())),
-                    };
-
-                    let mut profiles_list: Vec<(&str, &deploy::data::Profile)> = Vec::new();
-
-                    for profile_name in [
-                        node.node_settings.profiles_order.iter().collect(),
-                        node.node_settings.profiles.keys().collect::<Vec<&String>>(),
-                    ]
-                    .concat()
-                    {
-                        let profile = match node.node_settings.profiles.get(profile_name) {
-                            Some(x) => x,
-                            None => {
-                                return Err(RunDeployError::ProfileNotFound(profile_name.clone()))
-                            }
-                        };
-
-                        if !profiles_list.iter().any(|(n, _)| n == profile_name) {
-                            profiles_list.push((profile_name, profile));
-                        }
-                    }
-
-                    profiles_list
-                        .into_iter()
-                        .map(|x| (deploy_flake, data, (node_name.as_str(), node), x))
-                        .collect()
-                }
-                (None, None) => {
-                    let mut l = Vec::new();
-
-                    for (node_name, node) in &data.nodes {
-                        let mut profiles_list: Vec<(&str, &deploy::data::Profile)> = Vec::new();
-
-                        for profile_name in [
-                            node.node_settings.profiles_order.iter().collect(),
-                            node.node_settings.profiles.keys().collect::<Vec<&String>>(),
-                        ]
-                        .concat()
-                        {
-                            let profile = match node.node_settings.profiles.get(profile_name) {
-                                Some(x) => x,
-                                None => {
-                                    return Err(RunDeployError::ProfileNotFound(
-                                        profile_name.clone(),
-                                    ))
-                                }
-                            };
-
-                            if !profiles_list.iter().any(|(n, _)| n == profile_name) {
-                                profiles_list.push((profile_name, profile));
-                            }
-                        }
-
-                        let ll: ToDeploy = profiles_list
-                            .into_iter()
-                            .map(|x| (deploy_flake, data, (node_name.as_str(), node), x))
-                            .collect();
-
-                        l.extend(ll);
-                    }
-
-                    l
-                }
-                (None, Some(_)) => return Err(RunDeployError::ProfileWithoutNode),
-            };
-            Ok(to_deploys)
-        })
-        .collect::<Result<Vec<ToDeploy>, RunDeployError>>()?
-        .into_iter()
-        .flatten()
-        .collect();
+    if to_deploy.is_empty() && !tags.is_empty() {
+        return Err(RunDeployError::NoProfilesMatchedTags(tags.join(", ")));
+    }
 
     let mut parts: Vec<(
         &deploy::DeployFlake<'_>,
@@ -687,17 +706,19 @@ async fn run_deploy(
 
     let push_profile_datas: Vec<_> = parts
         .iter()
-        .map(|(deploy_flake, deploy_data, deploy_defs)| deploy::push::PushProfileData {
-            supports_flakes,
-            check_sigs,
-            repo: deploy_flake.repo,
-            deploy_data,
-            deploy_defs,
-            keep_result,
-            result_path,
-            extra_build_args,
-            build_tree,
-        })
+        .map(
+            |(deploy_flake, deploy_data, deploy_defs)| deploy::push::PushProfileData {
+                supports_flakes,
+                check_sigs,
+                repo: deploy_flake.repo,
+                deploy_data,
+                deploy_defs,
+                keep_result,
+                result_path,
+                extra_build_args,
+                build_tree,
+            },
+        )
         .collect();
 
     // Resolve derivations, then build all profiles (remote individually, local batched)
@@ -813,7 +834,99 @@ async fn run_deploy(
 mod tests {
     use super::*;
     use crate::DeployFlake;
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
+
+    fn empty_generic_settings() -> crate::data::GenericSettings {
+        crate::data::GenericSettings {
+            ssh_user: None,
+            user: None,
+            ssh_opts: vec![],
+            fast_connection: None,
+            auto_rollback: None,
+            confirm_timeout: None,
+            activation_timeout: None,
+            temp_path: None,
+            magic_rollback: None,
+            sudo: None,
+            remote_build: None,
+            interactive_sudo: None,
+        }
+    }
+
+    fn profile_with_tags(tags: &[&str]) -> crate::data::Profile {
+        crate::data::Profile {
+            profile_settings: crate::data::ProfileSettings {
+                path: "/nix/store/test-profile".to_string(),
+                profile_path: None,
+                tags: tags.iter().map(|tag| tag.to_string()).collect(),
+            },
+            generic_settings: empty_generic_settings(),
+        }
+    }
+
+    fn second_node_with_profiles() -> crate::data::Node {
+        let mut profiles = HashMap::new();
+        profiles.insert("api".to_string(), profile_with_tags(&["edge", "prod"]));
+        profiles.insert("batch".to_string(), profile_with_tags(&["batch"]));
+
+        crate::data::Node {
+            generic_settings: empty_generic_settings(),
+            node_settings: crate::data::NodeSettings {
+                hostname: "example.net".to_string(),
+                profiles,
+                profiles_order: vec!["api".to_string()],
+            },
+        }
+    }
+
+    fn data_with_nodes() -> crate::data::Data {
+        let mut nodes = HashMap::new();
+        nodes.insert("node1".to_string(), node_with_profiles());
+        nodes.insert("node2".to_string(), second_node_with_profiles());
+
+        crate::data::Data {
+            generic_settings: empty_generic_settings(),
+            nodes,
+        }
+    }
+
+    fn empty_cmd_overrides() -> crate::CmdOverrides {
+        crate::CmdOverrides {
+            ssh_user: None,
+            profile_user: None,
+            ssh_opts: None,
+            fast_connection: None,
+            auto_rollback: None,
+            hostname: None,
+            magic_rollback: None,
+            temp_path: None,
+            confirm_timeout: None,
+            activation_timeout: None,
+            sudo: None,
+            interactive_sudo: None,
+            dry_activate: false,
+            remote_build: false,
+        }
+    }
+
+    fn node_with_profiles() -> crate::data::Node {
+        let mut profiles = HashMap::new();
+        profiles.insert("system".to_string(), profile_with_tags(&["core", "prod"]));
+        profiles.insert("metrics".to_string(), profile_with_tags(&["observability"]));
+        profiles.insert(
+            "logs".to_string(),
+            profile_with_tags(&["observability", "prod"]),
+        );
+
+        crate::data::Node {
+            generic_settings: empty_generic_settings(),
+            node_settings: crate::data::NodeSettings {
+                hostname: "example.com".to_string(),
+                profiles,
+                profiles_order: vec!["logs".to_string(), "system".to_string()],
+            },
+        }
+    }
 
     #[test]
     fn test_build_repo_reqs_single_target() {
@@ -830,7 +943,10 @@ mod tests {
         assert_eq!(req.nodes.len(), 1);
         let n_req = req.nodes.get("node1").unwrap();
         assert!(!n_req.all_profiles);
-        assert_eq!(n_req.profiles, vec!["profile1"].into_iter().collect::<HashSet<_>>());
+        assert_eq!(
+            n_req.profiles,
+            vec!["profile1"].into_iter().collect::<HashSet<_>>()
+        );
     }
 
     #[test]
@@ -913,10 +1029,232 @@ mod tests {
         assert!(matches!(res, Err(GetDeploymentDataError::ProfileNoNode)));
     }
 
+    #[test]
+    fn test_ordered_profiles_for_node_filters_tags_and_preserves_order() {
+        let node = node_with_profiles();
+        let tags = HashSet::from(["observability"]);
+
+        let profiles = ordered_profiles_for_node(&node, &tags).unwrap();
+        let names: Vec<_> = profiles.into_iter().map(|(name, _)| name).collect();
+
+        assert_eq!(names, vec!["logs", "metrics"]);
+    }
+
+    #[test]
+    fn test_ordered_profiles_for_node_without_tags_returns_all_profiles_once() {
+        let node = node_with_profiles();
+
+        let profiles = ordered_profiles_for_node(&node, &HashSet::new()).unwrap();
+        let names: Vec<_> = profiles.into_iter().map(|(name, _)| name).collect();
+
+        assert_eq!(names, vec!["logs", "system", "metrics"]);
+    }
+
+    #[test]
+    fn test_profile_matches_tags_supports_empty_matching_and_non_matching_sets() {
+        let profile = profile_with_tags(&["prod", "blue"]);
+
+        assert!(profile_matches_tags(&profile, &HashSet::new()));
+        assert!(profile_matches_tags(&profile, &HashSet::from(["prod"])));
+        assert!(profile_matches_tags(
+            &profile,
+            &HashSet::from(["missing", "blue"])
+        ));
+        assert!(!profile_matches_tags(&profile, &HashSet::from(["missing"])));
+    }
+
+    #[test]
+    fn test_ordered_profiles_for_node_errors_when_profiles_order_references_missing_profile() {
+        let mut node = node_with_profiles();
+        node.node_settings
+            .profiles_order
+            .push("missing".to_string());
+
+        let result = ordered_profiles_for_node(&node, &HashSet::new());
+
+        assert!(matches!(
+            result,
+            Err(RunDeployError::ProfileNotFound(name)) if name == "missing"
+        ));
+    }
+
+    #[test]
+    fn test_collect_to_deploy_explicit_profile_matches_tag() {
+        let deploy_flakes = vec![DeployFlake {
+            repo: "repo1",
+            node: Some("node1".to_string()),
+            profile: Some("system".to_string()),
+        }];
+        let data = vec![data_with_nodes()];
+        let tags = vec!["prod".to_string()];
+
+        let to_deploy = collect_to_deploy(&deploy_flakes, &data, &tags).unwrap();
+        let names: Vec<_> = to_deploy
+            .into_iter()
+            .map(|(_, _, (node_name, _), (profile_name, _))| (node_name, profile_name))
+            .collect();
+
+        assert_eq!(names, vec![("node1", "system")]);
+    }
+
+    #[test]
+    fn test_collect_to_deploy_explicit_profile_errors_on_missing_node() {
+        let deploy_flakes = vec![DeployFlake {
+            repo: "repo1",
+            node: Some("missing-node".to_string()),
+            profile: Some("system".to_string()),
+        }];
+        let data = vec![data_with_nodes()];
+        let tags = vec!["prod".to_string()];
+
+        let result = collect_to_deploy(&deploy_flakes, &data, &tags);
+
+        assert!(matches!(
+            result,
+            Err(RunDeployError::NodeNotFound(name)) if name == "missing-node"
+        ));
+    }
+
+    #[test]
+    fn test_collect_to_deploy_explicit_profile_errors_on_missing_profile() {
+        let deploy_flakes = vec![DeployFlake {
+            repo: "repo1",
+            node: Some("node1".to_string()),
+            profile: Some("missing-profile".to_string()),
+        }];
+        let data = vec![data_with_nodes()];
+        let tags = vec!["prod".to_string()];
+
+        let result = collect_to_deploy(&deploy_flakes, &data, &tags);
+
+        assert!(matches!(
+            result,
+            Err(RunDeployError::ProfileNotFound(name)) if name == "missing-profile"
+        ));
+    }
+
+    #[test]
+    fn test_collect_to_deploy_node_target_filters_profiles_by_tag() {
+        let deploy_flakes = vec![DeployFlake {
+            repo: "repo1",
+            node: Some("node1".to_string()),
+            profile: None,
+        }];
+        let data = vec![data_with_nodes()];
+        let tags = vec!["observability".to_string()];
+
+        let to_deploy = collect_to_deploy(&deploy_flakes, &data, &tags).unwrap();
+        let names: Vec<_> = to_deploy
+            .into_iter()
+            .map(|(_, _, (node_name, _), (profile_name, _))| (node_name, profile_name))
+            .collect();
+
+        assert_eq!(names, vec![("node1", "logs"), ("node1", "metrics")]);
+    }
+
+    #[test]
+    fn test_collect_to_deploy_node_target_errors_on_missing_node() {
+        let deploy_flakes = vec![DeployFlake {
+            repo: "repo1",
+            node: Some("missing-node".to_string()),
+            profile: None,
+        }];
+        let data = vec![data_with_nodes()];
+        let tags = vec!["observability".to_string()];
+
+        let result = collect_to_deploy(&deploy_flakes, &data, &tags);
+
+        assert!(matches!(
+            result,
+            Err(RunDeployError::NodeNotFound(name)) if name == "missing-node"
+        ));
+    }
+
+    #[test]
+    fn test_collect_to_deploy_all_nodes_filters_matching_profiles_across_nodes() {
+        let deploy_flakes = vec![DeployFlake {
+            repo: "repo1",
+            node: None,
+            profile: None,
+        }];
+        let data = vec![data_with_nodes()];
+        let tags = vec!["prod".to_string()];
+
+        let mut names: Vec<_> = collect_to_deploy(&deploy_flakes, &data, &tags)
+            .unwrap()
+            .into_iter()
+            .map(|(_, _, (node_name, _), (profile_name, _))| (node_name, profile_name))
+            .collect();
+        names.sort();
+
+        assert_eq!(
+            names,
+            vec![("node1", "logs"), ("node1", "system"), ("node2", "api")]
+        );
+    }
+
+    #[test]
+    fn test_collect_to_deploy_rejects_profile_without_node() {
+        let deploy_flakes = vec![DeployFlake {
+            repo: "repo1",
+            node: None,
+            profile: Some("system".to_string()),
+        }];
+        let data = vec![data_with_nodes()];
+
+        let result = collect_to_deploy(&deploy_flakes, &data, &[]);
+
+        assert!(matches!(result, Err(RunDeployError::ProfileWithoutNode)));
+    }
+
+    #[tokio::test]
+    async fn test_run_deploy_errors_when_tags_match_no_profiles() {
+        let deploy_flakes = vec![DeployFlake {
+            repo: "repo1",
+            node: Some("node1".to_string()),
+            profile: Some("system".to_string()),
+        }];
+        let data = vec![data_with_nodes()];
+        let tags = vec!["staging".to_string()];
+        let log_dir = None;
+
+        let result = run_deploy(
+            deploy_flakes,
+            data,
+            true,
+            false,
+            false,
+            &empty_cmd_overrides(),
+            false,
+            None,
+            &[],
+            false,
+            false,
+            false,
+            &log_dir,
+            true,
+            false,
+            false,
+            false,
+            false,
+            &tags,
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(RunDeployError::NoProfilesMatchedTags(requested)) if requested == "staging"
+        ));
+    }
+
     #[tokio::test]
     async fn test_get_deployment_data_integration() {
         // This test requires 'nix' to be installed.
-        if std::process::Command::new("nix").arg("--version").status().is_err() {
+        if std::process::Command::new("nix")
+            .arg("--version")
+            .status()
+            .is_err()
+        {
             return;
         }
 
@@ -931,14 +1269,14 @@ mod tests {
         node1 = {
           hostname = "node1-host";
           profiles = {
-            p1 = { path = "/nix/store/p1"; };
-            p2 = { path = "/nix/store/p2"; };
+            p1 = { path = "/nix/store/p1"; tags = [ "web" ]; };
+            p2 = { path = "/nix/store/p2"; tags = [ "db" "prod" ]; };
           };
         };
         node2 = {
           hostname = "node2-host";
           profiles = {
-            pA = { path = "/nix/store/pA"; };
+            pA = { path = "/nix/store/pA"; tags = [ "web" ]; };
           };
         };
       };
@@ -961,6 +1299,12 @@ mod tests {
         assert_eq!(data[0].nodes.len(), 2);
         assert!(data[0].nodes.contains_key("node1"));
         assert!(data[0].nodes.contains_key("node2"));
+        assert_eq!(
+            data[0].nodes["node1"].node_settings.profiles["p1"]
+                .profile_settings
+                .tags,
+            vec!["web".to_string()]
+        );
 
         // Branch 2: req.all_nodes = false
         // Branch 2a: node1 in req.nodes
@@ -986,8 +1330,14 @@ mod tests {
         assert_eq!(data.len(), 1);
         assert_eq!(data[0].nodes.len(), 1);
         assert_eq!(data[0].nodes["node1"].node_settings.profiles.len(), 1);
-        assert!(data[0].nodes["node1"].node_settings.profiles.contains_key("p1"));
-        assert!(!data[0].nodes["node1"].node_settings.profiles.contains_key("p2"));
+        assert!(data[0].nodes["node1"]
+            .node_settings
+            .profiles
+            .contains_key("p1"));
+        assert!(!data[0].nodes["node1"]
+            .node_settings
+            .profiles
+            .contains_key("p2"));
 
         // Branch 2b: Multiple repos and mixed targets (implicitly tests filtering out node2 when only node1 is requested)
         // Branch 2b: Multiple repos and mixed targets
@@ -1135,6 +1485,7 @@ pub async fn run(args: Option<&ArgMatches>) -> Result<(), RunError> {
         !opts.no_rollback_fresh_connection,
         build_tree,
         review_changes,
+        &opts.tags,
     )
     .await?;
 

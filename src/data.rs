@@ -56,6 +56,8 @@ pub struct ProfileSettings {
     pub path: String,
     #[serde(rename(deserialize = "profilePath"))]
     pub profile_path: Option<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -79,4 +81,26 @@ pub struct Data {
     #[serde(flatten)]
     pub generic_settings: GenericSettings,
     pub nodes: HashMap<String, Node>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ProfileSettings;
+
+    #[test]
+    fn test_profile_settings_tags_default_to_empty() {
+        let profile: ProfileSettings =
+            serde_json::from_str(r#"{"path":"/nix/store/profile"}"#).unwrap();
+
+        assert!(profile.tags.is_empty());
+    }
+
+    #[test]
+    fn test_profile_settings_tags_deserialize() {
+        let profile: ProfileSettings =
+            serde_json::from_str(r#"{"path":"/nix/store/profile","tags":["prod","system"]}"#)
+                .unwrap();
+
+        assert_eq!(profile.tags, vec!["prod", "system"]);
+    }
 }
