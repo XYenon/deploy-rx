@@ -377,6 +377,7 @@ struct PromptPart<'a> {
     ssh_user: &'a str,
     path: &'a str,
     hostname: &'a str,
+    tags: &'a [String],
     ssh_opts: &'a [String],
 }
 
@@ -400,6 +401,7 @@ fn print_deployment(
                     ssh_user: &defs.ssh_user,
                     path: &data.profile.profile_settings.path,
                     hostname: &data.node.node_settings.hostname,
+                    tags: &data.profile.profile_settings.tags,
                     ssh_opts: &data.merged_settings.ssh_opts,
                 },
             );
