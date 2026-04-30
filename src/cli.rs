@@ -673,13 +673,15 @@ async fn run_deploy(
         {
             warn!("Interactive sudo is enabled! Using a sudo password is less secure than correctly configured SSH keys.\nPlease use keys in production environments.");
 
-            if deploy_data.merged_settings.sudo.is_some() {
+            if deploy_data
+                .merged_settings
+                .sudo
+                .as_ref()
+                .and_then(|sudo| sudo.argv().first())
+                .map(|program| program != "sudo")
+                .unwrap_or(false)
+            {
                 warn!("Custom sudo commands should be configured to accept password input from stdin when using the 'interactive sudo' option. Deployment may fail if the custom command ignores stdin.");
-            } else {
-                // this configures sudo to hide the password prompt and accept input from stdin
-                // at the time of writing, deploy_defs.sudo defaults to 'sudo -u root' when using user=root and sshUser as non-root
-                let original = deploy_defs.sudo.unwrap_or("sudo".to_string());
-                deploy_defs.sudo = Some(format!("{} -S -p \"\"", original));
             }
 
             info!(
@@ -1391,6 +1393,8 @@ pub enum RunError {
     ParseFlake(#[from] deploy::ParseFlakeError),
     #[error("Error parsing arguments: {0}")]
     ParseArgs(#[from] clap::Error),
+    #[error("Error parsing sudo configuration: {0}")]
+    SudoParse(#[from] deploy::sudo::SudoParseError),
     #[error("Error initiating logger: {0}")]
     Logger(#[from] flexi_logger::FlexiLoggerError),
     #[error("{0}")]
@@ -1430,6 +1434,12 @@ pub async fn run(args: Option<&ArgMatches>) -> Result<(), RunError> {
             .collect::<Result<Vec<DeployFlake>, ParseFlakeError>>()?
     };
 
+    let sudo = opts
+        .sudo
+        .as_deref()
+        .map(deploy::sudo::SudoCommand::parse_legacy)
+        .transpose()?;
+
     let cmd_overrides = deploy::CmdOverrides {
         ssh_user: opts.ssh_user,
         profile_user: opts.profile_user,
@@ -1443,7 +1453,7 @@ pub async fn run(args: Option<&ArgMatches>) -> Result<(), RunError> {
         activation_timeout: opts.activation_timeout,
         dry_activate: opts.dry_activate,
         remote_build: opts.remote_build,
-        sudo: opts.sudo,
+        sudo,
         interactive_sudo: opts.interactive_sudo,
     };
 

@@ -151,7 +151,9 @@ pub mod cli;
 pub mod data;
 pub mod deploy;
 pub mod push;
+pub mod remote_protocol;
 pub mod ssh;
+pub mod sudo;
 
 #[derive(Debug)]
 pub struct CmdOverrides {
@@ -165,7 +167,7 @@ pub struct CmdOverrides {
     pub temp_path: Option<PathBuf>,
     pub confirm_timeout: Option<u16>,
     pub activation_timeout: Option<u16>,
-    pub sudo: Option<String>,
+    pub sudo: Option<sudo::SudoCommand>,
     pub interactive_sudo: Option<bool>,
     pub dry_activate: bool,
     pub remote_build: bool,
@@ -352,10 +354,11 @@ pub struct DeployData<'a> {
 pub struct DeployDefs {
     pub ssh_user: String,
     pub profile_user: String,
-    pub sudo: Option<String>,
+    pub sudo: Option<sudo::SudoCommand>,
     pub sudo_password: Option<String>,
 }
-enum ProfileInfo {
+#[derive(Debug, Clone)]
+pub enum ProfileInfo {
     ProfilePath {
         profile_path: String,
     },
@@ -380,8 +383,8 @@ impl<'a> DeployData<'a> {
 
         let profile_user = self.get_profile_user()?;
 
-        let sudo: Option<String> = match self.merged_settings.user {
-            Some(ref user) if user != &ssh_user => Some(format!("{} {}", self.get_sudo(), user)),
+        let sudo: Option<sudo::SudoCommand> = match self.merged_settings.user {
+            Some(ref user) if user != &ssh_user => Some(self.get_sudo()),
             _ => None,
         };
 
@@ -409,14 +412,14 @@ impl<'a> DeployData<'a> {
         Ok(profile_user)
     }
 
-    fn get_sudo(&'a self) -> String {
+    fn get_sudo(&'a self) -> sudo::SudoCommand {
         match self.merged_settings.sudo {
             Some(ref x) => x.clone(),
-            None => "sudo -u".to_string(),
+            None => sudo::SudoCommand::default_sudo(),
         }
     }
 
-    fn get_profile_info(&'a self) -> Result<ProfileInfo, DeployDataDefsError> {
+    pub fn get_profile_info(&'a self) -> Result<ProfileInfo, DeployDataDefsError> {
         match self
             .profile
             .profile_settings
@@ -482,6 +485,9 @@ pub fn make_deploy_data<'a, 's>(
     }
     if let Some(interactive_sudo) = cmd_overrides.interactive_sudo {
         merged_settings.interactive_sudo = Some(interactive_sudo);
+    }
+    if let Some(ref sudo) = cmd_overrides.sudo {
+        merged_settings.sudo = Some(sudo.clone());
     }
 
     DeployData {
