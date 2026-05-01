@@ -60,13 +60,21 @@ enum SubCommand {
     BootstrapSession,
     PrivilegedSession(PrivilegedSessionOpts),
     ConfirmSession,
-    SudoCheck,
+    WriteConfirmation(WriteConfirmationOpts),
 }
 
 #[derive(Parser, Debug)]
 struct PrivilegedSessionOpts {
     #[arg(long)]
     request_path: PathBuf,
+}
+
+#[derive(Parser, Debug)]
+struct WriteConfirmationOpts {
+    #[arg(long)]
+    path: PathBuf,
+    #[arg(long)]
+    nonce: String,
 }
 
 /// Activate a profile
@@ -575,8 +583,11 @@ fn get_profile_path(
 
 #[cfg(test)]
 mod tests {
-    use super::get_profile_path;
+    use super::{get_profile_path, write_confirmation_file};
     use std::env;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    use tempfile::tempdir;
 
     #[test]
     fn test_get_profile_path_for_root_system_profile() {
@@ -616,6 +627,42 @@ mod tests {
             .unwrap(),
             format!("{}/profiles/per-user/root/custom-profile", nix_state_dir)
         );
+    }
+
+    #[test]
+    fn test_write_confirmation_file_allows_repeated_matching_nonce() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("confirm");
+
+        write_confirmation_file(&path, "nonce").unwrap();
+        write_confirmation_file(&path, "nonce").unwrap();
+
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "nonce\n");
+    }
+
+    #[test]
+    fn test_write_confirmation_file_rejects_nonce_mismatch() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("confirm");
+
+        write_confirmation_file(&path, "nonce").unwrap();
+
+        assert_eq!(
+            write_confirmation_file(&path, "other").unwrap_err(),
+            "existing confirmation file has a different nonce"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_write_confirmation_file_uses_private_permissions() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("confirm");
+
+        write_confirmation_file(&path, "nonce").unwrap();
+
+        let mode = std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
     }
 }
 
@@ -744,6 +791,102 @@ fn random_token() -> Result<String, std::io::Error> {
 
 fn confirm_path(temp_path: &Path, session_id: &str) -> PathBuf {
     temp_path.join(format!("deploy-rx-confirm-{}", session_id))
+}
+
+#[cfg(unix)]
+fn session_request_root() -> PathBuf {
+    PathBuf::from("/tmp")
+}
+
+#[cfg(not(unix))]
+fn session_request_root() -> PathBuf {
+    env::temp_dir()
+}
+
+fn write_confirmation_file(path: &Path, nonce: &str) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|err| format!("failed to create confirmation directory: {}", err))?;
+    }
+
+    let mut open_options = std::fs::OpenOptions::new();
+    open_options.write(true).create_new(true);
+    #[cfg(unix)]
+    open_options.mode(0o600);
+
+    match open_options.open(path) {
+        Ok(mut file) => {
+            file.write_all(nonce.as_bytes())
+                .map_err(|err| format!("failed to write confirmation file: {}", err))?;
+            file.write_all(b"\n")
+                .map_err(|err| format!("failed to write confirmation file: {}", err))?;
+            file.flush()
+                .map_err(|err| format!("failed to flush confirmation file: {}", err))?;
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            let existing = std::fs::read_to_string(path)
+                .map_err(|err| format!("failed to read confirmation file: {}", err))?;
+            if existing.trim() != nonce {
+                return Err("existing confirmation file has a different nonce".to_string());
+            }
+        }
+        Err(err) => return Err(format!("failed to create confirmation file: {}", err)),
+    }
+
+    Ok(())
+}
+
+async fn write_confirmation_via_sudo(
+    request: &ConfirmRequest,
+    path: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let sudo = request
+        .sudo
+        .as_ref()
+        .expect("sudo request checked before writing confirmation");
+    let current_exe = env::current_exe()?;
+    let mut sudo_argv = sudo.argv_for_user(&request.profile_user, request.interactive_sudo);
+    let program = sudo_argv.remove(0);
+    let mut command = Command::new(program);
+    command
+        .args(sudo_argv)
+        .arg(current_exe)
+        .arg("write-confirmation")
+        .arg("--path")
+        .arg(path)
+        .arg("--nonce")
+        .arg(&request.nonce)
+        .stdin(if request.interactive_sudo {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .kill_on_drop(true);
+
+    let mut child = command.spawn()?;
+    if request.interactive_sudo {
+        if let Some(stdin) = child.stdin.as_mut() {
+            stdin
+                .write_all(
+                    format!("{}\n", request.sudo_password.clone().unwrap_or_default()).as_bytes(),
+                )
+                .await?;
+            stdin.shutdown().await?;
+        }
+    }
+
+    let status = child.wait().await?;
+    if !status.success() {
+        return Err(format!(
+            "sudo confirmation write failed with status {:?}",
+            status.code()
+        )
+        .into());
+    }
+
+    Ok(())
 }
 
 async fn wait_for_session_confirmation(
@@ -904,6 +1047,21 @@ async fn deactivate_session(profile_path: &str) -> Result<(), String> {
     }
 }
 
+async fn rollback_after_confirmation_failure(
+    profile_path: &str,
+    err: impl Into<String>,
+) -> SessionError {
+    let err = err.into();
+    let rollback = deactivate_session(profile_path).await;
+    SessionError::rolled_back(match rollback {
+        Ok(()) => format!("confirmation failed: {}", err),
+        Err(rollback_err) => format!(
+            "confirmation failed: {}; rollback also failed: {}",
+            err, rollback_err
+        ),
+    })
+}
+
 async fn process_deploy_session(
     request: deploy::remote_protocol::RemoteDeployRequest,
 ) -> Result<String, SessionError> {
@@ -1014,26 +1172,22 @@ async fn process_deploy_session(
         let nonce = random_token()
             .map_err(|err| SessionError::failed(format!("failed to generate nonce: {}", err)))?;
 
-        send_event(&RemoteEvent::AwaitingConfirm {
+        if let Err(err) = send_event(&RemoteEvent::AwaitingConfirm {
             session_id: session_id.clone(),
             nonce: nonce.clone(),
-        })
-        .map_err(|err| {
-            SessionError::failed(format!("failed to send confirmation event: {}", err))
-        })?;
+        }) {
+            return Err(rollback_after_confirmation_failure(
+                &profile_path,
+                format!("failed to send confirmation event: {}", err),
+            )
+            .await);
+        }
 
         if let Err(err) =
             wait_for_session_confirmation(&temp_path, &session_id, &nonce, request.confirm_timeout)
                 .await
         {
-            let rollback = deactivate_session(&profile_path).await;
-            return Err(SessionError::rolled_back(match rollback {
-                Ok(()) => format!("confirmation failed: {}", err),
-                Err(rollback_err) => format!(
-                    "confirmation failed: {}; rollback also failed: {}",
-                    err, rollback_err
-                ),
-            }));
+            return Err(rollback_after_confirmation_failure(&profile_path, err).await);
         }
     }
 
@@ -1091,7 +1245,9 @@ async fn bootstrap_session() -> Result<(), Box<dyn std::error::Error>> {
         .into());
     }
 
-    let session_dir = PathBuf::from(request.operation.temp_path()).join(format!(
+    // Keep the handoff request in a neutral system temp dir so `tempPath` only needs to work for
+    // the target profile user during confirmation.
+    let session_dir = session_request_root().join(format!(
         "deploy-rx-session-{}-{}",
         std::process::id(),
         random_token()?
@@ -1100,7 +1256,7 @@ async fn bootstrap_session() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(unix)]
     std::fs::DirBuilder::new()
         .recursive(true)
-        .mode(0o700)
+        .mode(0o711)
         .create(&session_dir)?;
     #[cfg(not(unix))]
     std::fs::create_dir_all(&session_dir)?;
@@ -1110,7 +1266,7 @@ async fn bootstrap_session() -> Result<(), Box<dyn std::error::Error>> {
     let mut open_options = std::fs::OpenOptions::new();
     open_options.write(true).create_new(true);
     #[cfg(unix)]
-    open_options.mode(0o600);
+    open_options.mode(0o644);
     let mut request_file = open_options.open(&request_path)?;
     request_file.write_all(&request_json)?;
     request_file.flush()?;
@@ -1128,6 +1284,7 @@ async fn bootstrap_session() -> Result<(), Box<dyn std::error::Error>> {
     child_args.push("privileged-session".to_string());
     child_args.push("--request-path".to_string());
     child_args.push(request_path.display().to_string());
+    let needs_sudo_password = request.interactive_sudo && request.sudo.is_some();
 
     let mut command = if let Some(sudo) = request.sudo {
         let mut sudo_argv =
@@ -1142,7 +1299,7 @@ async fn bootstrap_session() -> Result<(), Box<dyn std::error::Error>> {
 
     command
         .args(child_args)
-        .stdin(if request.interactive_sudo {
+        .stdin(if needs_sudo_password {
             Stdio::piped()
         } else {
             Stdio::null()
@@ -1152,7 +1309,7 @@ async fn bootstrap_session() -> Result<(), Box<dyn std::error::Error>> {
         .kill_on_drop(true);
 
     let mut child = command.spawn()?;
-    if request.interactive_sudo {
+    if needs_sudo_password {
         if let Some(stdin) = child.stdin.as_mut() {
             stdin
                 .write_all(format!("{}\n", request.sudo_password.unwrap_or_default()).as_bytes())
@@ -1172,79 +1329,19 @@ async fn bootstrap_session() -> Result<(), Box<dyn std::error::Error>> {
 
 async fn confirm_session() -> Result<(), Box<dyn std::error::Error>> {
     let request: ConfirmRequest = read_stdin_json().await?;
-    confirm_sudo_available(&request).await?;
+    let path = confirm_path(Path::new(&request.temp_path), &request.session_id);
 
-    let temp_path = PathBuf::from(&request.temp_path);
-    fs::create_dir_all(&temp_path).await?;
-
-    let path = confirm_path(&temp_path, &request.session_id);
-    match std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&path)
-    {
-        Ok(mut file) => {
-            file.write_all(request.nonce.as_bytes())?;
-            file.write_all(b"\n")?;
-            file.flush()?;
-        }
-        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-            let existing = std::fs::read_to_string(&path)?;
-            if existing.trim() != request.nonce {
-                return Err("existing confirmation file has a different nonce".into());
-            }
-        }
-        Err(err) => return Err(err.into()),
+    if request.sudo.is_some() {
+        write_confirmation_via_sudo(&request, &path).await?;
+    } else {
+        write_confirmation_file(&path, &request.nonce)?;
     }
 
     Ok(())
 }
 
-async fn confirm_sudo_available(
-    request: &ConfirmRequest,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let Some(sudo) = &request.sudo else {
-        return Ok(());
-    };
-
-    let current_exe = env::current_exe()?;
-    let mut sudo_argv = sudo.argv_for_user(&request.profile_user, request.interactive_sudo);
-    let program = sudo_argv.remove(0);
-    let mut command = Command::new(program);
-    command
-        .args(sudo_argv)
-        .arg(current_exe)
-        .arg("sudo-check")
-        .stdin(if request.interactive_sudo {
-            Stdio::piped()
-        } else {
-            Stdio::null()
-        })
-        .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
-        .kill_on_drop(true);
-
-    let mut child = command.spawn()?;
-    if request.interactive_sudo {
-        if let Some(stdin) = child.stdin.as_mut() {
-            stdin
-                .write_all(
-                    format!("{}\n", request.sudo_password.clone().unwrap_or_default()).as_bytes(),
-                )
-                .await?;
-            stdin.shutdown().await?;
-        }
-    }
-
-    let status = child.wait().await?;
-    if !status.success() {
-        return Err(format!(
-            "sudo confirmation check failed with status {:?}",
-            status.code()
-        )
-        .into());
-    }
-
+fn write_confirmation(opts: WriteConfirmationOpts) -> Result<(), Box<dyn std::error::Error>> {
+    write_confirmation_file(&opts.path, &opts.nonce)?;
     Ok(())
 }
 
@@ -1271,7 +1368,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             SubCommand::BootstrapSession => deploy::LoggerType::Activate,
             SubCommand::PrivilegedSession(_) => deploy::LoggerType::Activate,
             SubCommand::ConfirmSession => deploy::LoggerType::Activate,
-            SubCommand::SudoCheck => deploy::LoggerType::Activate,
+            SubCommand::WriteConfirmation(_) => deploy::LoggerType::Activate,
         },
     )?;
 
@@ -1321,7 +1418,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         SubCommand::ConfirmSession => confirm_session().await,
 
-        SubCommand::SudoCheck => Ok(()),
+        SubCommand::WriteConfirmation(write_confirmation_opts) => {
+            write_confirmation(write_confirmation_opts)
+        }
     };
 
     match r {

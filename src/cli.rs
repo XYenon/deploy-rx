@@ -670,15 +670,14 @@ async fn run_deploy(
             .merged_settings
             .interactive_sudo
             .unwrap_or(false)
+            && deploy_defs.sudo.is_some()
         {
             warn!("Interactive sudo is enabled! Using a sudo password is less secure than correctly configured SSH keys.\nPlease use keys in production environments.");
 
-            if deploy_data
-                .merged_settings
+            if deploy_defs
                 .sudo
                 .as_ref()
-                .and_then(|sudo| sudo.argv().first())
-                .map(|program| program != "sudo")
+                .map(|sudo| !sudo.is_sudo())
                 .unwrap_or(false)
             {
                 warn!("Custom sudo commands should be configured to accept password input from stdin when using the 'interactive sudo' option. Deployment may fail if the custom command ignores stdin.");

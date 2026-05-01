@@ -4,6 +4,7 @@
 
 use serde::{de, Deserialize, Deserializer, Serialize};
 use std::fmt;
+use std::path::Path;
 use thiserror::Error;
 
 #[derive(Error, Debug, Clone, PartialEq, Eq)]
@@ -46,15 +47,18 @@ impl SudoCommand {
         &self.argv
     }
 
+    pub fn is_sudo(&self) -> bool {
+        self.argv
+            .first()
+            .and_then(|program| Path::new(program).file_name())
+            .map(|program| program == "sudo")
+            .unwrap_or(false)
+    }
+
     pub fn argv_for_user(&self, user: &str, interactive: bool) -> Vec<String> {
         let mut argv = self.argv.clone();
 
-        if interactive
-            && argv
-                .first()
-                .map(|program| program == "sudo")
-                .unwrap_or(false)
-        {
+        if interactive && self.is_sudo() {
             if !argv.iter().any(|arg| arg == "-S" || arg == "--stdin") {
                 argv.insert(1, "-S".to_string());
             }
@@ -233,5 +237,23 @@ mod tests {
     fn serializes_as_argv_array() {
         let sudo = SudoCommand::new(vec!["sudo".to_string(), "-u".to_string()]).unwrap();
         assert_eq!(serde_json::to_string(&sudo).unwrap(), r#"["sudo","-u"]"#);
+    }
+
+    #[test]
+    fn treats_full_path_sudo_as_sudo_for_interactive_mode() {
+        let sudo =
+            SudoCommand::new(vec!["/run/wrappers/bin/sudo".to_string(), "-u".to_string()]).unwrap();
+
+        assert_eq!(
+            sudo.argv_for_user("root", true),
+            vec![
+                "/run/wrappers/bin/sudo".to_string(),
+                "-S".to_string(),
+                "-p".to_string(),
+                String::new(),
+                "-u".to_string(),
+                "root".to_string(),
+            ]
+        );
     }
 }
