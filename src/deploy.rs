@@ -4,7 +4,7 @@
 //
 // SPDX-License-Identifier: MPL-2.0
 
-use log::{debug, info};
+use log::{info, warn};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use thiserror::Error;
@@ -318,7 +318,7 @@ async fn run_remote_operation(
                 })
                 .await
                 {
-                    debug!("Fresh SSH confirmation failed: {}", err);
+                    warn!("Fresh SSH confirmation failed: {}", err);
                 }
             }
             RemoteEvent::Finished {

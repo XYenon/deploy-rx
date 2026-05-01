@@ -583,7 +583,7 @@ fn get_profile_path(
 
 #[cfg(test)]
 mod tests {
-    use super::{get_profile_path, write_confirmation_file};
+    use super::{get_profile_path, resolve_interactive_sudo_password, write_confirmation_file};
     use std::env;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
@@ -650,6 +650,37 @@ mod tests {
         assert_eq!(
             write_confirmation_file(&path, "other").unwrap_err(),
             "existing confirmation file has a different nonce"
+        );
+    }
+
+    #[test]
+    fn test_resolve_interactive_sudo_password_requires_password() {
+        assert_eq!(
+            resolve_interactive_sudo_password(
+                true,
+                true,
+                None,
+                "starting the privileged activation session"
+            )
+            .unwrap_err(),
+            "interactive sudo requires sudo_password when starting the privileged activation session"
+        );
+    }
+
+    #[test]
+    fn test_resolve_interactive_sudo_password_returns_password_only_when_needed() {
+        assert_eq!(
+            resolve_interactive_sudo_password(true, true, Some("secret"), "confirming activation")
+                .unwrap(),
+            Some("secret")
+        );
+        assert_eq!(
+            resolve_interactive_sudo_password(false, true, None, "confirming activation").unwrap(),
+            None
+        );
+        assert_eq!(
+            resolve_interactive_sudo_password(true, false, None, "confirming activation").unwrap(),
+            None
         );
     }
 
@@ -761,6 +792,21 @@ async fn read_stdin_json<T: DeserializeOwned>() -> Result<T, Box<dyn std::error:
     Ok(serde_json::from_str(input.trim())?)
 }
 
+fn resolve_interactive_sudo_password<'a>(
+    interactive_sudo: bool,
+    sudo_requested: bool,
+    sudo_password: Option<&'a str>,
+    context: &str,
+) -> Result<Option<&'a str>, String> {
+    if interactive_sudo && sudo_requested {
+        return sudo_password
+            .map(Some)
+            .ok_or_else(|| format!("interactive sudo requires sudo_password when {}", context));
+    }
+
+    Ok(None)
+}
+
 fn send_event(event: &RemoteEvent) -> Result<(), Box<dyn std::error::Error>> {
     let mut stdout = std::io::stdout();
     serde_json::to_writer(&mut stdout, event)?;
@@ -844,6 +890,13 @@ async fn write_confirmation_via_sudo(
         .sudo
         .as_ref()
         .expect("sudo request checked before writing confirmation");
+    let sudo_password = resolve_interactive_sudo_password(
+        request.interactive_sudo,
+        true,
+        request.sudo_password.as_deref(),
+        "writing the activation confirmation file",
+    )
+    .map_err(|err| -> Box<dyn std::error::Error> { err.into() })?;
     let current_exe = env::current_exe()?;
     let mut sudo_argv = sudo.argv_for_user(&request.profile_user, request.interactive_sudo);
     let program = sudo_argv.remove(0);
@@ -856,7 +909,7 @@ async fn write_confirmation_via_sudo(
         .arg(path)
         .arg("--nonce")
         .arg(&request.nonce)
-        .stdin(if request.interactive_sudo {
+        .stdin(if sudo_password.is_some() {
             Stdio::piped()
         } else {
             Stdio::null()
@@ -866,12 +919,10 @@ async fn write_confirmation_via_sudo(
         .kill_on_drop(true);
 
     let mut child = command.spawn()?;
-    if request.interactive_sudo {
+    if let Some(sudo_password) = sudo_password {
         if let Some(stdin) = child.stdin.as_mut() {
             stdin
-                .write_all(
-                    format!("{}\n", request.sudo_password.clone().unwrap_or_default()).as_bytes(),
-                )
+                .write_all(format!("{}\n", sudo_password).as_bytes())
                 .await?;
             stdin.shutdown().await?;
         }
@@ -1284,7 +1335,13 @@ async fn bootstrap_session() -> Result<(), Box<dyn std::error::Error>> {
     child_args.push("privileged-session".to_string());
     child_args.push("--request-path".to_string());
     child_args.push(request_path.display().to_string());
-    let needs_sudo_password = request.interactive_sudo && request.sudo.is_some();
+    let sudo_password = resolve_interactive_sudo_password(
+        request.interactive_sudo,
+        request.sudo.is_some(),
+        request.sudo_password.as_deref(),
+        "starting the privileged activation session",
+    )
+    .map_err(|err| -> Box<dyn std::error::Error> { err.into() })?;
 
     let mut command = if let Some(sudo) = request.sudo {
         let mut sudo_argv =
@@ -1299,7 +1356,7 @@ async fn bootstrap_session() -> Result<(), Box<dyn std::error::Error>> {
 
     command
         .args(child_args)
-        .stdin(if needs_sudo_password {
+        .stdin(if sudo_password.is_some() {
             Stdio::piped()
         } else {
             Stdio::null()
@@ -1309,10 +1366,10 @@ async fn bootstrap_session() -> Result<(), Box<dyn std::error::Error>> {
         .kill_on_drop(true);
 
     let mut child = command.spawn()?;
-    if needs_sudo_password {
+    if let Some(sudo_password) = sudo_password {
         if let Some(stdin) = child.stdin.as_mut() {
             stdin
-                .write_all(format!("{}\n", request.sudo_password.unwrap_or_default()).as_bytes())
+                .write_all(format!("{}\n", sudo_password).as_bytes())
                 .await?;
             stdin.shutdown().await?;
         }
