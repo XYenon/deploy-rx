@@ -1,27 +1,25 @@
-name: Nix flake check
-on: pull_request
+name: CI
+
+on:
+  pull_request:
 
 jobs:
-  get-matrix:
-    runs-on: [self-hosted, nix]
-    outputs:
-      check-matrix: ${{ steps.set-check-matrix.outputs.matrix }}
+  cargo-test:
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: DeterminateSystems/determinate-nix-action@v3
+      - name: Run cargo test
+        run: nix develop --command cargo test
 
-      - id: set-check-matrix
-        run: echo "matrix=$(nix eval --json .#check-matrix.x86_64-linux)" >> $GITHUB_OUTPUT
-
-  check:
-    needs: get-matrix
-    name: check ${{ matrix.check }}
-    runs-on: [self-hosted, nix]
-    strategy:
-      fail-fast: false
-      # this matrix consists of the names of all checks defined in flake.nix
-      matrix: ${{fromJson(needs.get-matrix.outputs.check-matrix)}}
+  e2e:
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: check
-        run: nix build -L .#checks.x86_64-linux.${{ matrix.check }}
+      - uses: wimpysworld/nothing-but-nix@main
+      - uses: DeterminateSystems/determinate-nix-action@v3
+      - name: Run E2E checks with nix-fast-build
+        run: |
+          nix run nixpkgs#nix-fast-build -- \
+            --no-nom \
+            --skip-cached

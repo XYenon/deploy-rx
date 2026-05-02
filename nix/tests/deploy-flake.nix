@@ -21,6 +21,11 @@
       "StrictHostKeyChecking=no"
     ];
 
+    server2SshOpts = commonSshOpts ++ [
+      "-p"
+      "2222"
+    ];
+
     mkCustomProfile = script: let
       activateProfile = pkgs.writeShellScriptBin "activate" ''
         set -euo pipefail
@@ -56,6 +61,28 @@
         ${extra}
         exit 1
       '';
+
+    modeAwareMarkerProfile = {
+      marker,
+      activateValue,
+      dryValue,
+      bootValue,
+    }: let
+      writeMode = value: ''
+        ${pkgs.coreutils}/bin/mkdir -p ${lib.escapeShellArg (builtins.dirOf marker)}
+        printf '%s\n' ${lib.escapeShellArg value} > ${lib.escapeShellArg marker}
+      '';
+
+      custom =
+        deploy-rx.lib.${system}.activate.custom
+        // {
+          dryActivate = writeMode dryValue;
+          boot = writeMode bootValue;
+        };
+    in custom (pkgs.writeShellScriptBin "mode-aware-base" ''
+      set -euo pipefail
+      :
+    '') (writeMode activateValue);
 
     systemManagerBase = pkgs.writeShellScriptBin "activate" ''
       set -euo pipefail
@@ -125,6 +152,20 @@
             '';
           in deploy-rx.lib.${system}.activate.custom activateProfile "$PROFILE/bin/activate";
         };
+      };
+
+      mode-aware = {
+        hostname = "server";
+        sshUser = user;
+        sshOpts = commonSshOpts;
+        magicRollback = false;
+        profiles.app.path = modeAwareMarkerProfile {
+          marker = "/tmp/mode-select/result";
+          activateValue = "switch";
+          dryValue = "dry";
+          bootValue = "boot";
+        };
+        profiles.app.profilePath = "/home/${user}/.local/state/nix/profiles/mode-aware";
       };
 
       tagged = {
@@ -281,6 +322,66 @@
           value = "second";
         };
         profiles.second.profilePath = "/home/${user}/.local/state/nix/profiles/multiplex-second";
+      };
+
+      multi-host-a-baseline = {
+        hostname = "server";
+        sshUser = user;
+        sshOpts = commonSshOpts;
+        magicRollback = false;
+        profiles.app.path = writeMarkerProfile {
+          marker = "/tmp/multi-host/a";
+          value = "baseline";
+        };
+        profiles.app.profilePath = "/home/${user}/.local/state/nix/profiles/multi-host-a";
+      };
+
+      multi-host-a-updated = {
+        hostname = "server";
+        sshUser = user;
+        sshOpts = commonSshOpts;
+        magicRollback = false;
+        profiles.app.path = writeMarkerProfile {
+          marker = "/tmp/multi-host/a";
+          value = "updated";
+        };
+        profiles.app.profilePath = "/home/${user}/.local/state/nix/profiles/multi-host-a";
+      };
+
+      multi-host-b-baseline = {
+        hostname = "server2";
+        sshUser = "root";
+        sshOpts = server2SshOpts;
+        magicRollback = false;
+        profiles.app.path = writeMarkerProfile {
+          marker = "/tmp/multi-host/b";
+          value = "baseline";
+        };
+        profiles.app.profilePath = "/nix/var/nix/profiles/deploy-rx-tests/multi-host-b";
+      };
+
+      multi-host-b-updated = {
+        hostname = "server2";
+        sshUser = "root";
+        sshOpts = server2SshOpts;
+        magicRollback = false;
+        profiles.app.path = writeMarkerProfile {
+          marker = "/tmp/multi-host/b";
+          value = "updated";
+        };
+        profiles.app.profilePath = "/nix/var/nix/profiles/deploy-rx-tests/multi-host-b";
+      };
+
+      multi-host-b-fail = {
+        hostname = "server2";
+        sshUser = "root";
+        sshOpts = server2SshOpts;
+        magicRollback = false;
+        profiles.app.path = failingMarkerProfile {
+          marker = "/tmp/multi-host/b";
+          value = "failing";
+        };
+        profiles.app.profilePath = "/nix/var/nix/profiles/deploy-rx-tests/multi-host-b";
       };
 
       review-baseline = {

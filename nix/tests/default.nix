@@ -49,32 +49,44 @@ let
     name ? "",
     flakes ? true,
     isLocal ? true,
+    multiHost ? false,
     scenarioScript,
   }: let
+    remoteNodeNames = [ "server" ] ++ lib.optionals multiHost [ "server2" ];
+
+    mkServerNode = nodeName: extraModules: { nodes, ... }: {
+      imports = [
+       ./server.nix
+       (import ./common.nix { inherit inputs pkgs flakes; })
+      ] ++ extraModules;
+      virtualisation.additionalPaths = lib.optionals (!isLocal) [
+        pkgs.hello
+        pkgs.figlet
+        (allDrvOutputs (builtins.getAttr nodeName nodes).system.build.toplevel)
+        pkgs.deploy-rx.deploy-rx
+      ];
+    };
+
     nodes = {
-      server = { nodes, ... }: {
-        imports = [
-         ./server.nix
-         (import ./common.nix { inherit inputs pkgs flakes; })
-        ];
-        virtualisation.additionalPaths = lib.optionals (!isLocal) [
-          pkgs.hello
-          pkgs.figlet
-          (allDrvOutputs nodes.server.system.build.toplevel)
-          pkgs.deploy-rx.deploy-rx
-        ];
-      };
+      server = mkServerNode "server" [ ];
       client = { nodes, ... }: {
         imports = [ (import ./common.nix { inherit inputs pkgs flakes; }) ];
         environment.systemPackages = [ pkgs.deploy-rx.deploy-rx ];
         # nix evaluation takes a lot of memory, especially in non-flake usage
         virtualisation.memorySize = lib.mkForce 4096;
-        virtualisation.additionalPaths = lib.optionals isLocal [
-          pkgs.hello
-          pkgs.figlet
-          (allDrvOutputs nodes.server.system.build.toplevel)
-        ];
+        virtualisation.additionalPaths = lib.optionals isLocal (
+          [
+            pkgs.hello
+            pkgs.figlet
+          ] ++ map (nodeName: allDrvOutputs (builtins.getAttr nodeName nodes).system.build.toplevel) remoteNodeNames
+        );
       };
+    } // lib.optionalAttrs multiHost {
+      server2 = mkServerNode "server2" [
+        {
+          services.openssh.ports = [ 2222 ];
+        }
+      ];
     };
 
     flakeInputs = ''
@@ -172,6 +184,13 @@ if True:
         timeout=30
       )
       server.succeed("mkdir -p /nix/var/nix/profiles/deploy-rx-tests")
+      if ${if multiHost then "True" else "False"}:
+          server2.wait_for_open_port(2222)
+          client_sh(
+              "ssh -p 2222 -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no server2 'echo hello world' >&2",
+              timeout=30,
+          )
+          server2.succeed("mkdir -p /nix/var/nix/profiles/deploy-rx-tests")
 
       reset_logs()
       install_wrapper("deploy", deploy_wrapper_source)
@@ -247,6 +266,28 @@ in {
     deployArgs = "--file . --targets server";
   };
 
+  dry-activate-selects-dry-script = mkTest {
+    name = "dry-activate-selects-dry-script";
+    scenarioScript = ''
+      server.succeed("rm -rf /tmp/mode-select /home/deploy/.local/state/nix/profiles/mode-aware")
+      work("deploy -s --no-build-tree --no-review-changes --dry-activate .#mode-aware -- --offline > /tmp/dry-activate.out 2>&1", timeout=600)
+      server.succeed("grep -Fx dry /tmp/mode-select/result")
+      server.succeed("test ! -e /home/deploy/.local/state/nix/profiles/mode-aware")
+      client_sh("grep -F 'Completed dry-activate!' /tmp/dry-activate.out")
+    '';
+  };
+
+  boot-selects-boot-script = mkTest {
+    name = "boot-selects-boot-script";
+    scenarioScript = ''
+      server.succeed("rm -rf /tmp/mode-select /home/deploy/.local/state/nix/profiles/mode-aware")
+      work("deploy -s --no-build-tree --no-review-changes --boot .#mode-aware -- --offline > /tmp/boot.out 2>&1", timeout=600)
+      server.succeed("grep -Fx boot /tmp/mode-select/result")
+      server.succeed("test -L /home/deploy/.local/state/nix/profiles/mode-aware")
+      client_sh("grep -F 'Success activating for next boot, done!' /tmp/boot.out")
+    '';
+  };
+
   tag-select-and-order = mkTest {
     name = "tag-select-and-order";
     scenarioScript = ''
@@ -311,6 +352,36 @@ in {
       client_sh("grep -F 'Revoking previous deploys' /tmp/multi-rollback.out")
       server.succeed("grep -Fx baseline /tmp/multi-rollback/app")
       server.succeed("grep -Fx baseline /tmp/multi-rollback/bad")
+    '';
+  };
+
+  multi-host-heterogeneous-targets = mkTest {
+    name = "multi-host-heterogeneous-targets";
+    multiHost = true;
+    scenarioScript = ''
+      server.succeed("rm -rf /tmp/multi-host")
+      server2.succeed("rm -rf /tmp/multi-host")
+      client_fail("ssh -o ConnectTimeout=5 -o ConnectionAttempts=1 -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no server2 true", timeout=10)
+      client_sh("ssh -p 2222 -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no server2 true", timeout=30)
+      work("deploy -s --no-build-tree --no-review-changes --targets .#multi-host-a-updated .#multi-host-b-updated -- --offline", timeout=600)
+      server.succeed("grep -Fx updated /tmp/multi-host/a")
+      server2.succeed("grep -Fx updated /tmp/multi-host/b")
+    '';
+  };
+
+  multi-host-rollback-succeeded = mkTest {
+    name = "multi-host-rollback-succeeded";
+    multiHost = true;
+    scenarioScript = ''
+      server.succeed("rm -rf /tmp/multi-host")
+      server2.succeed("rm -rf /tmp/multi-host")
+      work("deploy -s --no-build-tree --no-review-changes --targets .#multi-host-a-baseline .#multi-host-b-baseline -- --offline", timeout=600)
+      server.succeed("grep -Fx baseline /tmp/multi-host/a")
+      server2.succeed("grep -Fx baseline /tmp/multi-host/b")
+      work_fail("deploy -s --no-build-tree --no-review-changes --targets .#multi-host-a-updated .#multi-host-b-fail -- --offline > /tmp/multi-host-rollback.out 2>&1", timeout=600)
+      client_sh("grep -F 'Revoking previous deploys' /tmp/multi-host-rollback.out")
+      server.succeed("grep -Fx baseline /tmp/multi-host/a")
+      server2.succeed("grep -Fx baseline /tmp/multi-host/b")
     '';
   };
 
