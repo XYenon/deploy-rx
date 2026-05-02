@@ -15,8 +15,7 @@ use flexi_logger::*;
 use std::path::{Path, PathBuf};
 
 pub fn make_lock_path(temp_path: &Path, closure: &str) -> PathBuf {
-    let lock_hash =
-        &closure["/nix/store/".len()..closure.find('-').unwrap_or_else(|| closure.len())];
+    let lock_hash = &closure["/nix/store/".len()..closure.find('-').unwrap_or(closure.len())];
     temp_path.join(format!("deploy-rx-canary-{}", lock_hash))
 }
 

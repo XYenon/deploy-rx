@@ -788,7 +788,12 @@ impl SessionError {
 
 async fn read_stdin_json<T: DeserializeOwned>() -> Result<T, Box<dyn std::error::Error>> {
     let mut input = String::new();
-    std::io::stdin().read_to_string(&mut input)?;
+    let bytes = std::io::stdin().read_line(&mut input)?;
+
+    if bytes == 0 {
+        return Err("expected JSON request on stdin".into());
+    }
+
     Ok(serde_json::from_str(input.trim())?)
 }
 
