@@ -122,6 +122,28 @@ pub enum RemoteSessionError {
     Wait(std::io::Error),
 }
 
+fn interpret_remote_session_completion(
+    finished: Option<(bool, String)>,
+    exit_success: bool,
+    exit_code: Option<i32>,
+) -> Result<(), RemoteSessionError> {
+    match finished {
+        Some((true, _)) => {
+            if !exit_success {
+                return Err(RemoteSessionError::RemoteExit(exit_code));
+            }
+            Ok(())
+        }
+        Some((false, message)) => Err(RemoteSessionError::RemoteFailed(message)),
+        None => {
+            if !exit_success {
+                return Err(RemoteSessionError::RemoteExit(exit_code));
+            }
+            Err(RemoteSessionError::MissingFinished)
+        }
+    }
+}
+
 #[derive(Error, Debug)]
 pub enum RemoteConfirmError {
     #[error("failed to build remote confirm command: {0}")]
@@ -333,15 +355,8 @@ async fn run_remote_operation(
 
     let status = child.wait().await.map_err(RemoteSessionError::Wait)?;
 
-    if !status.success() {
-        return Err(RemoteSessionError::RemoteExit(status.code()));
-    }
-
-    match finished {
-        Some((true, _)) => Ok(()),
-        Some((false, message)) => Err(RemoteSessionError::RemoteFailed(message)),
-        None => Err(RemoteSessionError::MissingFinished),
-    }
+    // Prefer the descriptive error message from the `Finished` event when available.
+    interpret_remote_session_completion(finished, status.success(), status.code())
 }
 
 #[derive(Error, Debug)]
@@ -461,6 +476,18 @@ mod tests {
         assert!(matches!(
             remote_activate_rs_command("/tmp/profile", "bootstrap-session"),
             Err(RemoteCommandError::NotStorePath(_))
+        ));
+    }
+
+    #[test]
+    fn remote_session_prefers_finished_error_over_exit_code() {
+        let err =
+            interpret_remote_session_completion(Some((false, "boom".to_string())), false, Some(1))
+                .unwrap_err();
+
+        assert!(matches!(
+            err,
+            RemoteSessionError::RemoteFailed(message) if message == "boom"
         ));
     }
 }

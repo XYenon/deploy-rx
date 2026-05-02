@@ -47,28 +47,43 @@ impl SudoCommand {
         &self.argv
     }
 
+    fn sudo_index(&self) -> Option<usize> {
+        self.argv.iter().position(|program| {
+            Path::new(program)
+                .file_name()
+                .map(|program| program == "sudo")
+                .unwrap_or(false)
+        })
+    }
+
     pub fn is_sudo(&self) -> bool {
-        self.argv
-            .first()
-            .and_then(|program| Path::new(program).file_name())
-            .map(|program| program == "sudo")
-            .unwrap_or(false)
+        self.sudo_index().is_some()
     }
 
     pub fn argv_for_user(&self, user: &str, interactive: bool) -> Vec<String> {
         let mut argv = self.argv.clone();
 
-        if interactive && self.is_sudo() {
-            if !argv.iter().any(|arg| arg == "-S" || arg == "--stdin") {
-                argv.insert(1, "-S".to_string());
-            }
+        if interactive {
+            if let Some(sudo_index) = self.sudo_index() {
+                let mut insert_at = sudo_index + 1;
 
-            if !argv
-                .iter()
-                .any(|arg| arg == "-p" || arg.starts_with("--prompt"))
-            {
-                argv.insert(2, "-p".to_string());
-                argv.insert(3, String::new());
+                let has_stdin_flag = argv
+                    .iter()
+                    .skip(sudo_index + 1)
+                    .any(|arg| arg == "-S" || arg == "--stdin");
+                if !has_stdin_flag {
+                    argv.insert(insert_at, "-S".to_string());
+                    insert_at += 1;
+                }
+
+                let has_prompt_flag = argv
+                    .iter()
+                    .skip(sudo_index + 1)
+                    .any(|arg| arg == "-p" || arg.starts_with("--prompt"));
+                if !has_prompt_flag {
+                    argv.insert(insert_at, "-p".to_string());
+                    argv.insert(insert_at + 1, String::new());
+                }
             }
         }
 
@@ -248,6 +263,29 @@ mod tests {
             sudo.argv_for_user("root", true),
             vec![
                 "/run/wrappers/bin/sudo".to_string(),
+                "-S".to_string(),
+                "-p".to_string(),
+                String::new(),
+                "-u".to_string(),
+                "root".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn treats_wrapped_sudo_as_sudo_for_interactive_mode() {
+        let sudo = SudoCommand::new(vec![
+            "env".to_string(),
+            "sudo".to_string(),
+            "-u".to_string(),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            sudo.argv_for_user("root", true),
+            vec![
+                "env".to_string(),
+                "sudo".to_string(),
                 "-S".to_string(),
                 "-p".to_string(),
                 String::new(),
