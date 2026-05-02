@@ -1181,10 +1181,12 @@ async fn process_deploy_session(
         .env("BOOT", if request.boot { "1" } else { "0" })
         .current_dir(activation_location);
 
-    let activation_timeout = if request.magic_rollback && !request.dry_activate && !request.boot {
-        request.activation_timeout
-    } else {
+    // `activation_timeout` is independent of `magic_rollback`.
+    // We only skip it for dry-activation runs, since those aren't actually activating the profile.
+    let activation_timeout = if request.dry_activate {
         None
+    } else {
+        request.activation_timeout
     };
 
     match command_status_to_stderr(activate, activation_timeout).await {

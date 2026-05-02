@@ -505,6 +505,8 @@ pub enum RunDeployError {
     SshControlMaster(#[from] deploy::ssh::SshError),
     #[error("No profiles matched the requested tags: {0}")]
     NoProfilesMatchedTags(String),
+    #[error("Failed to prompt for sudo password for {0}: {1}")]
+    PromptSudoPassword(String, std::io::Error),
 }
 
 type ToDeploy<'a> = Vec<(
@@ -692,7 +694,9 @@ async fn run_deploy(
                 "(sudo for {}) Password: ",
                 node.node_settings.hostname
             ))
-            .unwrap_or("".to_string());
+            .map_err(|err| {
+                RunDeployError::PromptSudoPassword(node.node_settings.hostname.clone(), err)
+            })?;
 
             deploy_defs.sudo_password = Some(sudo_password);
         }
