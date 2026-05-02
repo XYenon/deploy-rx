@@ -444,6 +444,10 @@ pub async fn activate(
 ) -> Result<(), ActivateError> {
     if !dry_activate {
         info!("Activating profile");
+        // Only attempt a destructive rollback if `nix-env --set` actually advanced the profile to a
+        // new generation. If `--set` fails without creating a new generation, rolling back here
+        // would revert a previously-good deployment.
+        let profile_link_before_set = std::fs::read_link(&profile_path).ok();
         let nix_env_set_exit_status = Command::new("nix-env")
             .arg("-p")
             .arg(&profile_path)
@@ -455,7 +459,12 @@ pub async fn activate(
         match nix_env_set_exit_status.code() {
             Some(0) => (),
             a => {
-                if auto_rollback && !dry_activate {
+                let profile_link_after_set = std::fs::read_link(&profile_path).ok();
+                let should_rollback = auto_rollback
+                    && profile_link_before_set.is_some()
+                    && profile_link_after_set.is_some()
+                    && profile_link_before_set != profile_link_after_set;
+                if should_rollback {
                     deactivate(&profile_path).await?;
                 }
                 return Err(ActivateError::SetProfileExit(a));
@@ -1136,6 +1145,10 @@ async fn process_deploy_session(
 
     if !request.dry_activate {
         info!("Activating profile");
+        // Only attempt a destructive rollback if `nix-env --set` actually advanced the profile to a
+        // new generation. If `--set` fails without creating a new generation, rolling back here
+        // would revert a previously-good deployment.
+        let profile_link_before_set = std::fs::read_link(&profile_path).ok();
         let mut set_profile = Command::new("nix-env");
         set_profile
             .arg("-p")
@@ -1146,7 +1159,12 @@ async fn process_deploy_session(
         match command_status_to_stderr(set_profile, None).await {
             Ok(Some(0)) => (),
             Ok(code) => {
-                if request.auto_rollback {
+                let profile_link_after_set = std::fs::read_link(&profile_path).ok();
+                let should_rollback = request.auto_rollback
+                    && profile_link_before_set.is_some()
+                    && profile_link_after_set.is_some()
+                    && profile_link_before_set != profile_link_after_set;
+                if should_rollback {
                     let _ = deactivate_session(&profile_path).await;
                     return Err(SessionError::rolled_back(format!(
                         "setting profile resulted in a bad exit code: {:?}",
@@ -1159,7 +1177,12 @@ async fn process_deploy_session(
                 )));
             }
             Err(err) => {
-                if request.auto_rollback {
+                let profile_link_after_set = std::fs::read_link(&profile_path).ok();
+                let should_rollback = request.auto_rollback
+                    && profile_link_before_set.is_some()
+                    && profile_link_after_set.is_some()
+                    && profile_link_before_set != profile_link_after_set;
+                if should_rollback {
                     let _ = deactivate_session(&profile_path).await;
                     return Err(SessionError::rolled_back(err));
                 }
