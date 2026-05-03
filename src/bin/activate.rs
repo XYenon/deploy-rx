@@ -1028,81 +1028,96 @@ async fn command_status_to_stderr(
     Ok(output.status.code())
 }
 
-async fn command_output_to_stderr(mut command: Command) -> Result<std::process::Output, String> {
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
+fn profile_generation_id_from_link_target(link_target: &Path) -> Option<String> {
+    let file_name = link_target.file_name()?.to_str()?;
+    let file_name = file_name.strip_suffix("-link")?;
+    let (_, generation_id) = file_name.rsplit_once('-')?;
 
-    let output = command
-        .output()
-        .await
-        .map_err(|err| format!("failed to run command: {}", err))?;
-
-    std::io::stderr()
-        .write_all(&output.stderr)
-        .map_err(|err| format!("failed to forward command stderr: {}", err))?;
-
-    Ok(output)
+    generation_id
+        .chars()
+        .all(|ch| ch.is_ascii_digit())
+        .then(|| generation_id.to_string())
 }
 
-async fn deactivate_session(profile_path: &str) -> Result<(), String> {
-    warn!("De-activating due to error");
+fn current_profile_generation_id(profile_path: &str) -> Option<String> {
+    let link_target = std::fs::read_link(profile_path).ok()?;
+    profile_generation_id_from_link_target(&link_target)
+}
 
-    let mut rollback = Command::new("nix-env");
-    rollback.arg("-p").arg(profile_path).arg("--rollback");
-    match command_status_to_stderr(rollback, None).await? {
-        Some(0) => (),
-        code => return Err(format!("rollback resulted in a bad exit code: {:?}", code)),
+fn current_profile_target(profile_path: &str) -> Option<PathBuf> {
+    let mut target = PathBuf::from(profile_path);
+
+    for _ in 0..8 {
+        let metadata = std::fs::symlink_metadata(&target).ok()?;
+        if !metadata.file_type().is_symlink() {
+            return Some(target);
+        }
+
+        let link_target = std::fs::read_link(&target).ok()?;
+        target = if link_target.is_absolute() {
+            link_target
+        } else {
+            target.parent()?.join(link_target)
+        };
     }
 
-    let mut list_generations = Command::new("nix-env");
-    list_generations
-        .arg("-p")
-        .arg(profile_path)
-        .arg("--list-generations");
-    let list_generations = command_output_to_stderr(list_generations).await?;
-    if list_generations.status.code() != Some(0) {
-        return Err(format!(
-            "listing generations resulted in a bad exit code: {:?}",
-            list_generations.status.code()
-        ));
+    None
+}
+
+fn resolve_previous_profile_target(profile_path: &str) -> Option<(PathBuf, bool)> {
+    if let Some(target) = current_profile_target(profile_path) {
+        return Some((target, false));
     }
 
-    let generations_list = String::from_utf8(list_generations.stdout)
-        .map_err(|err| format!("failed to decode generations list: {}", err))?;
-    let last_generation_line = generations_list
-        .lines()
-        .last()
-        .ok_or_else(|| "expected to find a generation in list".to_string())?;
-    let last_generation_id = last_generation_line
-        .split_whitespace()
-        .next()
-        .ok_or_else(|| "expected to get ID from generation entry".to_string())?;
+    let system_profile_path =
+        get_profile_path(None, Some("root".to_string()), Some("system".to_string())).ok()?;
+    if profile_path != system_profile_path {
+        return None;
+    }
 
-    warn!("Removing generation by ID {}", last_generation_id);
+    current_profile_target("/run/current-system").map(|target| (target, true))
+}
+
+async fn delete_profile_generation(profile_path: &str, generation_id: &str) -> Result<(), String> {
+    warn!("Removing generation by ID {}", generation_id);
     let mut delete_generation = Command::new("nix-env");
     delete_generation
         .arg("-p")
         .arg(profile_path)
         .arg("--delete-generations")
-        .arg(last_generation_id);
-    match command_status_to_stderr(delete_generation, None).await? {
-        Some(0) => (),
-        code => {
-            return Err(format!(
-                "deleting generations resulted in a bad exit code: {:?}",
-                code
-            ))
-        }
-    }
+        .arg(generation_id);
 
+    match command_status_to_stderr(delete_generation, None).await? {
+        Some(0) => Ok(()),
+        code => Err(format!(
+            "deleting generations resulted in a bad exit code: {:?}",
+            code
+        )),
+    }
+}
+
+async fn reactivate_profile(profile_path: &str) -> Result<(), String> {
     info!("Attempting to re-activate the last generation");
-    let mut reactivate = Command::new(format!("{}/deploy-rx-activate", profile_path));
-    reactivate
-        .env("PROFILE", profile_path)
-        .current_dir(profile_path);
+    let deploy_rx_activate = Path::new(profile_path).join("deploy-rx-activate");
+    let switch_to_configuration = Path::new(profile_path)
+        .join("bin")
+        .join("switch-to-configuration");
+
+    // When rolling back a NixOS system profile, the previous generation may be a vanilla
+    // NixOS system closure without deploy-rx's activation helpers. Fall back to the
+    // standard switch-to-configuration script in that case.
+    let reactivate = if deploy_rx_activate.exists() {
+        let mut cmd = Command::new(deploy_rx_activate);
+        cmd.env("PROFILE", profile_path).current_dir(profile_path);
+        cmd
+    } else if switch_to_configuration.exists() {
+        let mut cmd = Command::new(switch_to_configuration);
+        cmd.arg("switch").current_dir("/tmp");
+        cmd
+    } else {
+        return Err("no activation script found after rollback".to_string());
+    };
+
     match command_status_to_stderr(reactivate, None).await? {
         Some(0) => Ok(()),
         code => Err(format!(
@@ -1112,12 +1127,63 @@ async fn deactivate_session(profile_path: &str) -> Result<(), String> {
     }
 }
 
+async fn deactivate_session(
+    profile_path: &str,
+    previous_profile_target: Option<&Path>,
+) -> Result<(), String> {
+    warn!("De-activating due to error");
+
+    let failed_generation_id = current_profile_generation_id(profile_path);
+
+    if let Some(previous_profile_target) = previous_profile_target {
+        info!(
+            "Restoring previous profile target {}",
+            previous_profile_target.display()
+        );
+
+        let mut restore_profile = Command::new("nix-env");
+        restore_profile
+            .arg("-p")
+            .arg(profile_path)
+            .arg("--set")
+            .arg(previous_profile_target);
+
+        match command_status_to_stderr(restore_profile, None).await? {
+            Some(0) => (),
+            code => {
+                return Err(format!(
+                    "restoring previous profile target resulted in a bad exit code: {:?}",
+                    code
+                ))
+            }
+        }
+    } else {
+        let mut rollback = Command::new("nix-env");
+        rollback.arg("-p").arg(profile_path).arg("--rollback");
+
+        match command_status_to_stderr(rollback, None).await? {
+            Some(0) => (),
+            code => return Err(format!("rollback resulted in a bad exit code: {:?}", code)),
+        }
+    }
+
+    let restored_generation_id = current_profile_generation_id(profile_path);
+    if let Some(failed_generation_id) = failed_generation_id {
+        if restored_generation_id.as_deref() != Some(failed_generation_id.as_str()) {
+            delete_profile_generation(profile_path, &failed_generation_id).await?;
+        }
+    }
+
+    reactivate_profile(profile_path).await
+}
+
 async fn rollback_after_confirmation_failure(
     profile_path: &str,
+    previous_profile_target: Option<&Path>,
     err: impl Into<String>,
 ) -> SessionError {
     let err = err.into();
-    let rollback = deactivate_session(profile_path).await;
+    let rollback = deactivate_session(profile_path, previous_profile_target).await;
     SessionError::rolled_back(match rollback {
         Ok(()) => format!("confirmation failed: {}", err),
         Err(rollback_err) => format!(
@@ -1132,6 +1198,21 @@ async fn process_deploy_session(
 ) -> Result<String, SessionError> {
     let profile_path = profile_path_from_target(request.profile.clone())
         .map_err(|err| SessionError::failed(format!("failed to resolve profile path: {}", err)))?;
+    let previous_profile_target = if request.dry_activate {
+        None
+    } else {
+        let previous_profile_target = resolve_previous_profile_target(&profile_path);
+        if let Some((_, true)) = &previous_profile_target {
+            info!(
+                "System profile is not initialized yet; using /run/current-system as the rollback target"
+            );
+        } else if previous_profile_target.is_none() {
+            warn!(
+                "Could not resolve current profile target before activation; rollback will fall back to nix-env --rollback"
+            );
+        }
+        previous_profile_target.map(|(target, _)| target)
+    };
 
     if request.review_changes {
         match render_dry_diff(&profile_path, &request.closure) {
@@ -1165,7 +1246,8 @@ async fn process_deploy_session(
                     && profile_link_after_set.is_some()
                     && profile_link_before_set != profile_link_after_set;
                 if should_rollback {
-                    let _ = deactivate_session(&profile_path).await;
+                    let _ =
+                        deactivate_session(&profile_path, previous_profile_target.as_deref()).await;
                     return Err(SessionError::rolled_back(format!(
                         "setting profile resulted in a bad exit code: {:?}",
                         code
@@ -1183,7 +1265,8 @@ async fn process_deploy_session(
                     && profile_link_after_set.is_some()
                     && profile_link_before_set != profile_link_after_set;
                 if should_rollback {
-                    let _ = deactivate_session(&profile_path).await;
+                    let _ =
+                        deactivate_session(&profile_path, previous_profile_target.as_deref()).await;
                     return Err(SessionError::rolled_back(err));
                 }
                 return Err(SessionError::failed(err));
@@ -1219,7 +1302,7 @@ async fn process_deploy_session(
         }
         Ok(code) => {
             if request.auto_rollback {
-                let _ = deactivate_session(&profile_path).await;
+                let _ = deactivate_session(&profile_path, previous_profile_target.as_deref()).await;
                 return Err(SessionError::rolled_back(format!(
                     "activation script resulted in a bad exit code: {:?}",
                     code
@@ -1233,7 +1316,7 @@ async fn process_deploy_session(
         Err(err) if request.dry_activate => warn!("dry activation failed: {}", err),
         Err(err) => {
             if request.auto_rollback {
-                let _ = deactivate_session(&profile_path).await;
+                let _ = deactivate_session(&profile_path, previous_profile_target.as_deref()).await;
                 return Err(SessionError::rolled_back(err));
             }
             return Err(SessionError::failed(err));
@@ -1259,6 +1342,7 @@ async fn process_deploy_session(
         }) {
             return Err(rollback_after_confirmation_failure(
                 &profile_path,
+                previous_profile_target.as_deref(),
                 format!("failed to send confirmation event: {}", err),
             )
             .await);
@@ -1268,7 +1352,12 @@ async fn process_deploy_session(
             wait_for_session_confirmation(&temp_path, &session_id, &nonce, request.confirm_timeout)
                 .await
         {
-            return Err(rollback_after_confirmation_failure(&profile_path, err).await);
+            return Err(rollback_after_confirmation_failure(
+                &profile_path,
+                previous_profile_target.as_deref(),
+                err,
+            )
+            .await);
         }
     }
 
@@ -1280,7 +1369,7 @@ async fn process_revoke_session(
 ) -> Result<String, SessionError> {
     let profile_path = profile_path_from_target(request.profile)
         .map_err(|err| SessionError::failed(format!("failed to resolve profile path: {}", err)))?;
-    deactivate_session(&profile_path)
+    deactivate_session(&profile_path, None)
         .await
         .map_err(SessionError::failed)?;
     Ok("revoke finished".to_string())

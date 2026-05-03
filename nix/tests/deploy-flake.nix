@@ -97,6 +97,7 @@
         modules = [
           ./server.nix
           ./common.nix
+          (pkgs.path + "/nixos/modules/virtualisation/qemu-vm.nix")
           # Import the base config used by nixos tests
           (pkgs.path + "/nixos/lib/testing/nixos-test-base.nix")
           # Deployment breaks the network settings, so we need to restore them

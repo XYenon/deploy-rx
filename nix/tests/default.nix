@@ -2,11 +2,36 @@
 #
 # SPDX-License-Identifier: MPL-2.0
 
-{ pkgs , inputs , ... }:
+{ pkgs, inputs, deployRxSrc, ... }:
 let
   inherit (pkgs) lib;
 
   inherit (import "${pkgs.path}/nixos/tests/ssh-keys.nix" pkgs) snakeOilPrivateKey;
+
+  deployRxTestSrc = builtins.path {
+    path = deployRxSrc;
+    name = "deploy-rx-test-source";
+  };
+
+  nixpkgsTestSrc = builtins.path {
+    path = inputs.nixpkgs;
+    name = "nixpkgs-test-source";
+  };
+
+  utilsTestSrc = builtins.path {
+    path = inputs.utils;
+    name = "flake-utils-test-source";
+  };
+
+  systemsTestSrc = builtins.path {
+    path = inputs.utils.inputs.systems;
+    name = "systems-test-source";
+  };
+
+  flakeCompatTestSrc = builtins.path {
+    path = inputs.flake-compat;
+    name = "flake-compat-test-source";
+  };
 
   # Include all build dependencies to be able to build profiles offline
   allDrvOutputs = pkg: pkgs.runCommand "allDrvOutputs" { refs = pkgs.writeClosure pkg.drvPath; } ''
@@ -90,15 +115,16 @@ let
     };
 
     flakeInputs = ''
-      deploy-rx.url = "${../..}";
+      deploy-rx.url = "${deployRxTestSrc}";
+      deploy-rx.inputs.nixpkgs.follows = "nixpkgs";
       deploy-rx.inputs.utils.follows = "utils";
       deploy-rx.inputs.flake-compat.follows = "flake-compat";
 
-      nixpkgs.url = "${inputs.nixpkgs}";
-      utils.url = "${inputs.utils}";
+      nixpkgs.url = "${nixpkgsTestSrc}";
+      utils.url = "${utilsTestSrc}";
       utils.inputs.systems.follows = "systems";
-      systems.url = "${inputs.utils.inputs.systems}";
-      flake-compat.url = "${inputs.flake-compat}";
+      systems.url = "${systemsTestSrc}";
+      flake-compat.url = "${flakeCompatTestSrc}";
       flake-compat.flake = false;
 
       enable-flakes.url = "${builtins.toFile "use-flakes" (if flakes then "true" else "false")}";
@@ -127,8 +153,16 @@ let
     inherit nodes name;
 
     testScript = { nodes, ... }: let
-      serverNetworkJSON = pkgs.writeText "server-network.json"
-        (builtins.toJSON nodes.server.system.build.networkConfig);
+      # `system.build.networkConfig` includes test-only convenience attributes like
+      # `networking.primaryIPAddress`, which aren't real NixOS options and will fail
+      # evaluation when importing this config into a regular `nixosSystem`.
+      serverNetworkConfig = nodes.server.system.build.networkConfig // {
+        networking = lib.removeAttrs nodes.server.system.build.networkConfig.networking [
+          "primaryIPAddress"
+          "primaryIPv6Address"
+        ];
+      };
+      serverNetworkJSON = pkgs.writeText "server-network.json" (builtins.toJSON serverNetworkConfig);
     in ''
 if True:
       import shlex
@@ -161,6 +195,9 @@ if True:
           client.succeed("rm -rf /tmp/deploy-rx-e2e /tmp/wrappers && mkdir -p /tmp/deploy-rx-e2e")
 
       start_all()
+      # mypy type-checks `server2` even when multiHost is false (the block becomes `if False:`).
+      if ${if multiHost then "False" else "True"}:
+          server2 = server
 
       # Prepare
       client_sh(f"rm -rf {workspace} && mkdir -p {workspace}")
@@ -389,7 +426,9 @@ in {
     name = "magic-rollback-default";
     scenarioScript = ''
       work_fail("deploy -s --no-build-tree --no-review-changes .#broken-ssh -- --offline > /tmp/broken-ssh.out 2>&1", timeout=900)
-      server.wait_for_open_port(22)
+      client_sh("sed -n '1,200p' /tmp/broken-ssh.out >&2 || true")
+      server.succeed("ss -tlnp | sed -n '1,200p' >&2 || true")
+      server.wait_for_open_port(22, timeout=60)
       client_sh("ssh -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no server true", timeout=30)
       client_fail("ssh -p 2222 -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no server true", timeout=30)
     '';

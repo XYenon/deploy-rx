@@ -19,6 +19,15 @@ use std::process::Stdio;
 use thiserror::Error;
 use tokio::process::Command;
 
+fn add_nix_command_and_flakes(cmd: &mut Command) {
+    cmd.args([
+        "--extra-experimental-features",
+        "nix-command",
+        "--extra-experimental-features",
+        "flakes",
+    ]);
+}
+
 /// Simple Rust rewrite of a simple Nix Flake deployment tool
 #[derive(Parser, Debug, Clone)]
 #[command(version = "1.0", author = "Serokell <https://serokell.io/>")]
@@ -139,7 +148,9 @@ pub struct Opts {
 async fn test_flake_support() -> Result<bool, std::io::Error> {
     debug!("Checking for flake support");
 
-    Ok(Command::new("nix")
+    let mut cmd = Command::new("nix");
+    add_nix_command_and_flakes(&mut cmd);
+    Ok(cmd
         .arg("eval")
         .arg("--expr")
         .arg("builtins.getFlake")
@@ -172,6 +183,7 @@ async fn check_deployment(
     };
 
     if supports_flakes {
+        add_nix_command_and_flakes(&mut check_command);
         check_command.arg("flake").arg("check").arg(repo);
     } else {
         check_command.arg("-E")
@@ -321,6 +333,7 @@ in
 "#;
 
                 let mut c = Command::new("nix");
+                add_nix_command_and_flakes(&mut c);
                 c.arg("eval")
                     .arg("--json")
                     .arg(format!("{}#deploy", repo))

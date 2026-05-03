@@ -196,6 +196,7 @@
           deploy-rx = self.packages.${system}.default.overrideAttrs (super: { doCheck = true; });
         } // (pkgs.lib.optionalAttrs (pkgs.lib.elem system ["x86_64-linux"]) (import ./nix/tests {
           inherit inputs pkgs;
+          deployRxSrc = self.outPath;
         }));
 
         inherit (pkgs.deploy-rx) lib;

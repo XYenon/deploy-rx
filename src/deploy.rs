@@ -176,6 +176,11 @@ struct RemoteConfirmData<'a> {
 async fn confirm_remote_session(data: RemoteConfirmData<'_>) -> Result<(), RemoteConfirmError> {
     let ssh_addr = format!("{}@{}", data.deploy_defs.ssh_user, data.hostname);
     let remote_command = remote_activate_rs_command(data.closure, "confirm-session")?;
+    let confirm_timeout = data
+        .deploy_data
+        .merged_settings
+        .confirm_timeout
+        .unwrap_or(30);
     let confirm_request = ConfirmRequest {
         temp_path: data.temp_path.display().to_string(),
         session_id: data.session_id,
@@ -200,6 +205,12 @@ async fn confirm_remote_session(data: RemoteConfirmData<'_>) -> Result<(), Remot
             command.arg(ssh_opt);
         }
         command.arg("-o").arg("ControlPath=none");
+        // Without an explicit ConnectTimeout, a failed connection attempt can block for minutes
+        // on TCP timeouts (which makes `magicRollback` deployments appear hung).
+        command
+            .arg("-o")
+            .arg(format!("ConnectTimeout={}", confirm_timeout));
+        command.arg("-o").arg("ConnectionAttempts=1");
     } else {
         for ssh_opt in &data.deploy_data.merged_settings.ssh_opts {
             command.arg(ssh_opt);

@@ -18,8 +18,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: wimpysworld/nothing-but-nix@main
       - uses: DeterminateSystems/determinate-nix-action@v3
-      - name: Run E2E checks with nix-fast-build
+      - name: Run flake checks
         run: |
-          nix run nixpkgs#nix-fast-build -- \
-            --no-nom \
-            --skip-cached
+          nix build -L
+          nix flake check -L --max-jobs 1
