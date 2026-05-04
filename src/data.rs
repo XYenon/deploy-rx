@@ -7,6 +7,8 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+use crate::sudo::SudoCommand;
+
 #[derive(Deserialize, Debug, Clone, Merge)]
 pub struct GenericSettings {
     #[serde(rename(deserialize = "sshUser"))]
@@ -32,7 +34,7 @@ pub struct GenericSettings {
     #[serde(rename(deserialize = "magicRollback"))]
     pub magic_rollback: Option<bool>,
     #[serde(rename(deserialize = "sudo"))]
-    pub sudo: Option<String>,
+    pub sudo: Option<SudoCommand>,
     #[serde(default, rename(deserialize = "remoteBuild"))]
     pub remote_build: Option<bool>,
     #[serde(rename(deserialize = "interactiveSudo"))]
@@ -85,7 +87,7 @@ pub struct Data {
 
 #[cfg(test)]
 mod tests {
-    use super::ProfileSettings;
+    use super::{GenericSettings, ProfileSettings};
 
     #[test]
     fn test_profile_settings_tags_default_to_empty() {
@@ -102,5 +104,39 @@ mod tests {
                 .unwrap();
 
         assert_eq!(profile.tags, vec!["prod", "system"]);
+    }
+
+    #[test]
+    fn test_sudo_deserializes_structured_argv() {
+        let settings: GenericSettings =
+            serde_json::from_str(r#"{"sudo":["sudo","-u"],"sshOpts":[],"remoteBuild":false}"#)
+                .unwrap();
+
+        assert_eq!(
+            settings.sudo.unwrap().argv(),
+            &["sudo".to_string(), "-u".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_sudo_deserializes_legacy_string() {
+        let settings: GenericSettings =
+            serde_json::from_str(r#"{"sudo":"doas -u","sshOpts":[],"remoteBuild":false}"#).unwrap();
+
+        assert_eq!(
+            settings.sudo.unwrap().argv(),
+            &["doas".to_string(), "-u".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_sudo_rejects_legacy_shell_syntax() {
+        let err = serde_json::from_str::<GenericSettings>(
+            r#"{"sudo":"sudo -u root; sh","sshOpts":[],"remoteBuild":false}"#,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("structured sudo"));
     }
 }

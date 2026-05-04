@@ -39,6 +39,14 @@ First-class support for deploying [system-manager](https://github.com/numtide/sy
 - **Diff & Change Review**: Integrated, super-fast diffing (`dix`) of derivation changes before activation or switch. Enabled by default (bypass with `--no-review-changes`).
 - **Batched Nix Evaluation & Builds**: Intelligently groups multiple deployment targets from the same flake into a single `nix eval` and a single `nix build` invocation, reducing Nix overhead and improving deployment speed.
 
+### Sudo Configuration
+
+`deploy-rx` supports passing `sudo` as a list of arguments for better security and flexibility.
+
+- `sudo` can now be a list of strings (argv). It defaults to `[ "sudo" "-u" ]`.
+- Legacy string values (e.g., `"doas -u"`) are still supported if they contain only simple tokens.
+- Using the list form is recommended as it avoids shell escaping issues.
+
 ### Tag-Based Profile Selection
 
 Profiles can now declare `tags`, and the CLI can deploy every matching profile across all nodes in one command.

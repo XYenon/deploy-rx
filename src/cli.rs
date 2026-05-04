@@ -19,6 +19,15 @@ use std::process::Stdio;
 use thiserror::Error;
 use tokio::process::Command;
 
+fn add_nix_command_and_flakes(cmd: &mut Command) {
+    cmd.args([
+        "--extra-experimental-features",
+        "nix-command",
+        "--extra-experimental-features",
+        "flakes",
+    ]);
+}
+
 /// Simple Rust rewrite of a simple Nix Flake deployment tool
 #[derive(Parser, Debug, Clone)]
 #[command(version = "1.0", author = "Serokell <https://serokell.io/>")]
@@ -139,7 +148,9 @@ pub struct Opts {
 async fn test_flake_support() -> Result<bool, std::io::Error> {
     debug!("Checking for flake support");
 
-    Ok(Command::new("nix")
+    let mut cmd = Command::new("nix");
+    add_nix_command_and_flakes(&mut cmd);
+    Ok(cmd
         .arg("eval")
         .arg("--expr")
         .arg("builtins.getFlake")
@@ -172,6 +183,7 @@ async fn check_deployment(
     };
 
     if supports_flakes {
+        add_nix_command_and_flakes(&mut check_command);
         check_command.arg("flake").arg("check").arg(repo);
     } else {
         check_command.arg("-E")
@@ -321,6 +333,7 @@ in
 "#;
 
                 let mut c = Command::new("nix");
+                add_nix_command_and_flakes(&mut c);
                 c.arg("eval")
                     .arg("--json")
                     .arg(format!("{}#deploy", repo))
@@ -393,7 +406,7 @@ fn print_deployment(
     for (_, data, defs) in parts {
         part_map
             .entry(data.node_name.to_string())
-            .or_insert_with(HashMap::new)
+            .or_default()
             .insert(
                 data.profile_name.to_string(),
                 PromptPart {
@@ -505,6 +518,8 @@ pub enum RunDeployError {
     SshControlMaster(#[from] deploy::ssh::SshError),
     #[error("No profiles matched the requested tags: {0}")]
     NoProfilesMatchedTags(String),
+    #[error("Failed to prompt for sudo password for {0}: {1}")]
+    PromptSudoPassword(String, std::io::Error),
 }
 
 type ToDeploy<'a> = Vec<(
@@ -619,6 +634,7 @@ fn collect_to_deploy<'a>(
     Ok(to_deploy)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_deploy(
     deploy_flakes: Vec<deploy::DeployFlake<'_>>,
     data: Vec<deploy::data::Data>,
@@ -670,16 +686,17 @@ async fn run_deploy(
             .merged_settings
             .interactive_sudo
             .unwrap_or(false)
+            && deploy_defs.sudo.is_some()
         {
             warn!("Interactive sudo is enabled! Using a sudo password is less secure than correctly configured SSH keys.\nPlease use keys in production environments.");
 
-            if deploy_data.merged_settings.sudo.is_some() {
+            if deploy_defs
+                .sudo
+                .as_ref()
+                .map(|sudo| !sudo.is_sudo())
+                .unwrap_or(false)
+            {
                 warn!("Custom sudo commands should be configured to accept password input from stdin when using the 'interactive sudo' option. Deployment may fail if the custom command ignores stdin.");
-            } else {
-                // this configures sudo to hide the password prompt and accept input from stdin
-                // at the time of writing, deploy_defs.sudo defaults to 'sudo -u root' when using user=root and sshUser as non-root
-                let original = deploy_defs.sudo.unwrap_or("sudo".to_string());
-                deploy_defs.sudo = Some(format!("{} -S -p \"\"", original));
             }
 
             info!(
@@ -690,7 +707,9 @@ async fn run_deploy(
                 "(sudo for {}) Password: ",
                 node.node_settings.hostname
             ))
-            .unwrap_or("".to_string());
+            .map_err(|err| {
+                RunDeployError::PromptSudoPassword(node.node_settings.hostname.clone(), err)
+            })?;
 
             deploy_defs.sudo_password = Some(sudo_password);
         }
@@ -806,7 +825,7 @@ async fn run_deploy(
                 //  the command line)
                 for (deploy_data, deploy_defs) in &succeeded {
                     if deploy_data.merged_settings.auto_rollback.unwrap_or(true) {
-                        deploy::deploy::revoke(*deploy_data, *deploy_defs)
+                        deploy::deploy::revoke(deploy_data, deploy_defs)
                             .await
                             .map_err(|e| {
                                 RunDeployError::RevokeProfile(deploy_data.node_name.to_string(), e)
@@ -1391,6 +1410,8 @@ pub enum RunError {
     ParseFlake(#[from] deploy::ParseFlakeError),
     #[error("Error parsing arguments: {0}")]
     ParseArgs(#[from] clap::Error),
+    #[error("Error parsing sudo configuration: {0}")]
+    SudoParse(#[from] deploy::sudo::SudoParseError),
     #[error("Error initiating logger: {0}")]
     Logger(#[from] flexi_logger::FlexiLoggerError),
     #[error("{0}")]
@@ -1430,6 +1451,12 @@ pub async fn run(args: Option<&ArgMatches>) -> Result<(), RunError> {
             .collect::<Result<Vec<DeployFlake>, ParseFlakeError>>()?
     };
 
+    let sudo = opts
+        .sudo
+        .as_deref()
+        .map(deploy::sudo::SudoCommand::parse_legacy)
+        .transpose()?;
+
     let cmd_overrides = deploy::CmdOverrides {
         ssh_user: opts.ssh_user,
         profile_user: opts.profile_user,
@@ -1443,7 +1470,7 @@ pub async fn run(args: Option<&ArgMatches>) -> Result<(), RunError> {
         activation_timeout: opts.activation_timeout,
         dry_activate: opts.dry_activate,
         remote_build: opts.remote_build,
-        sudo: opts.sudo,
+        sudo,
         interactive_sudo: opts.interactive_sudo,
     };
 

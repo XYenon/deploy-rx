@@ -13,10 +13,15 @@
         password = "";
         isNormalUser = true;
         createHome = true;
+        extraGroups = [ "wheel" ];
         openssh.authorizedKeys.keys = [ snakeOilPublicKey ];
       };
       root.openssh.authorizedKeys.keys = [ snakeOilPublicKey ];
     };
+  };
+  security.sudo = {
+    enable = true;
+    wheelNeedsPassword = false;
   };
   services.openssh.enable = true;
   virtualisation.writableStore = true;
