@@ -5,20 +5,38 @@ on:
 
 jobs:
   cargo-test:
+    name: Cargo test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: DeterminateSystems/determinate-nix-action@v3
+      - uses: actions/checkout@main
+      - uses: DeterminateSystems/determinate-nix-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
       - name: Run cargo test
         run: nix develop --command cargo test
 
-  e2e:
+  get-matrix:
+    name: Get matrix
     runs-on: ubuntu-latest
+    outputs:
+      check-matrix: ${{ steps.set-check-matrix.outputs.matrix }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@main
+      - uses: DeterminateSystems/determinate-nix-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+      - id: set-check-matrix
+        run: echo "matrix=$(nix eval --json .#check-matrix.x86_64-linux)" >> $GITHUB_OUTPUT
+
+  check:
+    needs: get-matrix
+    name: Check ${{ matrix.check }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.get-matrix.outputs.check-matrix) }}
+    steps:
+      - uses: actions/checkout@main
       - uses: wimpysworld/nothing-but-nix@main
-      - uses: DeterminateSystems/determinate-nix-action@v3
-      - name: Run flake checks
-        run: |
-          nix build -L
-          nix flake check -L --max-jobs 1
+      - uses: DeterminateSystems/determinate-nix-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+      - name: Check
+        run: nix build -L .#checks.x86_64-linux.${{ matrix.check }}
