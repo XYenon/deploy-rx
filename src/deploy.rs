@@ -144,6 +144,27 @@ fn interpret_remote_session_completion(
     }
 }
 
+fn decode_remote_event_line(
+    line: &str,
+    saw_protocol_event: bool,
+) -> Result<Option<RemoteEvent>, RemoteSessionError> {
+    if line.trim().is_empty() {
+        return Ok(None);
+    }
+
+    match serde_json::from_str::<RemoteEvent>(line) {
+        Ok(event) => Ok(Some(event)),
+        Err(_) if !saw_protocol_event => {
+            info!("Ignoring unexpected remote stdout before protocol started: {line}");
+            Ok(None)
+        }
+        Err(source) => Err(RemoteSessionError::DecodeEvent {
+            line: line.to_string(),
+            source,
+        }),
+    }
+}
+
 #[derive(Error, Debug)]
 pub enum RemoteConfirmError {
     #[error("failed to build remote confirm command: {0}")]
@@ -312,21 +333,17 @@ async fn run_remote_operation(
         .ok_or(RemoteSessionError::MissingStdout)?;
     let mut lines = BufReader::new(stdout).lines();
     let mut finished: Option<(bool, String)> = None;
+    let mut saw_protocol_event = false;
 
     while let Some(line) = lines
         .next_line()
         .await
         .map_err(RemoteSessionError::ReadEvent)?
     {
-        if line.trim().is_empty() {
+        let Some(event) = decode_remote_event_line(&line, saw_protocol_event)? else {
             continue;
-        }
-
-        let event: RemoteEvent =
-            serde_json::from_str(&line).map_err(|source| RemoteSessionError::DecodeEvent {
-                line: line.clone(),
-                source,
-            })?;
+        };
+        saw_protocol_event = true;
 
         match event {
             RemoteEvent::Hello { protocol_version } => {
@@ -360,6 +377,7 @@ async fn run_remote_operation(
                 message,
             } => {
                 finished = Some((ok, message));
+                break;
             }
         }
     }
@@ -499,6 +517,23 @@ mod tests {
         assert!(matches!(
             err,
             RemoteSessionError::RemoteFailed(message) if message == "boom"
+        ));
+    }
+
+    #[test]
+    fn ignores_stdout_noise_before_protocol_starts() {
+        assert!(decode_remote_event_line("Last login: just now", false)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn rejects_stdout_noise_after_protocol_starts() {
+        let err = decode_remote_event_line("Last login: just now", true).unwrap_err();
+
+        assert!(matches!(
+            err,
+            RemoteSessionError::DecodeEvent { line, .. } if line == "Last login: just now"
         ));
     }
 }

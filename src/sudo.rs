@@ -11,6 +11,8 @@ use thiserror::Error;
 pub enum SudoParseError {
     #[error("sudo command must not be empty")]
     Empty,
+    #[error("sudo argv must end with `-u` or `--user` so deploy-rx can append the target user")]
+    MissingUserFlag,
     #[error("legacy sudo string contains unterminated quote; use structured sudo = [\"program\", \"arg\", ...] instead")]
     UnterminatedQuote,
     #[error("legacy sudo string ends with a dangling escape; use structured sudo = [\"program\", \"arg\", ...] instead")]
@@ -30,7 +32,9 @@ impl SudoCommand {
             return Err(SudoParseError::Empty);
         }
 
-        Ok(Self { argv })
+        let command = Self { argv };
+        command.validate()?;
+        Ok(command)
     }
 
     pub fn default_sudo() -> Self {
@@ -58,6 +62,15 @@ impl SudoCommand {
 
     pub fn is_sudo(&self) -> bool {
         self.sudo_index().is_some()
+    }
+
+    fn validate(&self) -> Result<(), SudoParseError> {
+        if self.is_sudo() && !matches!(self.argv.last().map(String::as_str), Some("-u" | "--user"))
+        {
+            return Err(SudoParseError::MissingUserFlag);
+        }
+
+        Ok(())
     }
 
     pub fn argv_for_user(&self, user: &str, interactive: bool) -> Vec<String> {
@@ -252,6 +265,28 @@ mod tests {
     fn serializes_as_argv_array() {
         let sudo = SudoCommand::new(vec!["sudo".to_string(), "-u".to_string()]).unwrap();
         assert_eq!(serde_json::to_string(&sudo).unwrap(), r#"["sudo","-u"]"#);
+    }
+
+    #[test]
+    fn rejects_bare_sudo_command() {
+        assert_eq!(
+            SudoCommand::new(vec!["sudo".to_string()]).unwrap_err(),
+            SudoParseError::MissingUserFlag
+        );
+    }
+
+    #[test]
+    fn rejects_sudo_when_user_slot_is_not_last() {
+        assert_eq!(
+            SudoCommand::new(vec![
+                "env".to_string(),
+                "sudo".to_string(),
+                "-u".to_string(),
+                "-H".to_string(),
+            ])
+            .unwrap_err(),
+            SudoParseError::MissingUserFlag
+        );
     }
 
     #[test]

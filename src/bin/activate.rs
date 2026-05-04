@@ -1436,6 +1436,9 @@ async fn bootstrap_session() -> Result<(), Box<dyn std::error::Error>> {
     let mut open_options = std::fs::OpenOptions::new();
     open_options.write(true).create_new(true);
     #[cfg(unix)]
+    // `privileged-session` may run as a different profile user, so the handoff file must stay
+    // readable across that sudo boundary. This file only contains `RemoteOperation`; bootstrap-only
+    // data like the sudo password is kept in memory and is not written to disk here.
     open_options.mode(0o644);
     let mut request_file = open_options.open(&request_path)?;
     request_file.write_all(&request_json)?;
