@@ -11,7 +11,9 @@ use thiserror::Error;
 pub enum SudoParseError {
     #[error("sudo command must not be empty")]
     Empty,
-    #[error("sudo argv must end with `-u` or `--user` so deploy-rx can append the target user")]
+    #[error(
+        "sudo argv must end with `-u`, `--user`, or a short option group ending in `u` (e.g. `-iu`) so deploy-rx can append the target user"
+    )]
     MissingUserFlag,
     #[error("legacy sudo string contains unterminated quote; use structured sudo = [\"program\", \"arg\", ...] instead")]
     UnterminatedQuote,
@@ -32,7 +34,10 @@ impl SudoCommand {
             return Err(SudoParseError::Empty);
         }
 
-        let command = Self { argv };
+        // For `sudo`, allow configuring just `sudo` or `sudo <flags>` and implicitly append
+        // the user slot marker. We still require the user slot to be the final argument.
+        let mut command = Self { argv };
+        command.normalize_sudo_user_flag();
         command.validate()?;
         Ok(command)
     }
@@ -65,9 +70,15 @@ impl SudoCommand {
     }
 
     fn validate(&self) -> Result<(), SudoParseError> {
-        if self.is_sudo() && !matches!(self.argv.last().map(String::as_str), Some("-u" | "--user"))
-        {
-            return Err(SudoParseError::MissingUserFlag);
+        if self.is_sudo() {
+            let last = self
+                .argv
+                .last()
+                .expect("sudo validated after non-empty check")
+                .as_str();
+            if !Self::is_sudo_user_slot_marker(last) {
+                return Err(SudoParseError::MissingUserFlag);
+            }
         }
 
         Ok(())
@@ -102,6 +113,61 @@ impl SudoCommand {
 
         argv.push(user.to_string());
         argv
+    }
+
+    fn normalize_sudo_user_flag(&mut self) {
+        if !self.is_sudo() {
+            return;
+        }
+
+        if self
+            .argv
+            .last()
+            .map(String::as_str)
+            .is_some_and(Self::is_sudo_user_slot_marker)
+        {
+            return;
+        }
+
+        let has_user_flag = self
+            .argv
+            .iter()
+            .any(|arg| Self::arg_contains_sudo_user_flag(arg));
+
+        // Only auto-append when the user flag is entirely absent; if the user flag is present but
+        // not last, the config is ambiguous (it would consume a subsequent option as the user).
+        if !has_user_flag {
+            self.argv.push("-u".to_string());
+        }
+    }
+
+    fn is_sudo_user_slot_marker(arg: &str) -> bool {
+        matches!(arg, "-u" | "--user") || Self::is_short_flag_group_ending_with_u(arg)
+    }
+
+    fn arg_contains_sudo_user_flag(arg: &str) -> bool {
+        arg == "-u"
+            || arg == "--user"
+            || arg.starts_with("--user=")
+            || (arg.starts_with("-u") && arg.len() > 2)
+            || Self::is_short_flag_group_containing_u(arg)
+    }
+
+    fn is_short_flag_group_containing_u(arg: &str) -> bool {
+        Self::is_short_flag_group(arg) && arg.contains('u')
+    }
+
+    fn is_short_flag_group_ending_with_u(arg: &str) -> bool {
+        Self::is_short_flag_group(arg) && arg.ends_with('u')
+    }
+
+    fn is_short_flag_group(arg: &str) -> bool {
+        // sudo supports combining short flags (e.g. `-iu`), so treat `-<letters>` as a flag group.
+        // We keep this intentionally conservative and only consider ASCII letters.
+        arg.len() > 2
+            && arg.starts_with('-')
+            && !arg.starts_with("--")
+            && arg[1..].chars().all(|ch| ch.is_ascii_alphabetic())
     }
 }
 
@@ -233,6 +299,16 @@ mod tests {
     }
 
     #[test]
+    fn supports_combined_short_user_flag() {
+        let sudo = SudoCommand::parse_legacy("sudo -iu").unwrap();
+        assert_eq!(sudo.argv(), &["sudo".to_string(), "-iu".to_string()]);
+        assert_eq!(
+            sudo.argv_for_user("root", false),
+            vec!["sudo".to_string(), "-iu".to_string(), "root".to_string()]
+        );
+    }
+
+    #[test]
     fn parses_legacy_quotes() {
         let sudo = SudoCommand::parse_legacy("sudo -S -p \"\" -u").unwrap();
         assert_eq!(
@@ -268,10 +344,17 @@ mod tests {
     }
 
     #[test]
-    fn rejects_bare_sudo_command() {
+    fn adds_user_flag_for_bare_sudo_command() {
+        let sudo = SudoCommand::new(vec!["sudo".to_string()]).unwrap();
+        assert_eq!(sudo.argv(), &["sudo".to_string(), "-u".to_string()]);
+    }
+
+    #[test]
+    fn adds_user_flag_for_sudo_with_flags() {
+        let sudo = SudoCommand::parse_legacy("sudo -H").unwrap();
         assert_eq!(
-            SudoCommand::new(vec!["sudo".to_string()]).unwrap_err(),
-            SudoParseError::MissingUserFlag
+            sudo.argv(),
+            &["sudo".to_string(), "-H".to_string(), "-u".to_string(),]
         );
     }
 
