@@ -242,15 +242,31 @@ ${scenarioScript}
     user ? "root",
     flakes ? true,
     isLocal ? true,
+    setupScript ? "",
+    verifyScript ? "",
   }:
     mkTest {
       inherit name flakes isLocal;
       scenarioScript = ''
+      ${setupScript}
       server.fail("su ${user} -l -c 'hello | figlet'")
       work("deploy ${deployArgs}", timeout=600)
       server.succeed("su ${user} -l -c 'hello | figlet' >&2")
+      ${verifyScript}
       '';
     };
+
+  assertRemoteBuildUsed = {
+    hostname,
+    sshUser ? "root",
+  }: let
+    remoteStore = "ssh-ng://${sshUser}@${hostname}";
+    directCopyStore = "ssh://${sshUser}@${hostname}";
+  in ''
+      client_sh("grep -F 'copy -s --to ${remoteStore} --derivation' /tmp/deploy-rx-e2e/nix.log")
+      client_sh("grep -F -- '--store ${remoteStore}' /tmp/deploy-rx-e2e/nix.log")
+      client_fail("grep -F 'copy --to ${directCopyStore}' /tmp/deploy-rx-e2e/nix.log")
+    '';
 in {
   # Deployment with client-side build
   local-build = mkSimpleDeployTest {
@@ -261,12 +277,26 @@ in {
   remote-build = mkSimpleDeployTest {
     name = "remote-build";
     isLocal = false;
+    setupScript = ''
+      install_wrapper("nix", nix_wrapper_source)
+    '';
+    verifyScript = assertRemoteBuildUsed {
+      hostname = "server";
+    };
     deployArgs = "-s .#server --remote-build -- --offline";
   };
-  non-flake-remote-build = mkSimpleDeployTest {
-    name = "non-flake-remote-build";
+
+  # Deployment using a flake target while the VM nix.conf does not enable flakes by default.
+  flake-remote-build-with-flakes-disabled-in-config = mkSimpleDeployTest {
+    name = "flake-remote-build-with-flakes-disabled-in-config";
     isLocal = false;
     flakes = false;
+    setupScript = ''
+      install_wrapper("nix", nix_wrapper_source)
+    '';
+    verifyScript = assertRemoteBuildUsed {
+      hostname = "server";
+    };
     deployArgs = "-s .#server --remote-build";
   };
   # Deployment with overridden options
@@ -291,14 +321,16 @@ in {
     user = "deploy";
     deployArgs = "-s .#profile --ssh-opts '-p 22 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null' -- --offline";
   };
-  # Deployment using a non-flake nix
-  non-flake-build = mkSimpleDeployTest {
-    name = "non-flake-build";
+  # Deployment using a flake target while the VM nix.conf does not enable flakes by default.
+  flake-build-with-flakes-disabled-in-config = mkSimpleDeployTest {
+    name = "flake-build-with-flakes-disabled-in-config";
     flakes = false;
     deployArgs = "-s .#server";
   };
-  non-flake-with-flakes = mkSimpleDeployTest {
-    name = "non-flake-with-flakes";
+
+  # Deployment using file mode (`--file`) on a flake-capable nix installation.
+  file-mode-with-flake-capable-nix = mkSimpleDeployTest {
+    name = "file-mode-with-flake-capable-nix";
     flakes = true;
     deployArgs = "--file . --targets server";
   };
