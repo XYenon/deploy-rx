@@ -529,6 +529,43 @@ type ToDeploy<'a> = Vec<(
     (&'a str, &'a deploy::data::Profile),
 )>;
 
+type DeployPart<'a> = (
+    &'a deploy::DeployFlake<'a>,
+    deploy::DeployData<'a>,
+    deploy::DeployDefs,
+);
+
+struct PushProfileDataOptions<'a> {
+    supports_flakes: bool,
+    check_sigs: bool,
+    keep_result: bool,
+    result_path: Option<&'a str>,
+    extra_build_args: &'a [String],
+    build_tree: bool,
+}
+
+fn make_push_profile_datas<'a>(
+    parts: &'a [DeployPart<'a>],
+    options: &PushProfileDataOptions<'a>,
+) -> Vec<deploy::push::PushProfileData<'a>> {
+    parts
+        .iter()
+        .map(
+            |(deploy_flake, deploy_data, deploy_defs)| deploy::push::PushProfileData {
+                supports_flakes: options.supports_flakes,
+                check_sigs: options.check_sigs,
+                repo: deploy_flake.repo,
+                deploy_data,
+                deploy_defs,
+                keep_result: options.keep_result,
+                result_path: options.result_path,
+                extra_build_args: options.extra_build_args,
+                build_tree: options.build_tree,
+            },
+        )
+        .collect()
+}
+
 fn profile_matches_tags(profile: &deploy::data::Profile, tags: &HashSet<&str>) -> bool {
     tags.iter()
         .all(|tag| profile.profile_settings.tags.iter().any(|t| t == *tag))
@@ -662,11 +699,7 @@ async fn run_deploy(
         return Err(RunDeployError::NoProfilesMatchedTags(tags.join(", ")));
     }
 
-    let mut parts: Vec<(
-        &deploy::DeployFlake<'_>,
-        deploy::DeployData,
-        deploy::DeployDefs,
-    )> = Vec::new();
+    let mut parts: Vec<DeployPart<'_>> = Vec::new();
 
     for (deploy_flake, data, (node_name, node), (profile_name, profile)) in to_deploy {
         let deploy_data = deploy::make_deploy_data(
@@ -723,22 +756,16 @@ async fn run_deploy(
         print_deployment(&parts[..])?;
     }
 
-    let push_profile_datas: Vec<_> = parts
-        .iter()
-        .map(
-            |(deploy_flake, deploy_data, deploy_defs)| deploy::push::PushProfileData {
-                supports_flakes,
-                check_sigs,
-                repo: deploy_flake.repo,
-                deploy_data,
-                deploy_defs,
-                keep_result,
-                result_path,
-                extra_build_args,
-                build_tree,
-            },
-        )
-        .collect();
+    let push_profile_data_options = PushProfileDataOptions {
+        supports_flakes,
+        check_sigs,
+        keep_result,
+        result_path,
+        extra_build_args,
+        build_tree,
+    };
+
+    let push_profile_datas = make_push_profile_datas(&parts, &push_profile_data_options);
 
     // Resolve derivations, then build all profiles (remote individually, local batched)
     deploy::push::build_profiles(&push_profile_datas)
@@ -779,31 +806,19 @@ async fn run_deploy(
         None
     };
 
-    let push_profile_datas: Vec<_> = parts
-        .iter()
-        .map(
-            |(deploy_flake, deploy_data, deploy_defs)| deploy::push::PushProfileData {
-                supports_flakes,
-                check_sigs,
-                repo: deploy_flake.repo,
-                deploy_data,
-                deploy_defs,
-                keep_result,
-                result_path,
-                extra_build_args,
-                build_tree,
-            },
-        )
-        .collect();
+    let push_profile_datas = make_push_profile_datas(&parts, &push_profile_data_options);
 
     deploy::push::push_profiles(&push_profile_datas)
         .await
         .map_err(|e| {
-            let node_names: Vec<_> = push_profile_datas
-                .iter()
-                .map(|d| d.deploy_data.node_name.to_string())
-                .collect();
-            RunDeployError::PushProfile(node_names.join(", "), e)
+            let node_names = e.node_context().map(str::to_string).unwrap_or_else(|| {
+                push_profile_datas
+                    .iter()
+                    .map(|d| d.deploy_data.node_name.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            });
+            RunDeployError::PushProfile(node_names, e)
         })?;
 
     let mut succeeded: Vec<(&deploy::DeployData, &deploy::DeployDefs)> = vec![];

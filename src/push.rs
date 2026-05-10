@@ -42,9 +42,33 @@ pub enum PushProfileError {
     Copy(std::io::Error),
     #[error("Nix copy command resulted in a bad exit code: {0:?}")]
     CopyExit(Option<i32>),
+    #[error("Failed to run Nix copy command to {target} for {profiles}: {source}")]
+    CopyGroup {
+        nodes: String,
+        target: String,
+        profiles: String,
+        source: std::io::Error,
+    },
+    #[error("Nix copy command to {target} for {profiles} resulted in a bad exit code: {code:?}")]
+    CopyGroupExit {
+        nodes: String,
+        target: String,
+        profiles: String,
+        code: Option<i32>,
+    },
 
     #[error("Failed to run Nix path-info command: {0}")]
     PathInfo(std::io::Error),
+}
+
+impl PushProfileError {
+    pub fn node_context(&self) -> Option<&str> {
+        match self {
+            PushProfileError::CopyGroup { nodes, .. }
+            | PushProfileError::CopyGroupExit { nodes, .. } => Some(nodes.as_str()),
+            _ => None,
+        }
+    }
 }
 
 pub struct PushProfileData<'a> {
@@ -568,6 +592,19 @@ fn make_copy_command(key: &CopyGroupKey, paths: &[&str]) -> Command {
     copy_command
 }
 
+fn copy_group_nodes(datas: &[PushProfileData<'_>], group: &CopyGroup) -> String {
+    let mut nodes = Vec::new();
+
+    for &index in &group.indexes {
+        let node_name = datas[index].deploy_data.node_name;
+        if !nodes.contains(&node_name) {
+            nodes.push(node_name);
+        }
+    }
+
+    nodes.join(", ")
+}
+
 pub async fn push_profiles(datas: &[PushProfileData<'_>]) -> Result<(), PushProfileError> {
     let mut copy_groups: Vec<CopyGroup> = Vec::new();
 
@@ -607,6 +644,8 @@ pub async fn push_profiles(datas: &[PushProfileData<'_>]) -> Result<(), PushProf
             })
             .collect::<Vec<_>>()
             .join(", ");
+        let nodes_str = copy_group_nodes(datas, &group);
+        let target = format!("ssh://{}@{}", group.key.ssh_user, group.key.hostname);
         info!(
             "Copying {} {} to node `{}`: {}",
             group.indexes.len(),
@@ -635,11 +674,23 @@ pub async fn push_profiles(datas: &[PushProfileData<'_>]) -> Result<(), PushProf
         let copy_exit_status = make_copy_command(&group.key, &paths)
             .status()
             .await
-            .map_err(PushProfileError::Copy)?;
+            .map_err(|source| PushProfileError::CopyGroup {
+                nodes: nodes_str.clone(),
+                target: target.clone(),
+                profiles: profiles_str.clone(),
+                source,
+            })?;
 
         match copy_exit_status.code() {
             Some(0) => (),
-            a => return Err(PushProfileError::CopyExit(a)),
+            code => {
+                return Err(PushProfileError::CopyGroupExit {
+                    nodes: nodes_str,
+                    target,
+                    profiles: profiles_str,
+                    code,
+                })
+            }
         };
     }
 
