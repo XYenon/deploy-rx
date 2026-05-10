@@ -655,12 +655,31 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
+    #[cfg(unix)]
+    use std::path::Path;
+    #[cfg(unix)]
+    use tokio::sync::Mutex;
+
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
+    #[cfg(unix)]
+    static ENV_LOCK: Mutex<()> = Mutex::const_new(());
+
     fn get_args(cmd: &Command) -> Vec<String> {
         let std_cmd = cmd.as_std();
         std::iter::once(std_cmd.get_program())
             .chain(std_cmd.get_args())
             .map(|s| s.to_string_lossy().into_owned())
             .collect()
+    }
+
+    #[cfg(unix)]
+    fn write_executable(path: &Path, contents: &str) {
+        std::fs::write(path, contents).unwrap();
+        let mut permissions = std::fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(path, permissions).unwrap();
     }
 
     #[test]
@@ -792,6 +811,79 @@ mod tests {
                 "bar"
             ]
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_run_build_command_uses_nom_when_available() {
+        let _lock = ENV_LOCK.lock().await;
+        let original_path = std::env::var_os("PATH");
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let nix_args = dir.path().join("nix.args");
+        let nom_args = dir.path().join("nom.args");
+
+        write_executable(
+            &bin.join("nix"),
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\nprintf '{{\"action\":\"msg\"}}\\n' >&2\nexit 0\n",
+                nix_args.display()
+            ),
+        );
+        write_executable(
+            &bin.join("nom"),
+            &format!(
+                "#!/bin/sh\nif [ \"$1\" = --version ]; then exit 0; fi\nprintf '%s\\n' \"$@\" > {}\n/bin/cat >/dev/null\nexit 0\n",
+                nom_args.display()
+            ),
+        );
+
+        std::env::set_var("PATH", &bin);
+        let mut command = Command::new("nix");
+        command.arg("build");
+        let result = run_build_command(command, true).await;
+        match original_path {
+            Some(path) => std::env::set_var("PATH", path),
+            None => std::env::remove_var("PATH"),
+        }
+
+        result.unwrap();
+        assert!(std::fs::read_to_string(nix_args)
+            .unwrap()
+            .contains("--log-format\ninternal-json\n--verbose"));
+        assert_eq!(std::fs::read_to_string(nom_args).unwrap(), "--json\n");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_run_build_command_falls_back_without_nom() {
+        let _lock = ENV_LOCK.lock().await;
+        let original_path = std::env::var_os("PATH");
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let nix_args = dir.path().join("nix.args");
+
+        write_executable(
+            &bin.join("nix"),
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\nexit 0\n",
+                nix_args.display()
+            ),
+        );
+
+        std::env::set_var("PATH", &bin);
+        let mut command = Command::new("nix");
+        command.arg("build");
+        let result = run_build_command(command, true).await;
+        match original_path {
+            Some(path) => std::env::set_var("PATH", path),
+            None => std::env::remove_var("PATH"),
+        }
+
+        result.unwrap();
+        assert_eq!(std::fs::read_to_string(nix_args).unwrap(), "build\n");
     }
 
     #[test]
