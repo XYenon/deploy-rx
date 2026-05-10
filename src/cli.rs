@@ -779,23 +779,32 @@ async fn run_deploy(
         None
     };
 
-    for (deploy_flake, deploy_data, deploy_defs) in &parts {
-        let data = deploy::push::PushProfileData {
-            supports_flakes,
-            check_sigs,
-            repo: deploy_flake.repo,
-            deploy_data,
-            deploy_defs,
-            keep_result,
-            result_path,
-            extra_build_args,
-            build_tree,
-        };
-        let node_name: String = deploy_data.node_name.to_string();
-        deploy::push::push_profile(data)
-            .await
-            .map_err(|e| RunDeployError::PushProfile(node_name, e))?;
-    }
+    let push_profile_datas: Vec<_> = parts
+        .iter()
+        .map(
+            |(deploy_flake, deploy_data, deploy_defs)| deploy::push::PushProfileData {
+                supports_flakes,
+                check_sigs,
+                repo: deploy_flake.repo,
+                deploy_data,
+                deploy_defs,
+                keep_result,
+                result_path,
+                extra_build_args,
+                build_tree,
+            },
+        )
+        .collect();
+
+    deploy::push::push_profiles(&push_profile_datas)
+        .await
+        .map_err(|e| {
+            let node_names: Vec<_> = push_profile_datas
+                .iter()
+                .map(|d| d.deploy_data.node_name.to_string())
+                .collect();
+            RunDeployError::PushProfile(node_names.join(", "), e)
+        })?;
 
     let mut succeeded: Vec<(&deploy::DeployData, &deploy::DeployDefs)> = vec![];
 

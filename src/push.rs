@@ -510,51 +510,129 @@ pub async fn build_profile(data: PushProfileData<'_>) -> Result<(), PushProfileE
     build_profiles(&[data]).await
 }
 
-pub async fn push_profile(data: PushProfileData<'_>) -> Result<(), PushProfileError> {
-    let ssh_opts_str = data
-        .deploy_data
-        .merged_settings
-        .ssh_opts
-        // This should provide some extra safety, but it also breaks for some reason, oh well
-        // .iter()
-        // .map(|x| format!("'{}'", x))
-        // .collect::<Vec<String>>()
-        .join(" ");
+#[derive(Debug, PartialEq, Eq)]
+struct CopyGroupKey {
+    hostname: String,
+    ssh_user: String,
+    ssh_opts: String,
+    fast_connection: Option<bool>,
+    check_sigs: bool,
+}
 
-    // remote building guarantees that the resulting derivation is stored on the target system
-    // no need to copy after building
-    if !data
-        .deploy_data
-        .merged_settings
-        .remote_build
-        .unwrap_or(false)
-    {
+struct CopyGroup {
+    key: CopyGroupKey,
+    indexes: Vec<usize>,
+}
+
+fn copy_group_key(data: &PushProfileData<'_>) -> CopyGroupKey {
+    let hostname = match data.deploy_data.cmd_overrides.hostname {
+        Some(ref x) => x,
+        None => &data.deploy_data.node.node_settings.hostname,
+    };
+
+    CopyGroupKey {
+        hostname: hostname.clone(),
+        ssh_user: data.deploy_defs.ssh_user.clone(),
+        ssh_opts: data
+            .deploy_data
+            .merged_settings
+            .ssh_opts
+            // This should provide some extra safety, but it also breaks for some reason, oh well
+            // .iter()
+            // .map(|x| format!("'{}'", x))
+            // .collect::<Vec<String>>()
+            .join(" "),
+        fast_connection: data.deploy_data.merged_settings.fast_connection,
+        check_sigs: data.check_sigs,
+    }
+}
+
+fn make_copy_command(key: &CopyGroupKey, paths: &[&str]) -> Command {
+    let mut copy_command = Command::new("nix");
+    copy_command.arg("copy");
+
+    if key.fast_connection != Some(true) {
+        copy_command.arg("--substitute-on-destination");
+    }
+
+    if !key.check_sigs {
+        copy_command.arg("--no-check-sigs");
+    }
+
+    copy_command
+        .arg("--to")
+        .arg(format!("ssh://{}@{}", key.ssh_user, key.hostname))
+        .args(paths)
+        .env("NIX_SSHOPTS", &key.ssh_opts);
+
+    copy_command
+}
+
+pub async fn push_profiles(datas: &[PushProfileData<'_>]) -> Result<(), PushProfileError> {
+    let mut copy_groups: Vec<CopyGroup> = Vec::new();
+
+    for (index, data) in datas.iter().enumerate() {
+        // Remote building guarantees that the resulting derivation is stored on the target system,
+        // so there is no need to copy after building.
+        if data
+            .deploy_data
+            .merged_settings
+            .remote_build
+            .unwrap_or(false)
+        {
+            continue;
+        }
+
+        let key = copy_group_key(data);
+        if let Some(group) = copy_groups.iter_mut().find(|group| group.key == key) {
+            group.indexes.push(index);
+        } else {
+            copy_groups.push(CopyGroup {
+                key,
+                indexes: vec![index],
+            });
+        }
+    }
+
+    for group in copy_groups {
+        let profiles_str = group
+            .indexes
+            .iter()
+            .map(|&index| {
+                let data = &datas[index];
+                format!(
+                    "`{}.{}`",
+                    data.deploy_data.node_name, data.deploy_data.profile_name
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
         info!(
-            "Copying profile `{}` to node `{}`",
-            data.deploy_data.profile_name, data.deploy_data.node_name
+            "Copying {} {} to node `{}`: {}",
+            group.indexes.len(),
+            if group.indexes.len() > 1 {
+                "profiles"
+            } else {
+                "profile"
+            },
+            group.key.hostname,
+            profiles_str
         );
 
-        let mut copy_command = Command::new("nix");
-        copy_command.arg("copy");
+        let paths: Vec<&str> = group
+            .indexes
+            .iter()
+            .map(|&index| {
+                datas[index]
+                    .deploy_data
+                    .profile
+                    .profile_settings
+                    .path
+                    .as_str()
+            })
+            .collect();
 
-        if data.deploy_data.merged_settings.fast_connection != Some(true) {
-            copy_command.arg("--substitute-on-destination");
-        }
-
-        if !data.check_sigs {
-            copy_command.arg("--no-check-sigs");
-        }
-
-        let hostname = match data.deploy_data.cmd_overrides.hostname {
-            Some(ref x) => x,
-            None => &data.deploy_data.node.node_settings.hostname,
-        };
-
-        let copy_exit_status = copy_command
-            .arg("--to")
-            .arg(format!("ssh://{}@{}", data.deploy_defs.ssh_user, hostname))
-            .arg(&data.deploy_data.profile.profile_settings.path)
-            .env("NIX_SSHOPTS", ssh_opts_str)
+        let copy_exit_status = make_copy_command(&group.key, &paths)
             .status()
             .await
             .map_err(PushProfileError::Copy)?;
@@ -566,6 +644,10 @@ pub async fn push_profile(data: PushProfileData<'_>) -> Result<(), PushProfileEr
     }
 
     Ok(())
+}
+
+pub async fn push_profile(data: PushProfileData<'_>) -> Result<(), PushProfileError> {
+    push_profiles(&[data]).await
 }
 
 #[cfg(test)]
@@ -708,6 +790,63 @@ mod tests {
                 "--option",
                 "foo",
                 "bar"
+            ]
+        );
+    }
+
+    #[test]
+    fn test_make_copy_command_multiple_paths() {
+        let key = CopyGroupKey {
+            hostname: "example.com".to_string(),
+            ssh_user: "deploy".to_string(),
+            ssh_opts: "-p 2222".to_string(),
+            fast_connection: Some(false),
+            check_sigs: false,
+        };
+        let cmd = make_copy_command(&key, &["/nix/store/abc-profile", "/nix/store/def-profile"]);
+
+        assert_eq!(
+            get_args(&cmd),
+            vec![
+                "nix",
+                "copy",
+                "--substitute-on-destination",
+                "--no-check-sigs",
+                "--to",
+                "ssh://deploy@example.com",
+                "/nix/store/abc-profile",
+                "/nix/store/def-profile",
+            ]
+        );
+
+        let nix_sshopts = cmd
+            .as_std()
+            .get_envs()
+            .find(|(key, _)| *key == "NIX_SSHOPTS")
+            .and_then(|(_, value)| value)
+            .map(|value| value.to_string_lossy().into_owned());
+        assert_eq!(nix_sshopts, Some("-p 2222".to_string()));
+    }
+
+    #[test]
+    fn test_make_copy_command_fast_connection_and_check_sigs() {
+        let key = CopyGroupKey {
+            hostname: "example.com".to_string(),
+            ssh_user: "deploy".to_string(),
+            ssh_opts: String::new(),
+            fast_connection: Some(true),
+            check_sigs: true,
+        };
+        let cmd = make_copy_command(&key, &["/nix/store/abc-profile"]);
+
+        assert_eq!(
+            get_args(&cmd),
+            vec![
+                "nix",
+                "copy",
+                "--to",
+                "ssh://deploy@example.com",
+                "/nix/store/abc-profile",
             ]
         );
     }
