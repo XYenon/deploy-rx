@@ -37,7 +37,7 @@ First-class support for deploying [system-manager](https://github.com/numtide/sy
 
 - **Build-tree Visualization**: Streams the build process visually using `nix-output-monitor` (`nom`). Enabled by default (bypass with `--no-build-tree`).
 - **Diff & Change Review**: Integrated, super-fast diffing (`dix`) of derivation changes before activation or switch. Enabled by default (bypass with `--no-review-changes`).
-- **Batched Nix Evaluation & Builds**: Intelligently groups multiple deployment targets from the same flake into a single `nix eval` and a single `nix build` invocation, reducing Nix overhead and improving deployment speed.
+- **Batched Nix Evaluation, Builds & Pushes**: Intelligently groups multiple deployment targets from the same flake into a single `nix eval`, batches local builds into one `nix build`, and batches compatible pushes to the same target into one `nix copy`, reducing Nix and SSH overhead for multi-profile deployments.
 
 ### Sudo Configuration
 
