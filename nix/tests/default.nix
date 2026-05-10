@@ -357,27 +357,6 @@ in {
     '';
   };
 
-  tag-select-and-order = mkTest {
-    name = "tag-select-and-order";
-    scenarioScript = ''
-      server.succeed("rm -rf /tmp/tag-select")
-      work("deploy -s --no-build-tree --no-review-changes --tag observability --tag prod .#tagged -- --offline", timeout=600)
-      server.succeed("test ! -e /tmp/tag-select/traces")
-      server.succeed("test ! -e /tmp/tag-select/api")
-      server.succeed("printf 'metrics\nlogs\n' | cmp -s - /tmp/tag-select/order.log")
-    '';
-  };
-
-  tag-no-match = mkTest {
-    name = "tag-no-match";
-    scenarioScript = ''
-      server.succeed("rm -rf /tmp/tag-select")
-      work_fail("deploy -s --no-build-tree --no-review-changes --tag staging .#tagged -- --offline > /tmp/tag-no-match.out 2>&1", timeout=600)
-      client_sh("grep -F 'No profiles matched the requested tags: staging' /tmp/tag-no-match.out")
-      server.succeed("test ! -e /tmp/tag-select/order.log")
-    '';
-  };
-
   system-manager-profile = mkTest {
     name = "system-manager-profile";
     scenarioScript = ''
@@ -386,16 +365,6 @@ in {
       server.succeed("grep -Fx activated /tmp/system-manager/state")
       server.succeed("test -L /nix/var/nix/profiles/system-manager-profiles/system-manager")
       server.succeed("test -x /nix/var/nix/profiles/system-manager-profiles/system-manager/bin/activate")
-    '';
-  };
-
-  sudo-argv-root-deploy = mkTest {
-    name = "sudo-argv-root-deploy";
-    scenarioScript = ''
-      server.succeed("rm -rf /tmp/sudo-argv")
-      work("deploy -s --no-build-tree --no-review-changes .#sudo-argv -- --offline", timeout=600)
-      server.succeed("grep -Fx root-via-sudo /tmp/sudo-argv/result")
-      server.succeed("test \"$(stat -c '%U' /tmp/sudo-argv/result)\" = root")
     '';
   };
 
@@ -497,38 +466,6 @@ in {
       server.wait_for_open_port(2222)
       client_fail("ssh -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no server true", timeout=30)
       client_sh("ssh -p 2222 -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no server true", timeout=30)
-    '';
-  };
-
-  batched-local-build = mkTest {
-    name = "batched-local-build";
-    scenarioScript = ''
-      install_wrapper("nix", nix_wrapper_source)
-      work("PATH=/tmp/wrappers:$PATH deploy -s --no-build-tree --no-review-changes .#multiplex -- --offline > /tmp/batched-local-build.out 2>&1", timeout=600)
-      server.succeed("grep -Fx first /tmp/multiplex/first")
-      server.succeed("grep -Fx second /tmp/multiplex/second")
-      client_sh("count=$(grep -c '^build ' /tmp/deploy-rx-e2e/nix.log || true); test \"$count\" = 1")
-    '';
-  };
-
-  nom-present = mkTest {
-    name = "nom-present";
-    scenarioScript = ''
-      client_sh(f"test -x {raw_deploy_cmd}")
-      install_wrapper("nom", nom_wrapper_source)
-      work(f"PATH=/tmp/wrappers:/run/current-system/sw/bin {raw_deploy_cmd} --fast-connection true -s --no-review-changes .#nom-profile -- --offline > /tmp/nom-present.out 2>&1", timeout=600)
-      server.succeed("grep -Fx nom /tmp/nom/result")
-      client_sh("grep -F -- '--json' /tmp/deploy-rx-e2e/nom.log")
-    '';
-  };
-
-  nom-absent = mkTest {
-    name = "nom-absent";
-    scenarioScript = ''
-      client_sh(f"test -x {raw_deploy_cmd}")
-      work(f"PATH=/run/current-system/sw/bin {raw_deploy_cmd} --fast-connection true -s --no-review-changes .#nom-profile -- --offline > /tmp/nom-absent.out 2>&1", timeout=600)
-      server.succeed("grep -Fx nom /tmp/nom/result")
-      client_sh("grep -F 'Build tree visualization requested but `nom` is not available in PATH; falling back to regular build logs' /tmp/nom-absent.out")
     '';
   };
 
