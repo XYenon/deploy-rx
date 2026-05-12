@@ -35,7 +35,7 @@ First-class support for deploying [system-manager](https://github.com/numtide/sy
 
 ### Modern Deployment UX
 
-- **Build-tree Visualization**: Streams the build process visually using `nix-output-monitor` (`nom`). Enabled by default (bypass with `--no-build-tree`).
+- **Build-tree Visualization**: Streams Nix checks and builds visually using `nix-output-monitor` (`nom`). Enabled by default (bypass with `--no-build-tree`).
 - **Diff & Change Review**: Integrated, super-fast diffing (`dix`) of derivation changes before activation or switch. Enabled by default (bypass with `--no-review-changes`).
 - **Batched Nix Evaluation, Builds & Pushes**: Intelligently groups multiple deployment targets from the same flake into a single `nix eval`, batches local builds into one `nix build`, and batches compatible pushes to the same target into one `nix copy`, reducing Nix and SSH overhead for multi-profile deployments.
 

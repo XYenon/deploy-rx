@@ -15,7 +15,7 @@ use futures_util::future::try_join_all;
 use log::{debug, error, info, warn};
 use serde::Serialize;
 use std::path::PathBuf;
-use std::process::Stdio;
+use std::process::{Command as StdCommand, Stdio};
 use thiserror::Error;
 use tokio::process::Command;
 
@@ -170,10 +170,96 @@ pub enum CheckDeploymentError {
     NixCheckExit(Option<i32>),
 }
 
+async fn command_exists(command: &str) -> bool {
+    Command::new(command)
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await
+        .is_ok()
+}
+
+async fn run_check_command(
+    mut check_command: Command,
+    build_tree: bool,
+) -> Result<(), CheckDeploymentError> {
+    debug!("check command: {:?}", check_command);
+
+    if build_tree {
+        if !command_exists("nom").await {
+            warn!(
+                "Build tree visualization requested for checks but `nom` is not available in PATH; falling back to regular check logs"
+            );
+        } else {
+            check_command
+                .arg("--log-format")
+                .arg("internal-json")
+                .arg("--verbose")
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped());
+
+            let (nix_status, nom_status) =
+                tokio::task::spawn_blocking(move || -> Result<_, CheckDeploymentError> {
+                    let mut nix_child = check_command
+                        .into_std()
+                        .spawn()
+                        .map_err(CheckDeploymentError::NixCheck)?;
+
+                    let nix_stderr = nix_child.stderr.take().ok_or_else(|| {
+                        CheckDeploymentError::NixCheck(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            "failed to capture nix check stderr for nom",
+                        ))
+                    })?;
+
+                    let nom_status = StdCommand::new("nom")
+                        .arg("--json")
+                        .stdin(Stdio::from(nix_stderr))
+                        .stdout(Stdio::inherit())
+                        .stderr(Stdio::inherit())
+                        .status()
+                        .map_err(CheckDeploymentError::NixCheck)?;
+
+                    let nix_status = nix_child.wait().map_err(CheckDeploymentError::NixCheck)?;
+
+                    Ok((nix_status, nom_status))
+                })
+                .await
+                .map_err(|err| {
+                    CheckDeploymentError::NixCheck(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("failed waiting for check build tree process: {}", err),
+                    ))
+                })??;
+
+            if nom_status.code() != Some(0) {
+                warn!(
+                    "`nom` exited with status {:?}; continuing based on Nix check result",
+                    nom_status.code()
+                );
+            }
+
+            return match nix_status.code() {
+                Some(0) => Ok(()),
+                a => Err(CheckDeploymentError::NixCheckExit(a)),
+            };
+        }
+    }
+
+    let check_status = check_command.status().await?;
+
+    match check_status.code() {
+        Some(0) => Ok(()),
+        a => Err(CheckDeploymentError::NixCheckExit(a)),
+    }
+}
+
 async fn check_deployment(
     supports_flakes: bool,
     repo: &str,
     extra_build_args: &[String],
+    build_tree: bool,
 ) -> Result<(), CheckDeploymentError> {
     info!("Running checks for flake in {}", repo);
 
@@ -193,14 +279,13 @@ async fn check_deployment(
 
     check_command.args(extra_build_args);
 
-    let check_status = check_command.status().await?;
+    if build_tree && !supports_flakes {
+        warn!(
+            "Build tree visualization currently requires flake-capable nix checks; continuing without tree output"
+        );
+    }
 
-    match check_status.code() {
-        Some(0) => (),
-        a => return Err(CheckDeploymentError::NixCheckExit(a)),
-    };
-
-    Ok(())
+    run_check_command(check_command, build_tree && supports_flakes).await
 }
 
 #[derive(Error, Debug)]
@@ -1510,16 +1595,22 @@ pub async fn run(args: Option<&ArgMatches>) -> Result<(), RunError> {
     }
 
     let using_flakes = supports_flakes && !do_not_want_flakes;
+    let build_tree = opts.build_tree && !opts.no_build_tree;
+    let review_changes = opts.review_changes && !opts.no_review_changes;
 
     if !opts.skip_checks {
         for deploy_flake in &deploy_flakes {
-            check_deployment(using_flakes, deploy_flake.repo, &opts.extra_build_args).await?;
+            check_deployment(
+                using_flakes,
+                deploy_flake.repo,
+                &opts.extra_build_args,
+                build_tree,
+            )
+            .await?;
         }
     }
     let result_path = opts.result_path.as_deref();
     let data = get_deployment_data(using_flakes, &deploy_flakes, &opts.extra_build_args).await?;
-    let build_tree = opts.build_tree && !opts.no_build_tree;
-    let review_changes = opts.review_changes && !opts.no_review_changes;
 
     run_deploy(
         deploy_flakes,
