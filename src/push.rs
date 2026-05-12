@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
 use log::{debug, info, warn};
+use std::ffi::OsStr;
 use std::path::Path;
 use std::process::{Command as StdCommand, Stdio};
 use thiserror::Error;
@@ -83,8 +84,13 @@ pub struct PushProfileData<'a> {
     pub build_tree: bool,
 }
 
-async fn command_exists(command: &str) -> bool {
-    Command::new(command)
+async fn command_exists(command: &str, path: Option<&OsStr>) -> bool {
+    let mut command = Command::new(command);
+    if let Some(path) = path {
+        command.env("PATH", path);
+    }
+
+    command
         .arg("--version")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -99,8 +105,14 @@ async fn run_build_command(
 ) -> Result<(), PushProfileError> {
     debug!("build command: {:?}", build_command);
 
+    let path = build_command
+        .as_std()
+        .get_envs()
+        .find(|(key, _)| *key == "PATH")
+        .and_then(|(_, value)| value.map(|value| value.to_os_string()));
+
     if build_tree {
-        if !command_exists("nom").await {
+        if !command_exists("nom", path.as_deref()).await {
             warn!(
                 "Build tree visualization requested but `nom` is not available in PATH; falling back to regular build logs"
             );
@@ -126,7 +138,12 @@ async fn run_build_command(
                         ))
                     })?;
 
-                    let nom_status = StdCommand::new("nom")
+                    let mut nom_command = StdCommand::new("nom");
+                    if let Some(path) = path {
+                        nom_command.env("PATH", path);
+                    }
+
+                    let nom_status = nom_command
                         .arg("--json")
                         .stdin(Stdio::from(nix_stderr))
                         .stdout(Stdio::inherit())
@@ -708,14 +725,9 @@ mod tests {
 
     #[cfg(unix)]
     use std::path::Path;
-    #[cfg(unix)]
-    use tokio::sync::Mutex;
 
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
-
-    #[cfg(unix)]
-    static ENV_LOCK: Mutex<()> = Mutex::const_new(());
 
     fn get_args(cmd: &Command) -> Vec<String> {
         let std_cmd = cmd.as_std();
@@ -867,8 +879,6 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn test_run_build_command_uses_nom_when_available() {
-        let _lock = ENV_LOCK.lock().await;
-        let original_path = std::env::var_os("PATH");
         let dir = tempfile::tempdir().unwrap();
         let bin = dir.path().join("bin");
         std::fs::create_dir(&bin).unwrap();
@@ -890,14 +900,9 @@ mod tests {
             ),
         );
 
-        std::env::set_var("PATH", &bin);
-        let mut command = Command::new("nix");
-        command.arg("build");
+        let mut command = Command::new(bin.join("nix"));
+        command.arg("build").env("PATH", &bin);
         let result = run_build_command(command, true).await;
-        match original_path {
-            Some(path) => std::env::set_var("PATH", path),
-            None => std::env::remove_var("PATH"),
-        }
 
         result.unwrap();
         assert!(std::fs::read_to_string(nix_args)
@@ -909,8 +914,6 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn test_run_build_command_falls_back_without_nom() {
-        let _lock = ENV_LOCK.lock().await;
-        let original_path = std::env::var_os("PATH");
         let dir = tempfile::tempdir().unwrap();
         let bin = dir.path().join("bin");
         std::fs::create_dir(&bin).unwrap();
@@ -924,14 +927,9 @@ mod tests {
             ),
         );
 
-        std::env::set_var("PATH", &bin);
-        let mut command = Command::new("nix");
-        command.arg("build");
+        let mut command = Command::new(bin.join("nix"));
+        command.arg("build").env("PATH", &bin);
         let result = run_build_command(command, true).await;
-        match original_path {
-            Some(path) => std::env::set_var("PATH", path),
-            None => std::env::remove_var("PATH"),
-        }
 
         result.unwrap();
         assert_eq!(std::fs::read_to_string(nix_args).unwrap(), "build\n");
