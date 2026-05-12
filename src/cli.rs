@@ -14,6 +14,7 @@ use self::deploy::{DeployFlake, ParseFlakeError};
 use futures_util::future::try_join_all;
 use log::{debug, error, info, warn};
 use serde::Serialize;
+use std::ffi::OsStr;
 use std::path::PathBuf;
 use std::process::{Command as StdCommand, Stdio};
 use thiserror::Error;
@@ -170,8 +171,13 @@ pub enum CheckDeploymentError {
     NixCheckExit(Option<i32>),
 }
 
-async fn command_exists(command: &str) -> bool {
-    Command::new(command)
+async fn command_exists(command: &str, path: Option<&OsStr>) -> bool {
+    let mut command = Command::new(command);
+    if let Some(path) = path {
+        command.env("PATH", path);
+    }
+
+    command
         .arg("--version")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -186,8 +192,14 @@ async fn run_check_command(
 ) -> Result<(), CheckDeploymentError> {
     debug!("check command: {:?}", check_command);
 
+    let path = check_command
+        .as_std()
+        .get_envs()
+        .find(|(key, _)| *key == "PATH")
+        .and_then(|(_, value)| value.map(|value| value.to_os_string()));
+
     if build_tree {
-        if !command_exists("nom").await {
+        if !command_exists("nom", path.as_deref()).await {
             warn!(
                 "Build tree visualization requested for checks but `nom` is not available in PATH; falling back to regular check logs"
             );
@@ -213,7 +225,12 @@ async fn run_check_command(
                         ))
                     })?;
 
-                    let nom_status = StdCommand::new("nom")
+                    let mut nom_command = StdCommand::new("nom");
+                    if let Some(path) = path {
+                        nom_command.env("PATH", path);
+                    }
+
+                    let nom_status = nom_command
                         .arg("--json")
                         .stdin(Stdio::from(nix_stderr))
                         .stdout(Stdio::inherit())
@@ -964,6 +981,19 @@ mod tests {
     use crate::DeployFlake;
     use std::collections::{HashMap, HashSet};
 
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    #[cfg(unix)]
+    use std::path::Path;
+
+    #[cfg(unix)]
+    fn write_executable(path: &Path, contents: &str) {
+        std::fs::write(path, contents).unwrap();
+        let mut permissions = std::fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(path, permissions).unwrap();
+    }
+
     fn empty_generic_settings() -> crate::data::GenericSettings {
         crate::data::GenericSettings {
             ssh_user: None,
@@ -1377,6 +1407,65 @@ mod tests {
             result,
             Err(RunDeployError::NoProfilesMatchedTags(requested)) if requested == "staging"
         ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_run_check_command_uses_nom_from_command_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let nix_args = dir.path().join("nix.args");
+        let nom_args = dir.path().join("nom.args");
+
+        write_executable(
+            &bin.join("nix"),
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\nprintf '{{\"action\":\"msg\"}}\\n' >&2\nexit 0\n",
+                nix_args.display()
+            ),
+        );
+        write_executable(
+            &bin.join("nom"),
+            &format!(
+                "#!/bin/sh\nif [ \"$1\" = --version ]; then exit 0; fi\nprintf '%s\\n' \"$@\" > {}\n/bin/cat >/dev/null\nexit 0\n",
+                nom_args.display()
+            ),
+        );
+
+        let mut command = Command::new(bin.join("nix"));
+        command.arg("flake").arg("check").env("PATH", &bin);
+
+        run_check_command(command, true).await.unwrap();
+
+        assert!(std::fs::read_to_string(nix_args)
+            .unwrap()
+            .contains("--log-format\ninternal-json\n--verbose"));
+        assert_eq!(std::fs::read_to_string(nom_args).unwrap(), "--json\n");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_run_check_command_falls_back_without_nom_in_command_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let nix_args = dir.path().join("nix.args");
+
+        write_executable(
+            &bin.join("nix"),
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\nexit 0\n",
+                nix_args.display()
+            ),
+        );
+
+        let mut command = Command::new(bin.join("nix"));
+        command.arg("flake").arg("check").env("PATH", &bin);
+
+        run_check_command(command, true).await.unwrap();
+
+        assert_eq!(std::fs::read_to_string(nix_args).unwrap(), "flake\ncheck\n");
     }
 
     #[tokio::test]
