@@ -415,12 +415,12 @@ fn make_build_command(
         }
     } else {
         let result_path = result_path.unwrap_or("./.deploy-gc");
-        for info in profiles {
-            build_command.arg("--out-link").arg(format!(
-                "{}/{}/{}",
-                result_path, info.node_name, info.profile_name
-            ));
-        }
+        let out_link = match profiles {
+            [info] => format!("{}/{}/{}", result_path, info.node_name, info.profile_name),
+            _ => format!("{}/profiles", result_path),
+        };
+
+        build_command.arg("--out-link").arg(out_link);
     }
 
     build_command.args(extra_build_args);
@@ -799,14 +799,40 @@ mod tests {
 
     #[test]
     fn test_make_build_command_keep_result() {
+        let profiles = vec![BuildCommandInfo {
+            node_name: "node1",
+            profile_name: "system",
+        }];
+        let cmd = make_build_command(
+            true,
+            true,
+            Some("./results"),
+            &[],
+            &["/nix/store/abc.drv^out"],
+            &profiles,
+        );
+        assert_eq!(
+            get_args(&cmd),
+            vec![
+                "nix",
+                "build",
+                "/nix/store/abc.drv^out",
+                "--out-link",
+                "./results/node1/system",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_make_build_command_keep_result_multiple_profiles_uses_shared_out_link() {
         let profiles = vec![
             BuildCommandInfo {
                 node_name: "node1",
-                profile_name: "system",
+                profile_name: "logs",
             },
             BuildCommandInfo {
-                node_name: "node2",
-                profile_name: "system",
+                node_name: "node1",
+                profile_name: "metrics",
             },
         ];
         let cmd = make_build_command(
@@ -825,9 +851,7 @@ mod tests {
                 "/nix/store/abc.drv^out",
                 "/nix/store/def.drv^out",
                 "--out-link",
-                "./results/node1/system",
-                "--out-link",
-                "./results/node2/system",
+                "./results/profiles",
             ]
         );
     }
