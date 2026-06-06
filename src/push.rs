@@ -416,8 +416,10 @@ fn make_build_command(
     } else {
         let result_path = result_path.unwrap_or("./.deploy-gc");
         let out_link = match profiles {
-            [info] => format!("{}/{}/{}", result_path, info.node_name, info.profile_name),
-            _ => format!("{}/profiles", result_path),
+            [info] => Path::new(result_path)
+                .join(info.node_name)
+                .join(info.profile_name),
+            _ => Path::new(result_path).join("profiles"),
         };
 
         build_command.arg("--out-link").arg(out_link);
