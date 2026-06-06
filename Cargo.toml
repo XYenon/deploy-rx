@@ -29,8 +29,7 @@ toml = "0.8"
 whoami = "1.6"
 yn = "0.1"
 rpassword = "7.5.0"
-dix = "1.4.2"
-anyhow = "1.0"
+dix = "2.0.0"
 
 [dev-dependencies]
 tempfile = "3"

@@ -712,10 +712,10 @@ pub enum DryDiffError {
     ProfilePath(#[from] GetProfilePathError),
     #[error("Failed to read current profile: {0}")]
     ReadProfile(std::io::Error),
-    #[error("Failed to compute closure size: {0}")]
-    SizeDiff(anyhow::Error),
-    #[error("Failed to write package diff: {0}")]
-    PackageDiff(anyhow::Error),
+    #[error("Failed to compute diff report: {0}")]
+    DiffReport(String),
+    #[error("Failed to write diff report: {0}")]
+    WriteDiff(std::fmt::Error),
 }
 
 fn render_dry_diff(profile_path: &str, new_closure: &str) -> Result<String, DryDiffError> {
@@ -737,24 +737,9 @@ fn render_dry_diff(profile_path: &str, new_closure: &str) -> Result<String, DryD
     writeln!(&mut output, "Derivation changes for {}:", profile_path).unwrap();
 
     // Use dix for the diff
-    let size_handle = dix::spawn_size_diff(old_generation.clone(), new_generation.clone(), true);
-
-    let wrote = dix::write_package_diff(&mut output, &old_generation, &new_generation, true)
-        .map_err(DryDiffError::PackageDiff)?;
-
-    if let Ok(Ok((size_old, size_new))) = size_handle.join() {
-        if size_old == size_new {
-            if wrote == 0 {
-                output.push_str("No version or size changes.\n");
-            }
-        } else {
-            if wrote > 0 {
-                output.push('\n');
-            }
-            dix::write_size_diff(&mut output, size_old, size_new)
-                .map_err(|e| DryDiffError::SizeDiff(e.into()))?;
-        }
-    }
+    let report = dix::query_diff_report(&old_generation, &new_generation, true)
+        .map_err(|e| DryDiffError::DiffReport(e.to_string()))?;
+    dix::write_diff_report(&mut output, &report).map_err(DryDiffError::WriteDiff)?;
 
     Ok(output)
 }
