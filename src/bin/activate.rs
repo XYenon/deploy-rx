@@ -31,6 +31,7 @@ use thiserror::Error;
 
 use log::{debug, error, info, warn};
 
+use deploy::command;
 use deploy::remote_protocol::{
     BootstrapRequest, ConfirmRequest, ProfileTarget, RemoteEvent, RemoteOperation,
     REMOTE_PROTOCOL_VERSION,
@@ -169,57 +170,75 @@ pub struct DryDiffOpts {
 }
 
 #[derive(Error, Debug)]
+pub enum RollbackError {}
+impl command::HasCommandError for RollbackError {
+    fn title() -> String {
+        "Nix rollback".to_string()
+    }
+}
+
+#[derive(Error, Debug)]
+pub enum ListGenerationsError {}
+impl command::HasCommandError for ListGenerationsError {
+    fn title() -> String {
+        "Nix list generations".to_string()
+    }
+}
+
+#[derive(Error, Debug)]
+pub enum DeleteGenerationsError {}
+impl command::HasCommandError for DeleteGenerationsError {
+    fn title() -> String {
+        "Nix delete generations".to_string()
+    }
+}
+
+#[derive(Error, Debug)]
+pub enum ReactivateError {}
+impl command::HasCommandError for ReactivateError {
+    fn title() -> String {
+        "Nix reactivate last generation".to_string()
+    }
+}
+
+#[derive(Error, Debug)]
 pub enum DeactivateError {
-    #[error("Failed to execute the rollback command: {0}")]
-    Rollback(std::io::Error),
-    #[error("The rollback resulted in a bad exit code: {0:?}")]
-    RollbackExit(Option<i32>),
-    #[error("Failed to run command for listing generations: {0}")]
-    ListGen(std::io::Error),
-    #[error("Command for listing generations resulted in a bad exit code: {0:?}")]
-    ListGenExit(Option<i32>),
+    #[error("{0}")]
+    Rollback(#[from] command::CommandError<RollbackError>),
+    #[error("{0}")]
+    ListGen(#[from] command::CommandError<ListGenerationsError>),
     #[error("Error converting generation list output to utf8: {0}")]
     DecodeListGenUtf8(std::string::FromUtf8Error),
-    #[error("Failed to run command for deleting generation: {0}")]
-    DeleteGen(std::io::Error),
-    #[error("Command for deleting generations resulted in a bad exit code: {0:?}")]
-    DeleteGenExit(Option<i32>),
-    #[error("Failed to run command for re-activating the last generation: {0}")]
-    Reactivate(std::io::Error),
-    #[error("Command for re-activating the last generation resulted in a bad exit code: {0:?}")]
-    ReactivateExit(Option<i32>),
+    #[error("{0}")]
+    DeleteGen(#[from] command::CommandError<DeleteGenerationsError>),
+    #[error("{0}")]
+    Reactivate(#[from] command::CommandError<ReactivateError>),
 }
 
 pub async fn deactivate(profile_path: &str) -> Result<(), DeactivateError> {
     warn!("De-activating due to error");
 
-    let nix_env_rollback_exit_status = Command::new("nix-env")
+    let mut nix_env_rollback = Command::new("nix-env");
+    nix_env_rollback
         .arg("-p")
         .arg(&profile_path)
-        .arg("--rollback")
-        .status()
+        .arg("--rollback");
+    command::Command::new(nix_env_rollback)
+        .run()
         .await
         .map_err(DeactivateError::Rollback)?;
 
-    match nix_env_rollback_exit_status.code() {
-        Some(0) => (),
-        a => return Err(DeactivateError::RollbackExit(a)),
-    };
-
     debug!("Listing generations");
 
-    let nix_env_list_generations_out = Command::new("nix-env")
+    let mut nix_env_list_generations = Command::new("nix-env");
+    nix_env_list_generations
         .arg("-p")
         .arg(&profile_path)
-        .arg("--list-generations")
-        .output()
+        .arg("--list-generations");
+    let nix_env_list_generations_out = command::Command::new(nix_env_list_generations)
+        .run()
         .await
         .map_err(DeactivateError::ListGen)?;
-
-    match nix_env_list_generations_out.status.code() {
-        Some(0) => (),
-        a => return Err(DeactivateError::ListGenExit(a)),
-    };
 
     let generations_list = String::from_utf8(nix_env_list_generations_out.stdout)
         .map_err(DeactivateError::DecodeListGenUtf8)?;
@@ -237,33 +256,27 @@ pub async fn deactivate(profile_path: &str) -> Result<(), DeactivateError> {
     debug!("Removing generation entry {}", last_generation_line);
     warn!("Removing generation by ID {}", last_generation_id);
 
-    let nix_env_delete_generation_exit_status = Command::new("nix-env")
+    let mut nix_env_delete_generation = Command::new("nix-env");
+    nix_env_delete_generation
         .arg("-p")
         .arg(&profile_path)
         .arg("--delete-generations")
-        .arg(last_generation_id)
-        .status()
+        .arg(last_generation_id);
+    command::Command::new(nix_env_delete_generation)
+        .run()
         .await
         .map_err(DeactivateError::DeleteGen)?;
 
-    match nix_env_delete_generation_exit_status.code() {
-        Some(0) => (),
-        a => return Err(DeactivateError::DeleteGenExit(a)),
-    };
-
     info!("Attempting to re-activate the last generation");
 
-    let re_activate_exit_status = Command::new(format!("{}/deploy-rx-activate", profile_path))
+    let mut re_activate = Command::new(format!("{}/deploy-rx-activate", profile_path));
+    re_activate
         .env("PROFILE", &profile_path)
-        .current_dir(&profile_path)
-        .status()
+        .current_dir(&profile_path);
+    command::Command::new(re_activate)
+        .run()
         .await
         .map_err(DeactivateError::Reactivate)?;
-
-    match re_activate_exit_status.code() {
-        Some(0) => (),
-        a => return Err(DeactivateError::ReactivateExit(a)),
-    };
 
     Ok(())
 }
@@ -414,16 +427,28 @@ pub async fn wait(
 }
 
 #[derive(Error, Debug)]
-pub enum ActivateError {
-    #[error("Failed to execute the command for setting profile: {0}")]
-    SetProfile(std::io::Error),
-    #[error("The command for setting profile resulted in a bad exit code: {0:?}")]
-    SetProfileExit(Option<i32>),
+pub enum SetProfileError {}
+impl command::HasCommandError for SetProfileError {
+    fn title() -> String {
+        "Nix profile set".to_string()
+    }
+}
 
-    #[error("Failed to execute the activation script: {0}")]
-    RunActivate(std::io::Error),
-    #[error("The activation script resulted in a bad exit code: {0:?}")]
-    RunActivateExit(Option<i32>),
+#[derive(Error, Debug)]
+pub enum RunActivateError {}
+impl command::HasCommandError for RunActivateError {
+    fn title() -> String {
+        "Nix activation script".to_string()
+    }
+}
+
+#[derive(Error, Debug)]
+pub enum ActivateError {
+    #[error("{0}")]
+    SetProfile(command::CommandError<SetProfileError>),
+
+    #[error("{0}")]
+    RunActivate(command::CommandError<RunActivateError>),
 
     #[error("There was an error de-activating after an error was encountered: {0}")]
     Deactivate(#[from] DeactivateError),
@@ -448,28 +473,23 @@ pub async fn activate(
         // new generation. If `--set` fails without creating a new generation, rolling back here
         // would revert a previously-good deployment.
         let profile_link_before_set = std::fs::read_link(&profile_path).ok();
-        let nix_env_set_exit_status = Command::new("nix-env")
+        let mut nix_env_set = Command::new("nix-env");
+        nix_env_set
             .arg("-p")
             .arg(&profile_path)
             .arg("--set")
-            .arg(&closure)
-            .status()
-            .await
-            .map_err(ActivateError::SetProfile)?;
-        match nix_env_set_exit_status.code() {
-            Some(0) => (),
-            a => {
-                let profile_link_after_set = std::fs::read_link(&profile_path).ok();
-                let should_rollback = auto_rollback
-                    && profile_link_before_set.is_some()
-                    && profile_link_after_set.is_some()
-                    && profile_link_before_set != profile_link_after_set;
-                if should_rollback {
-                    deactivate(&profile_path).await?;
-                }
-                return Err(ActivateError::SetProfileExit(a));
+            .arg(&closure);
+        if let Err(err) = command::Command::new(nix_env_set).run().await {
+            let profile_link_after_set = std::fs::read_link(&profile_path).ok();
+            let should_rollback = auto_rollback
+                && profile_link_before_set.is_some()
+                && profile_link_after_set.is_some()
+                && profile_link_before_set != profile_link_after_set;
+            if should_rollback {
+                deactivate(&profile_path).await?;
             }
-        };
+            return Err(ActivateError::SetProfile(err));
+        }
     }
 
     debug!("Running activation script");
@@ -480,35 +500,21 @@ pub async fn activate(
         &profile_path
     };
 
-    let activate_status = match Command::new(format!("{}/deploy-rx-activate", activation_location))
+    let mut activate_command = Command::new(format!("{}/deploy-rx-activate", activation_location));
+    activate_command
         .env("PROFILE", activation_location)
         .env("DRY_ACTIVATE", if dry_activate { "1" } else { "0" })
         .env("BOOT", if boot { "1" } else { "0" })
-        .current_dir(activation_location)
-        .status()
-        .await
-        .map_err(ActivateError::RunActivate)
-    {
-        Ok(x) => x,
-        Err(e) => {
-            if auto_rollback && !dry_activate {
-                deactivate(&profile_path).await?;
-            }
-            return Err(e);
+        .current_dir(activation_location);
+
+    if let Err(err) = command::Command::new(activate_command).run().await {
+        if auto_rollback && !dry_activate {
+            deactivate(&profile_path).await?;
         }
-    };
+        return Err(ActivateError::RunActivate(err));
+    }
 
     if !dry_activate {
-        match activate_status.code() {
-            Some(0) => (),
-            a => {
-                if auto_rollback {
-                    deactivate(&profile_path).await?;
-                }
-                return Err(ActivateError::RunActivateExit(a));
-            }
-        };
-
         if !dry_activate {
             info!("Activation succeeded!");
         }
