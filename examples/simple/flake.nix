@@ -12,7 +12,7 @@
       hostname = "localhost";
       profiles.hello = {
         user = "balsoft";
-        path = deploy-rx.lib.x86_64-linux.setActivate nixpkgs.legacyPackages.x86_64-linux.hello "./bin/hello";
+        path = deploy-rx.lib.x86_64-linux.activate.custom nixpkgs.legacyPackages.x86_64-linux.hello "./bin/hello";
       };
     };
 

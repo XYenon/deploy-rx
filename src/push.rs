@@ -84,7 +84,7 @@ pub enum PushProfileError {
         nodes: String,
         target: String,
         profiles: String,
-        source: command::CommandError<CopyError>,
+        source: Box<command::CommandError<CopyError>>,
     },
 
     #[error("{0}")]
@@ -160,10 +160,7 @@ async fn run_build_command(
 
                     let nix_stderr = nix_child.stderr.take().ok_or_else(|| {
                         PushProfileError::Build(command::CommandError::RunError(
-                            std::io::Error::new(
-                                std::io::ErrorKind::Other,
-                                "failed to capture nix build stderr for nom",
-                            ),
+                            std::io::Error::other("failed to capture nix build stderr for nom"),
                         ))
                     })?;
 
@@ -190,8 +187,7 @@ async fn run_build_command(
                 })
                 .await
                 .map_err(|err| {
-                    PushProfileError::Build(command::CommandError::RunError(std::io::Error::new(
-                        std::io::ErrorKind::Other,
+                    PushProfileError::Build(command::CommandError::RunError(std::io::Error::other(
                         format!("failed waiting for build tree process: {}", err),
                     )))
                 })??;
@@ -206,10 +202,10 @@ async fn run_build_command(
             return match nix_status.code() {
                 Some(0) => Ok(()),
                 a => Err(PushProfileError::Build(command::CommandError::RunError(
-                    std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        format!("Nix build command resulted in a bad exit code: {:?}", a),
-                    ),
+                    std::io::Error::other(format!(
+                        "Nix build command resulted in a bad exit code: {:?}",
+                        a
+                    )),
                 ))),
             };
         }
@@ -736,7 +732,7 @@ pub async fn push_profiles(datas: &[PushProfileData<'_>]) -> Result<(), PushProf
                 nodes: nodes_str.clone(),
                 target: target.clone(),
                 profiles: profiles_str.clone(),
-                source,
+                source: Box::new(source),
             })?;
     }
 

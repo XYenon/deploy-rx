@@ -226,10 +226,7 @@ async fn run_check_command(
 
                     let nix_stderr = nix_child.stderr.take().ok_or_else(|| {
                         CheckDeploymentError::NixCheck(command::CommandError::RunError(
-                            std::io::Error::new(
-                                std::io::ErrorKind::Other,
-                                "failed to capture nix check stderr for nom",
-                            ),
+                            std::io::Error::other("failed to capture nix check stderr for nom"),
                         ))
                     })?;
 
@@ -257,10 +254,10 @@ async fn run_check_command(
                 .await
                 .map_err(|err| {
                     CheckDeploymentError::NixCheck(command::CommandError::RunError(
-                        std::io::Error::new(
-                            std::io::ErrorKind::Other,
-                            format!("failed waiting for check build tree process: {}", err),
-                        ),
+                        std::io::Error::other(format!(
+                            "failed waiting for check build tree process: {}",
+                            err
+                        )),
                     ))
                 })??;
 
@@ -274,13 +271,10 @@ async fn run_check_command(
             return match nix_status.code() {
                 Some(0) => Ok(()),
                 a => Err(CheckDeploymentError::NixCheck(
-                    command::CommandError::RunError(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        format!(
-                            "nix check piped to nom resulted in a bad exit code: {:?}",
-                            a
-                        ),
-                    )),
+                    command::CommandError::RunError(std::io::Error::other(format!(
+                        "nix check piped to nom resulted in a bad exit code: {:?}",
+                        a
+                    ))),
                 )),
             };
         }
