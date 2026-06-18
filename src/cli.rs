@@ -287,7 +287,7 @@ async fn run_check_command(
     }
 
     command::Command::new(check_command)
-        .run()
+        .status()
         .await
         .map_err(CheckDeploymentError::NixCheck)?;
 
@@ -481,10 +481,25 @@ in
             };
             c.args(extra_build_args);
 
-            let build_output = command::Command::new(c)
-                .run()
-                .await
-                .map_err(GetDeploymentDataError::NixEval)?;
+            c.stdout(Stdio::piped());
+            let c_debug = format!("{:?}", c);
+            let build_child = c.spawn().map_err(|err| {
+                GetDeploymentDataError::NixEval(command::CommandError::RunError(err))
+            })?;
+
+            let build_output = build_child.wait_with_output().await.map_err(|err| {
+                GetDeploymentDataError::NixEval(command::CommandError::RunError(err))
+            })?;
+
+            match build_output.status.code() {
+                Some(0) => (),
+                _exit_code => {
+                    return Err(GetDeploymentDataError::NixEval(command::CommandError::Exit(
+                        build_output,
+                        c_debug,
+                    )))
+                }
+            }
 
             let data_json = String::from_utf8(build_output.stdout)?;
             let parsed_data: deploy::data::Data = serde_json::from_str(&data_json)?;
