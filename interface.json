@@ -7,10 +7,10 @@
             "type": "object",
             "properties": {
                 "sshUser": {
-                    "type": "string"
+                    "type": ["string", "null"]
                 },
                 "user": {
-                    "type": "string"
+                    "type": ["string", "null"]
                 },
                 "sshOpts": {
                     "type": "array",
@@ -19,25 +19,25 @@
                     }
                 },
                 "fastConnection": {
-                    "type": "boolean"
+                    "type": ["boolean", "null"]
                 },
                 "autoRollback": {
-                    "type": "boolean"
+                    "type": ["boolean", "null"]
                 },
                 "magicRollback": {
-                    "type": "boolean"
+                    "type": ["boolean", "null"]
                 },
                 "confirmTimeout": {
-                    "type": "integer"
+                    "type": ["integer", "null"]
                 },
                 "activationTimeout": {
-                    "type": "integer"
+                    "type": ["integer", "null"]
                 },
                 "tempPath": {
-                    "type": "string"
+                    "type": ["string", "null"]
                 },
                 "interactiveSudo": {
-                    "type": "boolean"
+                    "type": ["boolean", "null"]
                 }
             }
         },
@@ -82,7 +82,7 @@
                     "type": "string"
                 },
                 "profilePath": {
-                    "type": "string"
+                    "type": ["string", "null"]
                 },
                 "tags": {
                     "type": "array",

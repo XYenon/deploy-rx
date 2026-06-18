@@ -198,6 +198,15 @@ This is the core of how `deploy-rs` was designed, any number of these can run on
 }
 ```
 
+The `deploy-rs.lib.<system>.activate` set provides a helper for each kind of profile:
+
+- `activate.nixos <nixosConfiguration>` — activate a NixOS system (runs `switch-to-configuration`).
+- `activate.home-manager <hmConfiguration>` — activate a home-manager generation.
+- `activate.darwin <darwinConfiguration>` — activate a nix-darwin system.
+- `activate.custom <drv> "<activation command>"` — wrap any derivation with a custom activation script (as shown above).
+- `activate.profile <drv>` — install a package (or `buildEnv`) into the target user's nix3 `nix profile`, replacing any previous generation with the same name.
+- `activate.noop <drv>` — deploy the closure without running any activation.
+
 ### Node
 
 This defines a single node/server, and the profiles you intend it to run.

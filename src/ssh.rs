@@ -150,7 +150,7 @@ impl Drop for SshControlMaster {
                 .arg(format!("ControlPath={}", self.control_path.display()))
                 .arg("-O")
                 .arg("exit")
-                .arg(&self.ssh_addr())
+                .arg(self.ssh_addr())
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .spawn();
@@ -202,5 +202,11 @@ impl SshMultiplexer {
                 warn!("Failed to close SSH master for {}: {}", key, e);
             }
         }
+    }
+}
+
+impl Default for SshMultiplexer {
+    fn default() -> Self {
+        Self::new()
     }
 }

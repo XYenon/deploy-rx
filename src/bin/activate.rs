@@ -221,7 +221,7 @@ pub async fn deactivate(profile_path: &str) -> Result<(), DeactivateError> {
     let mut nix_env_rollback = Command::new("nix-env");
     nix_env_rollback
         .arg("-p")
-        .arg(&profile_path)
+        .arg(profile_path)
         .arg("--rollback");
     command::Command::new(nix_env_rollback)
         .status()
@@ -233,7 +233,7 @@ pub async fn deactivate(profile_path: &str) -> Result<(), DeactivateError> {
     let mut nix_env_list_generations = Command::new("nix-env");
     nix_env_list_generations
         .arg("-p")
-        .arg(&profile_path)
+        .arg(profile_path)
         .arg("--list-generations");
     let nix_env_list_generations_out = command::Command::new(nix_env_list_generations)
         .run()
@@ -259,7 +259,7 @@ pub async fn deactivate(profile_path: &str) -> Result<(), DeactivateError> {
     let mut nix_env_delete_generation = Command::new("nix-env");
     nix_env_delete_generation
         .arg("-p")
-        .arg(&profile_path)
+        .arg(profile_path)
         .arg("--delete-generations")
         .arg(last_generation_id);
     command::Command::new(nix_env_delete_generation)
@@ -271,8 +271,8 @@ pub async fn deactivate(profile_path: &str) -> Result<(), DeactivateError> {
 
     let mut re_activate = Command::new(format!("{}/deploy-rx-activate", profile_path));
     re_activate
-        .env("PROFILE", &profile_path)
-        .current_dir(&profile_path);
+        .env("PROFILE", profile_path)
+        .current_dir(profile_path);
     command::Command::new(re_activate)
         .status()
         .await
@@ -365,7 +365,7 @@ pub async fn activation_confirmation(
 
     danger_zone(done, confirm_timeout)
         .await
-        .map_err(|err| ActivationConfirmationError::WaitingError(err))
+        .map_err(ActivationConfirmationError::WaitingError)
 }
 
 #[derive(Error, Debug)]
@@ -457,6 +457,7 @@ pub enum ActivateError {
     ActivationConfirmation(#[from] ActivationConfirmationError),
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn activate(
     profile_path: String,
     closure: String,
@@ -582,9 +583,7 @@ fn get_profile_path(
                         // using 'dirs::state_dir()' directly.
                         let state_dir = env::var("XDG_STATE_HOME").or_else(|_| {
                             dirs::home_dir()
-                                .map(|h| {
-                                    format!("{}/.local/state", h.as_path().display().to_string())
-                                })
+                                .map(|h| format!("{}/.local/state", h.as_path().display()))
                                 .ok_or(GetProfilePathError::NoUserHome(profile_user))
                         })?;
                         Ok(format!("{}/nix/profiles/{}", state_dir, profile_name))
@@ -1518,7 +1517,7 @@ fn write_confirmation(opts: WriteConfirmationOpts) -> Result<(), Box<dyn std::er
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Ensure that this process stays alive after the SSH connection dies
-    let mut signals = Signals::new(&[SIGHUP])?;
+    let mut signals = Signals::new([SIGHUP])?;
     std::thread::spawn(move || {
         for _ in signals.forever() {
             eprintln!("Received SIGHUP - ignoring...");

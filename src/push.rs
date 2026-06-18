@@ -152,18 +152,16 @@ async fn run_build_command(
                 .stdout(Stdio::null())
                 .stderr(Stdio::piped());
 
-            let (nix_status, nom_status) =
-                tokio::task::spawn_blocking(move || -> Result<_, PushProfileError> {
+            let (nix_status, nom_status) = tokio::task::spawn_blocking(
+                #[allow(clippy::result_large_err)]
+                move || -> Result<_, PushProfileError> {
                     let mut nix_child = build_command.into_std().spawn().map_err(|err| {
                         PushProfileError::Build(command::CommandError::RunError(err))
                     })?;
 
                     let nix_stderr = nix_child.stderr.take().ok_or_else(|| {
                         PushProfileError::Build(command::CommandError::RunError(
-                            std::io::Error::new(
-                                std::io::ErrorKind::Other,
-                                "failed to capture nix build stderr for nom",
-                            ),
+                            std::io::Error::other("failed to capture nix build stderr for nom"),
                         ))
                     })?;
 
@@ -187,14 +185,14 @@ async fn run_build_command(
                     })?;
 
                     Ok((nix_status, nom_status))
-                })
-                .await
-                .map_err(|err| {
-                    PushProfileError::Build(command::CommandError::RunError(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        format!("failed waiting for build tree process: {}", err),
-                    )))
-                })??;
+                },
+            )
+            .await
+            .map_err(|err| {
+                PushProfileError::Build(command::CommandError::RunError(std::io::Error::other(
+                    format!("failed waiting for build tree process: {}", err),
+                )))
+            })??;
 
             if nom_status.code() != Some(0) {
                 warn!(
@@ -206,10 +204,10 @@ async fn run_build_command(
             return match nix_status.code() {
                 Some(0) => Ok(()),
                 a => Err(PushProfileError::Build(command::CommandError::RunError(
-                    std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        format!("Nix build command resulted in a bad exit code: {:?}", a),
-                    ),
+                    std::io::Error::other(format!(
+                        "Nix build command resulted in a bad exit code: {:?}",
+                        a
+                    )),
                 ))),
             };
         }

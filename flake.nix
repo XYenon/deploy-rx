@@ -126,6 +126,21 @@
             darwin = base: custom base.config.system.build.toplevel "HOME=/var/root $PROFILE/activate";
 
             noop = base: custom base ":";
+
+            # Install a package into the target's nix3 profile (`nix profile`).
+            # Unlike the other activators this does not just `nix-env --set` the
+            # closure into deploy-rs' own profile, it also (re)installs `base`
+            # into the calling user's `nix profile`, replacing a previous
+            # generation with the same name. Useful for declaratively rolling
+            # out a package (or a `buildEnv`) to a machine.
+            profile = base: custom base ''
+              export PATH="${final.lib.makeBinPath [ final.nix ]}:$PATH"
+              nixFlags=(--extra-experimental-features "nix-command flakes")
+              # Best-effort removal of a previously-installed element of the same
+              # name (no-op on first deploy), then install the new closure.
+              nix "''${nixFlags[@]}" profile remove "${base.name}" 2>/dev/null || true
+              nix "''${nixFlags[@]}" profile install "${base}"
+            '';
           };
 
           deployChecks = deploy: builtins.mapAttrs (_: check: check deploy) {
@@ -194,6 +209,34 @@
 
         checks = {
           deploy-rx = self.packages.${system}.default.overrideAttrs (super: { doCheck = true; });
+
+          # Lint the Rust sources with clippy, failing on any warning.
+          clippy = self.packages.${system}.default.overrideAttrs (super: {
+            pname = "deploy-rx-clippy";
+            nativeBuildInputs = (super.nativeBuildInputs or [ ]) ++ [ pkgs.clippy ];
+            buildPhase = "cargo clippy --all-targets -- --deny warnings";
+            doCheck = false;
+            installPhase = "touch $out";
+            postFixup = "";
+          });
+
+          # Enforce `cargo fmt` formatting.
+          rustfmt = pkgs.runCommandLocal "deploy-rx-rustfmt" {
+            nativeBuildInputs = [ pkgs.cargo pkgs.rustfmt ];
+          } ''
+            export HOME="$TMPDIR"
+            cd ${self.packages.${system}.default.src}
+            cargo fmt --check
+            touch $out
+          '';
+
+          # Enforce REUSE licensing compliance.
+          reuse = pkgs.runCommandLocal "deploy-rx-reuse" {
+            nativeBuildInputs = [ pkgs.reuse ];
+          } ''
+            reuse --root ${self} lint
+            touch $out
+          '';
         } // (pkgs.lib.optionalAttrs (pkgs.lib.elem system ["x86_64-linux"]) (import ./nix/tests {
           inherit inputs pkgs;
           deployRxSrc = self.outPath;
