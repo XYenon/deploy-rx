@@ -4,6 +4,8 @@
 //
 // SPDX-License-Identifier: MPL-2.0
 
+pub mod command;
+
 use rnix::{types::*, SyntaxKind::*};
 
 use merge::Merge;

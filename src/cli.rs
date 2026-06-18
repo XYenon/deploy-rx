@@ -10,7 +10,7 @@ use clap::{ArgMatches, FromArgMatches, Parser};
 
 use crate as deploy;
 
-use self::deploy::{DeployFlake, ParseFlakeError};
+use self::deploy::{command, DeployFlake, ParseFlakeError};
 use futures_util::future::try_join_all;
 use log::{debug, error, info, warn};
 use serde::Serialize;
@@ -164,11 +164,18 @@ async fn test_flake_support() -> Result<bool, std::io::Error> {
 }
 
 #[derive(Error, Debug)]
+pub enum NixCheckError {}
+
+impl command::HasCommandError for NixCheckError {
+    fn title() -> String {
+        "Nix checking".to_string()
+    }
+}
+
+#[derive(Error, Debug)]
 pub enum CheckDeploymentError {
-    #[error("Failed to execute Nix checking command: {0}")]
-    NixCheck(#[from] std::io::Error),
-    #[error("Nix checking command resulted in a bad exit code: {0:?}")]
-    NixCheckExit(Option<i32>),
+    #[error("{0}")]
+    NixCheck(#[from] command::CommandError<NixCheckError>),
 }
 
 async fn command_exists(command: &str, path: Option<&OsStr>) -> bool {
@@ -213,15 +220,16 @@ async fn run_check_command(
 
             let (nix_status, nom_status) =
                 tokio::task::spawn_blocking(move || -> Result<_, CheckDeploymentError> {
-                    let mut nix_child = check_command
-                        .into_std()
-                        .spawn()
-                        .map_err(CheckDeploymentError::NixCheck)?;
+                    let mut nix_child = check_command.into_std().spawn().map_err(|err| {
+                        CheckDeploymentError::NixCheck(command::CommandError::RunError(err))
+                    })?;
 
                     let nix_stderr = nix_child.stderr.take().ok_or_else(|| {
-                        CheckDeploymentError::NixCheck(std::io::Error::new(
-                            std::io::ErrorKind::Other,
-                            "failed to capture nix check stderr for nom",
+                        CheckDeploymentError::NixCheck(command::CommandError::RunError(
+                            std::io::Error::new(
+                                std::io::ErrorKind::Other,
+                                "failed to capture nix check stderr for nom",
+                            ),
                         ))
                     })?;
 
@@ -236,17 +244,23 @@ async fn run_check_command(
                         .stdout(Stdio::inherit())
                         .stderr(Stdio::inherit())
                         .status()
-                        .map_err(CheckDeploymentError::NixCheck)?;
+                        .map_err(|err| {
+                            CheckDeploymentError::NixCheck(command::CommandError::RunError(err))
+                        })?;
 
-                    let nix_status = nix_child.wait().map_err(CheckDeploymentError::NixCheck)?;
+                    let nix_status = nix_child.wait().map_err(|err| {
+                        CheckDeploymentError::NixCheck(command::CommandError::RunError(err))
+                    })?;
 
                     Ok((nix_status, nom_status))
                 })
                 .await
                 .map_err(|err| {
-                    CheckDeploymentError::NixCheck(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        format!("failed waiting for check build tree process: {}", err),
+                    CheckDeploymentError::NixCheck(command::CommandError::RunError(
+                        std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            format!("failed waiting for check build tree process: {}", err),
+                        ),
                     ))
                 })??;
 
@@ -259,17 +273,25 @@ async fn run_check_command(
 
             return match nix_status.code() {
                 Some(0) => Ok(()),
-                a => Err(CheckDeploymentError::NixCheckExit(a)),
+                a => Err(CheckDeploymentError::NixCheck(
+                    command::CommandError::RunError(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!(
+                            "nix check piped to nom resulted in a bad exit code: {:?}",
+                            a
+                        ),
+                    )),
+                )),
             };
         }
     }
 
-    let check_status = check_command.status().await?;
+    command::Command::new(check_command)
+        .run()
+        .await
+        .map_err(CheckDeploymentError::NixCheck)?;
 
-    match check_status.code() {
-        Some(0) => Ok(()),
-        a => Err(CheckDeploymentError::NixCheckExit(a)),
-    }
+    Ok(())
 }
 
 async fn check_deployment(
@@ -306,13 +328,18 @@ async fn check_deployment(
 }
 
 #[derive(Error, Debug)]
+pub enum NixEvalError {}
+
+impl command::HasCommandError for NixEvalError {
+    fn title() -> String {
+        "Nix eval".to_string()
+    }
+}
+
+#[derive(Error, Debug)]
 pub enum GetDeploymentDataError {
-    #[error("Failed to execute nix eval command: {0}")]
-    NixEval(std::io::Error),
-    #[error("Failed to read output from evaluation: {0}")]
-    NixEvalOut(std::io::Error),
-    #[error("Evaluation resulted in a bad exit code: {0:?}")]
-    NixEvalExit(Option<i32>),
+    #[error("{0}")]
+    NixEval(#[from] command::CommandError<NixEvalError>),
     #[error("Error converting evaluation output to utf8: {0}")]
     DecodeUtf8(#[from] std::string::FromUtf8Error),
     #[error("Error decoding the JSON from evaluation: {0}")]
@@ -454,20 +481,10 @@ in
             };
             c.args(extra_build_args);
 
-            let build_child = c
-                .stdout(Stdio::piped())
-                .spawn()
-                .map_err(GetDeploymentDataError::NixEval)?;
-
-            let build_output = build_child
-                .wait_with_output()
+            let build_output = command::Command::new(c)
+                .run()
                 .await
-                .map_err(GetDeploymentDataError::NixEvalOut)?;
-
-            match build_output.status.code() {
-                Some(0) => (),
-                a => return Err(GetDeploymentDataError::NixEvalExit(a)),
-            };
+                .map_err(GetDeploymentDataError::NixEval)?;
 
             let data_json = String::from_utf8(build_output.stdout)?;
             let parsed_data: deploy::data::Data = serde_json::from_str(&data_json)?;
