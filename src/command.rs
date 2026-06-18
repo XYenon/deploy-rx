@@ -12,6 +12,7 @@ pub trait HasCommandError {
 pub enum CommandError<T> {
     RunError(std::io::Error),
     Exit(std::process::Output, String),
+    ExitStatus(std::process::ExitStatus, String),
     OtherError(T),
 }
 
@@ -28,11 +29,20 @@ impl<T: HasCommandError + Debug + fmt::Display> fmt::Display for CommandError<T>
                 };
                 write!(
                     f,
-                    "{} command resulted in a bad exit code: {:?}.\nThe failed command is provided below:\n{}\nThe stderr output is provided below:\n{}",
+                    "{} command resulted in a bad exit status: {}.\nThe failed command is provided below:\n{}\nThe stderr output is provided below:\n{}",
                     T::title(),
-                    output.status.code(),
+                    output.status,
                     unescape::unescape(cmd).unwrap_or(cmd.clone()),
                     stderr,
+                )
+            }
+            CommandError::ExitStatus(status, cmd) => {
+                write!(
+                    f,
+                    "{} command resulted in a bad exit status: {}.\nThe failed command is provided below:\n{}",
+                    T::title(),
+                    status,
+                    unescape::unescape(cmd).unwrap_or(cmd.clone()),
                 )
             }
             CommandError::OtherError(err) => write!(f, "{}", err),
@@ -61,6 +71,23 @@ impl Command {
         match output.status.code() {
             Some(0) => Ok(output),
             _exit_code => Err(CommandError::Exit(output, format!("{:?}", self.command))),
+        }
+    }
+
+    pub async fn status<T: HasCommandError + Debug + fmt::Display>(
+        &mut self,
+    ) -> Result<std::process::ExitStatus, CommandError<T>> {
+        let status = self
+            .command
+            .status()
+            .await
+            .map_err(CommandError::RunError)?;
+        match status.code() {
+            Some(0) => Ok(status),
+            _exit_code => Err(CommandError::ExitStatus(
+                status,
+                format!("{:?}", self.command),
+            )),
         }
     }
 }

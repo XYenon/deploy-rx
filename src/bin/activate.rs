@@ -224,7 +224,7 @@ pub async fn deactivate(profile_path: &str) -> Result<(), DeactivateError> {
         .arg(&profile_path)
         .arg("--rollback");
     command::Command::new(nix_env_rollback)
-        .run()
+        .status()
         .await
         .map_err(DeactivateError::Rollback)?;
 
@@ -263,7 +263,7 @@ pub async fn deactivate(profile_path: &str) -> Result<(), DeactivateError> {
         .arg("--delete-generations")
         .arg(last_generation_id);
     command::Command::new(nix_env_delete_generation)
-        .run()
+        .status()
         .await
         .map_err(DeactivateError::DeleteGen)?;
 
@@ -274,7 +274,7 @@ pub async fn deactivate(profile_path: &str) -> Result<(), DeactivateError> {
         .env("PROFILE", &profile_path)
         .current_dir(&profile_path);
     command::Command::new(re_activate)
-        .run()
+        .status()
         .await
         .map_err(DeactivateError::Reactivate)?;
 
@@ -479,7 +479,7 @@ pub async fn activate(
             .arg(&profile_path)
             .arg("--set")
             .arg(&closure);
-        if let Err(err) = command::Command::new(nix_env_set).run().await {
+        if let Err(err) = command::Command::new(nix_env_set).status().await {
             let profile_link_after_set = std::fs::read_link(&profile_path).ok();
             let should_rollback = auto_rollback
                 && profile_link_before_set.is_some()
@@ -507,7 +507,7 @@ pub async fn activate(
         .env("BOOT", if boot { "1" } else { "0" })
         .current_dir(activation_location);
 
-    if let Err(err) = command::Command::new(activate_command).run().await {
+    if let Err(err) = command::Command::new(activate_command).status().await {
         if auto_rollback && !dry_activate {
             deactivate(&profile_path).await?;
         }
