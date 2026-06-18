@@ -84,7 +84,7 @@ pub enum PushProfileError {
         nodes: String,
         target: String,
         profiles: String,
-        source: command::CommandError<CopyError>,
+        source: Box<command::CommandError<CopyError>>,
     },
 
     #[error("{0}")]
@@ -152,9 +152,8 @@ async fn run_build_command(
                 .stdout(Stdio::null())
                 .stderr(Stdio::piped());
 
-            let (nix_status, nom_status) = tokio::task::spawn_blocking(
-                #[allow(clippy::result_large_err)]
-                move || -> Result<_, PushProfileError> {
+            let (nix_status, nom_status) =
+                tokio::task::spawn_blocking(move || -> Result<_, PushProfileError> {
                     let mut nix_child = build_command.into_std().spawn().map_err(|err| {
                         PushProfileError::Build(command::CommandError::RunError(err))
                     })?;
@@ -185,14 +184,13 @@ async fn run_build_command(
                     })?;
 
                     Ok((nix_status, nom_status))
-                },
-            )
-            .await
-            .map_err(|err| {
-                PushProfileError::Build(command::CommandError::RunError(std::io::Error::other(
-                    format!("failed waiting for build tree process: {}", err),
-                )))
-            })??;
+                })
+                .await
+                .map_err(|err| {
+                    PushProfileError::Build(command::CommandError::RunError(std::io::Error::other(
+                        format!("failed waiting for build tree process: {}", err),
+                    )))
+                })??;
 
             if nom_status.code() != Some(0) {
                 warn!(
@@ -734,7 +732,7 @@ pub async fn push_profiles(datas: &[PushProfileData<'_>]) -> Result<(), PushProf
                 nodes: nodes_str.clone(),
                 target: target.clone(),
                 profiles: profiles_str.clone(),
-                source,
+                source: Box::new(source),
             })?;
     }
 

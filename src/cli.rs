@@ -699,7 +699,6 @@ fn profile_matches_tags(profile: &deploy::data::Profile, tags: &HashSet<&str>) -
         .all(|tag| profile.profile_settings.tags.iter().any(|t| t == *tag))
 }
 
-#[allow(clippy::result_large_err)]
 fn ordered_profiles_for_node<'a>(
     node: &'a deploy::data::Node,
     tags: &HashSet<&str>,
@@ -730,7 +729,6 @@ fn ordered_profiles_for_node<'a>(
     Ok(profiles_list)
 }
 
-#[allow(clippy::result_large_err)]
 fn collect_to_deploy<'a>(
     deploy_flakes: &'a [deploy::DeployFlake<'a>],
     data: &'a [deploy::data::Data],
