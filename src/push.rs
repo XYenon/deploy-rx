@@ -734,9 +734,11 @@ pub async fn build_and_push_profiles(
     }))
     .await?;
 
-    // Group by node, as upstream does: profiles_order is defined per node and
-    // therefore must remain sequential within that node's queue.
-    let mut remote_builds: HashMap<&str, Vec<(&PushProfileData<'_>, &str)>> = HashMap::new();
+    // profiles_order is defined per node within one deployment source. Node
+    // names from separate repositories must not serialize otherwise-independent
+    // remote builds.
+    let mut remote_builds: HashMap<(&str, &str), Vec<(&PushProfileData<'_>, &str)>> =
+        HashMap::new();
     let mut local_builds: Vec<(&PushProfileData<'_>, &str)> = Vec::new();
 
     for (data, deriver) in datas.iter().zip(&derivations) {
@@ -747,7 +749,7 @@ pub async fn build_and_push_profiles(
             .unwrap_or(false)
         {
             remote_builds
-                .entry(data.deploy_data.node_name)
+                .entry((data.repo, data.deploy_data.node_name))
                 .or_default()
                 .push((data, deriver));
         } else {
