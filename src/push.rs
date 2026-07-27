@@ -2,6 +2,7 @@
 //
 // SPDX-License-Identifier: MPL-2.0
 
+use futures_util::future::try_join_all;
 use log::{debug, info, warn};
 use std::ffi::OsStr;
 use std::path::Path;
@@ -584,6 +585,78 @@ pub async fn build_profiles(datas: &[PushProfileData<'_>]) -> Result<(), PushPro
     Ok(())
 }
 
+/// Build profiles and copy locally-built closures to their target hosts.
+///
+/// Remote builds targeting the same host retain profile order, while builds on
+/// different hosts are run concurrently.  The local batch is also run in
+/// parallel with the remote build queues and is copied as soon as it finishes.
+pub async fn build_and_push_profiles(
+    datas: &[PushProfileData<'_>],
+) -> Result<(), PushProfileError> {
+    let derivations: Vec<String> = try_join_all(datas.iter().map(resolve_derivation)).await?;
+
+    let mut remote_builds: Vec<Vec<(&PushProfileData<'_>, &str)>> = Vec::new();
+    let mut local_builds: Vec<(&PushProfileData<'_>, &str)> = Vec::new();
+
+    for (data, deriver) in datas.iter().zip(&derivations) {
+        if data
+            .deploy_data
+            .merged_settings
+            .remote_build
+            .unwrap_or(false)
+        {
+            let hostname = data
+                .deploy_data
+                .cmd_overrides
+                .hostname
+                .as_deref()
+                .unwrap_or(&data.deploy_data.node.node_settings.hostname);
+
+            if let Some(queue) = remote_builds.iter_mut().find(|queue| {
+                let queued = queue[0].0;
+                queued
+                    .deploy_data
+                    .cmd_overrides
+                    .hostname
+                    .as_deref()
+                    .unwrap_or(&queued.deploy_data.node.node_settings.hostname)
+                    == hostname
+            }) {
+                queue.push((data, deriver));
+            } else {
+                remote_builds.push(vec![(data, deriver)]);
+            }
+        } else {
+            local_builds.push((data, deriver));
+        }
+    }
+
+    let remote = try_join_all(remote_builds.into_iter().map(|queue| async move {
+        for (data, deriver) in queue {
+            if !data.supports_flakes {
+                warn!("remote builds using non-flake nix are experimental");
+            }
+            build_profile_remotely(data, deriver).await?;
+        }
+        Ok::<(), PushProfileError>(())
+    }));
+
+    let local = async {
+        if !local_builds.is_empty() {
+            build_profiles_locally(&local_builds).await?;
+            let local_datas: Vec<PushProfileData<'_>> = local_builds
+                .into_iter()
+                .map(|(data, _)| PushProfileData { ..*data })
+                .collect();
+            push_profiles(&local_datas).await?;
+        }
+        Ok::<(), PushProfileError>(())
+    };
+
+    tokio::try_join!(remote, local)?;
+    Ok(())
+}
+
 pub async fn build_profile(data: PushProfileData<'_>) -> Result<(), PushProfileError> {
     build_profiles(&[data]).await
 }
@@ -685,7 +758,7 @@ pub async fn push_profiles(datas: &[PushProfileData<'_>]) -> Result<(), PushProf
         }
     }
 
-    for group in copy_groups {
+    try_join_all(copy_groups.into_iter().map(|group| async move {
         let profiles_str = group
             .indexes
             .iter()
@@ -734,7 +807,9 @@ pub async fn push_profiles(datas: &[PushProfileData<'_>]) -> Result<(), PushProf
                 profiles: profiles_str.clone(),
                 source: Box::new(source),
             })?;
-    }
+        Ok::<(), PushProfileError>(())
+    }))
+    .await?;
 
     Ok(())
 }

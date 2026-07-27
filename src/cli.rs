@@ -893,19 +893,6 @@ async fn run_deploy(
         build_tree,
     };
 
-    let push_profile_datas = make_push_profile_datas(&parts, &push_profile_data_options);
-
-    // Resolve derivations, then build all profiles (remote individually, local batched)
-    deploy::push::build_profiles(&push_profile_datas)
-        .await
-        .map_err(|e| {
-            let node_names: Vec<_> = push_profile_datas
-                .iter()
-                .map(|d| d.deploy_data.node_name.to_string())
-                .collect();
-            RunDeployError::BuildProfile(node_names.join(", "), e)
-        })?;
-
     let ssh_multiplexer = if ssh_multiplexing {
         let multiplexer = deploy::ssh::SshMultiplexer::new();
 
@@ -936,7 +923,7 @@ async fn run_deploy(
 
     let push_profile_datas = make_push_profile_datas(&parts, &push_profile_data_options);
 
-    deploy::push::push_profiles(&push_profile_datas)
+    deploy::push::build_and_push_profiles(&push_profile_datas)
         .await
         .map_err(|e| {
             let node_names = e.node_context().map(str::to_string).unwrap_or_else(|| {
@@ -946,7 +933,7 @@ async fn run_deploy(
                     .collect::<Vec<_>>()
                     .join(", ")
             });
-            RunDeployError::PushProfile(node_names, e)
+            RunDeployError::BuildProfile(node_names, e)
         })?;
 
     let mut succeeded: Vec<(&deploy::DeployData, &deploy::DeployDefs)> = vec![];
