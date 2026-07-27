@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
 use futures_util::future::{join_all, try_join_all};
-use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use indicatif::{MultiProgress, ProgressBar, ProgressState, ProgressStyle};
 use log::{debug, info, warn};
 use std::collections::HashMap;
 use std::ffi::OsStr;
@@ -13,16 +13,191 @@ use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 
+fn separator(_state: &ProgressState, w: &mut dyn std::fmt::Write) {
+    let _ = write!(w, "│");
+}
+
 fn progress_style() -> ProgressStyle {
-    ProgressStyle::with_template("{spinner:.blue} {prefix} │ {msg}")
-        .expect("valid progress template")
+    ProgressStyle::with_template("{spinner:.blue} {prefix} {sep:.blue} {msg}")
+        .expect("invalid template")
+        .with_key("sep", separator)
         .tick_strings(&["⢎ ", "⠎⠁", "⠊⠑", "⠈⠱", " ⡱", "⢀⡰", "⢄⡠", "⢆⡀"])
 }
 
 fn finish_progress(pb: &ProgressBar, result: &Result<(), impl std::fmt::Display>) {
     match result {
-        Ok(()) => pb.finish_with_message("Done!"),
-        Err(error) => pb.abandon_with_message(format!("Error: {error}")),
+        Ok(()) => {
+            pb.set_style(
+                ProgressStyle::with_template("✅ {prefix} {sep:.blue} {msg}")
+                    .expect("invalid template")
+                    .with_key("sep", separator),
+            );
+            pb.finish_with_message("Done!");
+        }
+        Err(error) => {
+            pb.set_style(
+                ProgressStyle::with_template("❌ {prefix} {sep:.blue} {msg}")
+                    .expect("invalid template")
+                    .with_key("sep", separator),
+            );
+            pb.finish_with_message(format!("Error: {error}"));
+        }
+    }
+}
+
+// Nix `internal-json` activity types (see nix's `logging.hh`).
+const ACT_COPY_PATHS: i64 = 103;
+const ACT_BUILDS: i64 = 104;
+const ACT_FILE_TRANSFER: i64 = 101;
+// Result types.
+const RES_PROGRESS: i64 = 105;
+const RES_BUILD_LOG_LINE: i64 = 101;
+
+/// Accumulates the aggregate progress reported by `nix --log-format internal-json`
+/// so we can render a compact `x/y built, x/y copied` message next to the spinner,
+/// mirroring nix's own progress bar.
+#[derive(Default)]
+struct NixProgress {
+    // Map of activity id -> activity type, so `result` events can be attributed.
+    activities: HashMap<u64, i64>,
+    builds: (u64, u64),
+    copies: (u64, u64),
+    // Downloads are not an aggregate activity: each file transfer reports its
+    // own byte count, so we track the latest bytes per active transfer and keep
+    // a running total of finished ones to render a single `X MiB DL` figure.
+    download_active: HashMap<u64, u64>,
+    download_done: u64,
+    // The most recent human-readable activity text (current path, build log line, ...).
+    last_line: String,
+}
+
+/// Render a byte count the way nix's own progress bar does (KiB/MiB/GiB, base 1024).
+fn human_bytes(n: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = n as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{} {}", n, UNITS[unit])
+    } else {
+        format!("{:.1} {}", value, UNITS[unit])
+    }
+}
+
+impl NixProgress {
+    /// Ingest one line of child output. Returns `true` if it was a structured
+    /// `@nix` message (already handled), `false` if it is a plain log line the
+    /// caller should surface directly.
+    fn ingest(&mut self, line: &str) -> bool {
+        let json = match line.strip_prefix("@nix ") {
+            Some(json) => json,
+            None => return false,
+        };
+        let value: serde_json::Value = match serde_json::from_str(json) {
+            Ok(value) => value,
+            Err(_) => return false,
+        };
+
+        let action = value.get("action").and_then(|a| a.as_str()).unwrap_or("");
+        match action {
+            "start" => {
+                let id = value.get("id").and_then(serde_json::Value::as_u64);
+                let typ = value.get("type").and_then(serde_json::Value::as_i64);
+                if let (Some(id), Some(typ)) = (id, typ) {
+                    self.activities.insert(id, typ);
+                }
+                // Show the individual operation (copying/downloading/building '...').
+                if let Some(text) = value.get("text").and_then(serde_json::Value::as_str) {
+                    if !text.is_empty() {
+                        self.last_line = text.to_string();
+                    }
+                }
+            }
+            "stop" => {
+                if let Some(id) = value.get("id").and_then(serde_json::Value::as_u64) {
+                    // Fold a finished download's bytes into the running total.
+                    if let Some(bytes) = self.download_active.remove(&id) {
+                        self.download_done += bytes;
+                    }
+                    self.activities.remove(&id);
+                }
+            }
+            "result" => {
+                let id = value.get("id").and_then(serde_json::Value::as_u64);
+                let rtype = value.get("type").and_then(serde_json::Value::as_i64);
+                let fields = value.get("fields").and_then(serde_json::Value::as_array);
+                match rtype {
+                    // Progress on an aggregate activity: fields = [done, expected, running, failed].
+                    Some(RES_PROGRESS) => {
+                        if let (Some(&atype), Some(fields)) =
+                            (id.and_then(|id| self.activities.get(&id)), fields)
+                        {
+                            let done = fields.first().and_then(serde_json::Value::as_u64);
+                            let expected = fields.get(1).and_then(serde_json::Value::as_u64);
+                            match atype {
+                                ACT_BUILDS => {
+                                    if let (Some(done), Some(expected)) = (done, expected) {
+                                        self.builds = (done, expected);
+                                    }
+                                }
+                                ACT_COPY_PATHS => {
+                                    if let (Some(done), Some(expected)) = (done, expected) {
+                                        self.copies = (done, expected);
+                                    }
+                                }
+                                // fields[0] is this transfer's downloaded bytes.
+                                ACT_FILE_TRANSFER => {
+                                    if let (Some(id), Some(done)) = (id, done) {
+                                        self.download_active.insert(id, done);
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    // A line of build output from a running derivation.
+                    Some(RES_BUILD_LOG_LINE) => {
+                        if let Some(text) = fields
+                            .and_then(|f| f.first())
+                            .and_then(serde_json::Value::as_str)
+                        {
+                            if !text.is_empty() {
+                                self.last_line = text.to_string();
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+        true
+    }
+
+    /// Render the accumulated state into a spinner message.
+    fn message(&self) -> String {
+        let mut counts = Vec::new();
+        if self.builds.1 > 0 {
+            counts.push(format!("{}/{} built", self.builds.0, self.builds.1));
+        }
+        if self.copies.1 > 0 {
+            counts.push(format!("{}/{} copied", self.copies.0, self.copies.1));
+        }
+        let downloaded: u64 = self.download_done + self.download_active.values().sum::<u64>();
+        if downloaded > 0 {
+            counts.push(format!("{} DL", human_bytes(downloaded)));
+        }
+        let counts = counts.join(", ");
+
+        match (counts.is_empty(), self.last_line.is_empty()) {
+            (false, false) => format!("[{}] {}", counts, self.last_line),
+            (false, true) => counts,
+            (true, false) => self.last_line.clone(),
+            (true, true) => "...".to_string(),
+        }
     }
 }
 
@@ -48,24 +223,28 @@ async fn run_nix_with_progress<
     let mut stdout = BufReader::new(stdout).lines();
     let mut stderr = BufReader::new(stderr).lines();
     let mut stderr_output = Vec::new();
+    let mut nix_progress = NixProgress::default();
     let mut stdout_done = false;
     let mut stderr_done = false;
 
     while !stdout_done || !stderr_done {
         tokio::select! {
             line = stdout.next_line(), if !stdout_done => match line.map_err(command::CommandError::RunError)? {
-                Some(line) => if !line.is_empty() { pb.set_message(line); },
+                Some(line) => {
+                    if nix_progress.ingest(&line) {
+                        pb.set_message(nix_progress.message());
+                    } else if !line.is_empty() {
+                        pb.set_message(line);
+                    }
+                },
                 None => stdout_done = true,
             },
             line = stderr.next_line(), if !stderr_done => match line.map_err(command::CommandError::RunError)? {
                 Some(line) => {
                     stderr_output.extend_from_slice(line.as_bytes());
                     stderr_output.push(b'\n');
-                    let message = line.strip_prefix("@nix ").unwrap_or(&line);
-                    if let Ok(event) = serde_json::from_str::<serde_json::Value>(message) {
-                        if let Some(text) = event.get("msg").and_then(|value| value.as_str()) {
-                            pb.set_message(text.to_string());
-                        }
+                    if nix_progress.ingest(&line) {
+                        pb.set_message(nix_progress.message());
                     } else if !line.is_empty() {
                         pb.set_message(line);
                     }
