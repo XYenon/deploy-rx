@@ -7,6 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::{stdin, stdout, Write};
 
 use clap::{ArgMatches, FromArgMatches, Parser};
+use indicatif::MultiProgress;
 
 use crate as deploy;
 
@@ -820,6 +821,7 @@ async fn run_deploy(
     build_tree: bool,
     review_changes: bool,
     tags: &[String],
+    progress: MultiProgress,
 ) -> Result<(), RunDeployError> {
     let to_deploy = collect_to_deploy(&deploy_flakes, &data, tags)?;
 
@@ -923,7 +925,7 @@ async fn run_deploy(
 
     let push_profile_datas = make_push_profile_datas(&parts, &push_profile_data_options);
 
-    deploy::push::build_and_push_profiles(&push_profile_datas)
+    deploy::push::build_and_push_profiles(&push_profile_datas, progress)
         .await
         .map_err(|e| {
             let all_node_names = || {
@@ -1424,6 +1426,7 @@ mod tests {
             false,
             false,
             &tags,
+            MultiProgress::new(),
         )
         .await;
 
@@ -1646,7 +1649,7 @@ pub async fn run(args: Option<&ArgMatches>) -> Result<(), RunError> {
         None => Opts::parse(),
     };
 
-    deploy::init_logger(
+    let (progress, _logger_handle) = deploy::init_logger(
         opts.debug_logs,
         opts.log_dir.as_deref(),
         &deploy::LoggerType::Deploy,
@@ -1745,6 +1748,7 @@ pub async fn run(args: Option<&ArgMatches>) -> Result<(), RunError> {
         build_tree,
         review_changes,
         &opts.tags,
+        progress,
     )
     .await?;
 

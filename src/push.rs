@@ -901,8 +901,8 @@ pub async fn build_profiles(datas: &[PushProfileData<'_>]) -> Result<(), PushPro
 /// parallel with the remote build queues and is copied as soon as it finishes.
 pub async fn build_and_push_profiles(
     datas: &[PushProfileData<'_>],
+    progress: MultiProgress,
 ) -> Result<(), BuildAndPushProfileError> {
-    let progress = MultiProgress::new();
     let derivations: Vec<String> = try_join_all(datas.iter().map(|data| async move {
         resolve_derivation(data)
             .await
