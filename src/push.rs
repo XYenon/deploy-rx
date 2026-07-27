@@ -4,6 +4,7 @@
 
 use futures_util::future::{join_all, try_join_all};
 use log::{debug, info, warn};
+use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::path::Path;
 use std::process::{Command as StdCommand, Stdio};
@@ -606,7 +607,9 @@ pub async fn build_and_push_profiles(
         .await
         .map_err(BuildAndPushProfileError::Build)?;
 
-    let mut remote_builds: Vec<Vec<(&PushProfileData<'_>, &str)>> = Vec::new();
+    // Group by node, as upstream does: profiles_order is defined per node and
+    // therefore must remain sequential within that node's queue.
+    let mut remote_builds: HashMap<&str, Vec<(&PushProfileData<'_>, &str)>> = HashMap::new();
     let mut local_builds: Vec<(&PushProfileData<'_>, &str)> = Vec::new();
 
     for (data, deriver) in datas.iter().zip(&derivations) {
@@ -616,33 +619,16 @@ pub async fn build_and_push_profiles(
             .remote_build
             .unwrap_or(false)
         {
-            let hostname = data
-                .deploy_data
-                .cmd_overrides
-                .hostname
-                .as_deref()
-                .unwrap_or(&data.deploy_data.node.node_settings.hostname);
-
-            if let Some(queue) = remote_builds.iter_mut().find(|queue| {
-                let queued = queue[0].0;
-                queued
-                    .deploy_data
-                    .cmd_overrides
-                    .hostname
-                    .as_deref()
-                    .unwrap_or(&queued.deploy_data.node.node_settings.hostname)
-                    == hostname
-            }) {
-                queue.push((data, deriver));
-            } else {
-                remote_builds.push(vec![(data, deriver)]);
-            }
+            remote_builds
+                .entry(data.deploy_data.node_name)
+                .or_default()
+                .push((data, deriver));
         } else {
             local_builds.push((data, deriver));
         }
     }
 
-    let remote = join_all(remote_builds.into_iter().map(|queue| async move {
+    let remote = join_all(remote_builds.into_values().map(|queue| async move {
         for (data, deriver) in queue {
             if !data.supports_flakes {
                 warn!("remote builds using non-flake nix are experimental");
