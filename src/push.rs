@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: MPL-2.0
 
-use futures_util::future::try_join_all;
+use futures_util::future::{join_all, try_join_all};
 use log::{debug, info, warn};
 use std::ffi::OsStr;
 use std::path::Path;
@@ -642,7 +642,7 @@ pub async fn build_and_push_profiles(
         }
     }
 
-    let remote = try_join_all(remote_builds.into_iter().map(|queue| async move {
+    let remote = join_all(remote_builds.into_iter().map(|queue| async move {
         for (data, deriver) in queue {
             if !data.supports_flakes {
                 warn!("remote builds using non-flake nix are experimental");
@@ -668,7 +668,14 @@ pub async fn build_and_push_profiles(
         Ok::<(), BuildAndPushProfileError>(())
     };
 
-    tokio::try_join!(remote, local)?;
+    // Do not cancel other hosts when one of them fails. Nix processes should be
+    // allowed to finish and report their result, matching the upstream JoinSet
+    // orchestration.
+    let (remote_results, local_result) = tokio::join!(remote, local);
+    for result in remote_results {
+        result?;
+    }
+    local_result?;
     Ok(())
 }
 
@@ -773,7 +780,7 @@ pub async fn push_profiles(datas: &[PushProfileData<'_>]) -> Result<(), PushProf
         }
     }
 
-    try_join_all(copy_groups.into_iter().map(|group| async move {
+    let results = join_all(copy_groups.into_iter().map(|group| async move {
         let profiles_str = group
             .indexes
             .iter()
@@ -824,7 +831,13 @@ pub async fn push_profiles(datas: &[PushProfileData<'_>]) -> Result<(), PushProf
             })?;
         Ok::<(), PushProfileError>(())
     }))
-    .await?;
+    .await;
+
+    // All copies are started together and allowed to complete even if another
+    // destination fails.
+    for result in results {
+        result?;
+    }
 
     Ok(())
 }
