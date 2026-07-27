@@ -926,14 +926,25 @@ async fn run_deploy(
     deploy::push::build_and_push_profiles(&push_profile_datas)
         .await
         .map_err(|e| {
-            let node_names = e.node_context().map(str::to_string).unwrap_or_else(|| {
+            let all_node_names = || {
                 push_profile_datas
                     .iter()
                     .map(|d| d.deploy_data.node_name.to_string())
                     .collect::<Vec<_>>()
                     .join(", ")
-            });
-            RunDeployError::BuildProfile(node_names, e)
+            };
+            match e {
+                deploy::push::BuildAndPushProfileError::Build(source) => {
+                    RunDeployError::BuildProfile(all_node_names(), source)
+                }
+                deploy::push::BuildAndPushProfileError::Push(source) => {
+                    let node_names = source
+                        .node_context()
+                        .map(str::to_string)
+                        .unwrap_or_else(all_node_names);
+                    RunDeployError::PushProfile(node_names, source)
+                }
+            }
         })?;
 
     let mut succeeded: Vec<(&deploy::DeployData, &deploy::DeployDefs)> = vec![];

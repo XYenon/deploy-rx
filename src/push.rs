@@ -92,6 +92,14 @@ pub enum PushProfileError {
     PathInfo(#[from] command::CommandError<PathInfoError>),
 }
 
+#[derive(Error, Debug)]
+pub enum BuildAndPushProfileError {
+    #[error("Failed to build profile: {0}")]
+    Build(PushProfileError),
+    #[error("Failed to push profile: {0}")]
+    Push(PushProfileError),
+}
+
 impl PushProfileError {
     pub fn node_context(&self) -> Option<&str> {
         match self {
@@ -101,6 +109,7 @@ impl PushProfileError {
     }
 }
 
+#[derive(Clone, Copy)]
 pub struct PushProfileData<'a> {
     pub supports_flakes: bool,
     pub check_sigs: bool,
@@ -592,8 +601,10 @@ pub async fn build_profiles(datas: &[PushProfileData<'_>]) -> Result<(), PushPro
 /// parallel with the remote build queues and is copied as soon as it finishes.
 pub async fn build_and_push_profiles(
     datas: &[PushProfileData<'_>],
-) -> Result<(), PushProfileError> {
-    let derivations: Vec<String> = try_join_all(datas.iter().map(resolve_derivation)).await?;
+) -> Result<(), BuildAndPushProfileError> {
+    let derivations: Vec<String> = try_join_all(datas.iter().map(resolve_derivation))
+        .await
+        .map_err(BuildAndPushProfileError::Build)?;
 
     let mut remote_builds: Vec<Vec<(&PushProfileData<'_>, &str)>> = Vec::new();
     let mut local_builds: Vec<(&PushProfileData<'_>, &str)> = Vec::new();
@@ -636,21 +647,25 @@ pub async fn build_and_push_profiles(
             if !data.supports_flakes {
                 warn!("remote builds using non-flake nix are experimental");
             }
-            build_profile_remotely(data, deriver).await?;
+            build_profile_remotely(data, deriver)
+                .await
+                .map_err(BuildAndPushProfileError::Build)?;
         }
-        Ok::<(), PushProfileError>(())
+        Ok::<(), BuildAndPushProfileError>(())
     }));
 
     let local = async {
         if !local_builds.is_empty() {
-            build_profiles_locally(&local_builds).await?;
-            let local_datas: Vec<PushProfileData<'_>> = local_builds
-                .into_iter()
-                .map(|(data, _)| PushProfileData { ..*data })
-                .collect();
-            push_profiles(&local_datas).await?;
+            build_profiles_locally(&local_builds)
+                .await
+                .map_err(BuildAndPushProfileError::Build)?;
+            let local_datas: Vec<PushProfileData<'_>> =
+                local_builds.into_iter().map(|(data, _)| *data).collect();
+            push_profiles(&local_datas)
+                .await
+                .map_err(BuildAndPushProfileError::Push)?;
         }
-        Ok::<(), PushProfileError>(())
+        Ok::<(), BuildAndPushProfileError>(())
     };
 
     tokio::try_join!(remote, local)?;
