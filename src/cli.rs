@@ -934,8 +934,8 @@ async fn run_deploy(
                     .join(", ")
             };
             match e {
-                deploy::push::BuildAndPushProfileError::Build(source) => {
-                    RunDeployError::BuildProfile(all_node_names(), source)
+                deploy::push::BuildAndPushProfileError::Build { nodes, source } => {
+                    RunDeployError::BuildProfile(nodes, source)
                 }
                 deploy::push::BuildAndPushProfileError::Push(source) => {
                     let node_names = source

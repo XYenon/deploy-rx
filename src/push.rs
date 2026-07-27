@@ -177,8 +177,11 @@ pub enum PushProfileError {
 
 #[derive(Error, Debug)]
 pub enum BuildAndPushProfileError {
-    #[error("Failed to build profile: {0}")]
-    Build(PushProfileError),
+    #[error("Failed to build profile on {nodes}: {source}")]
+    Build {
+        nodes: String,
+        source: PushProfileError,
+    },
     #[error("Failed to push profile: {0}")]
     Push(PushProfileError),
 }
@@ -721,9 +724,15 @@ pub async fn build_and_push_profiles(
     datas: &[PushProfileData<'_>],
 ) -> Result<(), BuildAndPushProfileError> {
     let progress = MultiProgress::new();
-    let derivations: Vec<String> = try_join_all(datas.iter().map(resolve_derivation))
-        .await
-        .map_err(BuildAndPushProfileError::Build)?;
+    let derivations: Vec<String> = try_join_all(datas.iter().map(|data| async move {
+        resolve_derivation(data)
+            .await
+            .map_err(|source| BuildAndPushProfileError::Build {
+                nodes: data.deploy_data.node_name.to_string(),
+                source,
+            })
+    }))
+    .await?;
 
     // Group by node, as upstream does: profiles_order is defined per node and
     // therefore must remain sequential within that node's queue.
@@ -761,7 +770,10 @@ pub async fn build_and_push_profiles(
                     ));
                     build_profile_remotely_with_progress(data, deriver, Some(&pb))
                         .await
-                        .map_err(BuildAndPushProfileError::Build)?;
+                        .map_err(|source| BuildAndPushProfileError::Build {
+                            nodes: data.deploy_data.node_name.to_string(),
+                            source,
+                        })?;
                 }
                 Ok::<(), BuildAndPushProfileError>(())
             }
@@ -773,12 +785,25 @@ pub async fn build_and_push_profiles(
 
     let local = async {
         if !local_builds.is_empty() {
+            let local_nodes = local_builds
+                .iter()
+                .map(|(data, _)| data.deploy_data.node_name)
+                .fold(Vec::new(), |mut nodes, node| {
+                    if !nodes.contains(&node) {
+                        nodes.push(node);
+                    }
+                    nodes
+                })
+                .join(", ");
             let pb = progress.add(ProgressBar::new_spinner().with_style(progress_style()));
             pb.enable_steady_tick(std::time::Duration::from_millis(80));
             pb.set_prefix("Building local profiles");
             let build_result = build_profiles_locally_with_progress(&local_builds, Some(&pb))
                 .await
-                .map_err(BuildAndPushProfileError::Build);
+                .map_err(|source| BuildAndPushProfileError::Build {
+                    nodes: local_nodes,
+                    source,
+                });
             if let Err(error) = build_result {
                 let result = Err(error);
                 finish_progress(&pb, &result);
