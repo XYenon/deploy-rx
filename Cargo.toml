@@ -16,6 +16,7 @@ dirs = "6"
 flexi_logger = "0.31"
 fork = "0.2"
 futures-util = "0.3.31"
+indicatif = { version = "0.17.11", features = ["tokio"] }
 log = "0.4"
 merge = "0.1.0"
 notify = "8.0"

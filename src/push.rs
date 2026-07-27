@@ -3,13 +3,95 @@
 // SPDX-License-Identifier: MPL-2.0
 
 use futures_util::future::{join_all, try_join_all};
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use log::{debug, info, warn};
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::path::Path;
 use std::process::{Command as StdCommand, Stdio};
 use thiserror::Error;
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
+
+fn progress_style() -> ProgressStyle {
+    ProgressStyle::with_template("{spinner:.blue} {prefix} │ {msg}")
+        .expect("valid progress template")
+        .tick_strings(&["⢎ ", "⠎⠁", "⠊⠑", "⠈⠱", " ⡱", "⢀⡰", "⢄⡠", "⢆⡀"])
+}
+
+fn finish_progress(pb: &ProgressBar, result: &Result<(), impl std::fmt::Display>) {
+    match result {
+        Ok(()) => pb.finish_with_message("Done!"),
+        Err(error) => pb.abandon_with_message(format!("Error: {error}")),
+    }
+}
+
+async fn run_nix_with_progress<
+    T: command::HasCommandError + std::fmt::Debug + std::fmt::Display,
+>(
+    mut nix_command: Command,
+    pb: &ProgressBar,
+) -> Result<(), command::CommandError<T>> {
+    nix_command
+        .arg("--log-format")
+        .arg("internal-json")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    debug!("nix command: {:?}", nix_command);
+
+    let command_debug = format!("{:?}", nix_command);
+    let mut child = nix_command
+        .spawn()
+        .map_err(command::CommandError::RunError)?;
+    let stdout = child.stdout.take().expect("piped stdout");
+    let stderr = child.stderr.take().expect("piped stderr");
+    let mut stdout = BufReader::new(stdout).lines();
+    let mut stderr = BufReader::new(stderr).lines();
+    let mut stderr_output = Vec::new();
+    let mut stdout_done = false;
+    let mut stderr_done = false;
+
+    while !stdout_done || !stderr_done {
+        tokio::select! {
+            line = stdout.next_line(), if !stdout_done => match line.map_err(command::CommandError::RunError)? {
+                Some(line) => if !line.is_empty() { pb.set_message(line); },
+                None => stdout_done = true,
+            },
+            line = stderr.next_line(), if !stderr_done => match line.map_err(command::CommandError::RunError)? {
+                Some(line) => {
+                    stderr_output.extend_from_slice(line.as_bytes());
+                    stderr_output.push(b'\n');
+                    let message = line.strip_prefix("@nix ").unwrap_or(&line);
+                    if let Ok(event) = serde_json::from_str::<serde_json::Value>(message) {
+                        if let Some(text) = event.get("msg").and_then(|value| value.as_str()) {
+                            pb.set_message(text.to_string());
+                        }
+                    } else if !line.is_empty() {
+                        pb.set_message(line);
+                    }
+                },
+                None => stderr_done = true,
+            },
+        }
+    }
+
+    let status = child
+        .wait()
+        .await
+        .map_err(command::CommandError::RunError)?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(command::CommandError::Exit(
+            std::process::Output {
+                status,
+                stdout: Vec::new(),
+                stderr: stderr_output,
+            },
+            command_debug,
+        ))
+    }
+}
 
 use crate::command;
 
@@ -235,6 +317,14 @@ pub async fn build_profile_remotely(
     data: &PushProfileData<'_>,
     derivation_name: &str,
 ) -> Result<(), PushProfileError> {
+    build_profile_remotely_with_progress(data, derivation_name, None).await
+}
+
+async fn build_profile_remotely_with_progress(
+    data: &PushProfileData<'_>,
+    derivation_name: &str,
+    progress: Option<&ProgressBar>,
+) -> Result<(), PushProfileError> {
     info!(
         "Building profile `{}.{}` on remote host",
         data.deploy_data.node_name, data.deploy_data.profile_name
@@ -260,12 +350,19 @@ pub async fn build_profile_remotely(
         .arg(&store_address)
         .arg("--derivation")
         .arg(derivation_name)
-        .env("NIX_SSHOPTS", ssh_opts_str.clone())
-        .stdout(Stdio::null());
-    command::Command::new(copy_command)
-        .status()
-        .await
-        .map_err(PushProfileError::Copy)?;
+        .env("NIX_SSHOPTS", ssh_opts_str.clone());
+    if let Some(pb) = progress {
+        pb.set_message("Copying derivation...");
+        run_nix_with_progress::<CopyError>(copy_command, pb)
+            .await
+            .map_err(PushProfileError::Copy)?;
+    } else {
+        copy_command.stdout(Stdio::null());
+        command::Command::new(copy_command)
+            .status()
+            .await
+            .map_err(PushProfileError::Copy)?;
+    }
 
     let mut build_command = Command::new("nix");
     build_command
@@ -280,7 +377,14 @@ pub async fn build_profile_remotely(
         .args(data.extra_build_args)
         .env("NIX_SSHOPTS", ssh_opts_str.clone());
 
-    run_build_command(build_command, data.build_tree && data.supports_flakes).await?;
+    if let Some(pb) = progress {
+        pb.set_message("Building...");
+        run_nix_with_progress::<BuildError>(build_command, pb)
+            .await
+            .map_err(PushProfileError::Build)?;
+    } else {
+        run_build_command(build_command, data.build_tree && data.supports_flakes).await?;
+    }
 
     Ok(())
 }
@@ -480,6 +584,13 @@ fn make_build_command(
 pub async fn build_profiles_locally(
     items: &[(&PushProfileData<'_>, &str)],
 ) -> Result<(), PushProfileError> {
+    build_profiles_locally_with_progress(items, None).await
+}
+
+async fn build_profiles_locally_with_progress(
+    items: &[(&PushProfileData<'_>, &str)],
+    progress: Option<&ProgressBar>,
+) -> Result<(), PushProfileError> {
     if items.is_empty() {
         return Ok(());
     }
@@ -551,7 +662,13 @@ pub async fn build_profiles_locally(
         );
     }
 
-    run_build_command(build_command, data.build_tree && data.supports_flakes).await?;
+    if let Some(pb) = progress.filter(|_| data.supports_flakes) {
+        run_nix_with_progress::<BuildError>(build_command, pb)
+            .await
+            .map_err(PushProfileError::Build)?;
+    } else {
+        run_build_command(build_command, data.build_tree && data.supports_flakes).await?;
+    }
 
     for &(d, _) in items {
         check_and_sign_profile(d).await?;
@@ -603,6 +720,7 @@ pub async fn build_profiles(datas: &[PushProfileData<'_>]) -> Result<(), PushPro
 pub async fn build_and_push_profiles(
     datas: &[PushProfileData<'_>],
 ) -> Result<(), BuildAndPushProfileError> {
+    let progress = MultiProgress::new();
     let derivations: Vec<String> = try_join_all(datas.iter().map(resolve_derivation))
         .await
         .map_err(BuildAndPushProfileError::Build)?;
@@ -628,26 +746,48 @@ pub async fn build_and_push_profiles(
         }
     }
 
-    let remote = join_all(remote_builds.into_values().map(|queue| async move {
-        for (data, deriver) in queue {
-            if !data.supports_flakes {
-                warn!("remote builds using non-flake nix are experimental");
+    let remote = join_all(remote_builds.into_values().map(|queue| {
+        let pb = progress.add(ProgressBar::new_spinner().with_style(progress_style()));
+        pb.enable_steady_tick(std::time::Duration::from_millis(80));
+        async move {
+            let result = async {
+                for (data, deriver) in queue {
+                    if !data.supports_flakes {
+                        warn!("remote builds using non-flake nix are experimental");
+                    }
+                    pb.set_prefix(format!(
+                        "Building profile '{}' on host '{}'",
+                        data.deploy_data.profile_name, data.deploy_data.node_name
+                    ));
+                    build_profile_remotely_with_progress(data, deriver, Some(&pb))
+                        .await
+                        .map_err(BuildAndPushProfileError::Build)?;
+                }
+                Ok::<(), BuildAndPushProfileError>(())
             }
-            build_profile_remotely(data, deriver)
-                .await
-                .map_err(BuildAndPushProfileError::Build)?;
+            .await;
+            finish_progress(&pb, &result);
+            result
         }
-        Ok::<(), BuildAndPushProfileError>(())
     }));
 
     let local = async {
         if !local_builds.is_empty() {
-            build_profiles_locally(&local_builds)
+            let pb = progress.add(ProgressBar::new_spinner().with_style(progress_style()));
+            pb.enable_steady_tick(std::time::Duration::from_millis(80));
+            pb.set_prefix("Building local profiles");
+            let build_result = build_profiles_locally_with_progress(&local_builds, Some(&pb))
                 .await
-                .map_err(BuildAndPushProfileError::Build)?;
+                .map_err(BuildAndPushProfileError::Build);
+            if let Err(error) = build_result {
+                let result = Err(error);
+                finish_progress(&pb, &result);
+                return result;
+            }
+            pb.finish_with_message("Built!");
             let local_datas: Vec<PushProfileData<'_>> =
                 local_builds.into_iter().map(|(data, _)| *data).collect();
-            push_profiles(&local_datas)
+            push_profiles_with_progress(&local_datas, Some(&progress))
                 .await
                 .map_err(BuildAndPushProfileError::Push)?;
         }
@@ -741,6 +881,13 @@ fn copy_group_nodes(datas: &[PushProfileData<'_>], group: &CopyGroup) -> String 
 }
 
 pub async fn push_profiles(datas: &[PushProfileData<'_>]) -> Result<(), PushProfileError> {
+    push_profiles_with_progress(datas, None).await
+}
+
+async fn push_profiles_with_progress(
+    datas: &[PushProfileData<'_>],
+    progress: Option<&MultiProgress>,
+) -> Result<(), PushProfileError> {
     let mut copy_groups: Vec<CopyGroup> = Vec::new();
 
     for (index, data) in datas.iter().enumerate() {
@@ -806,15 +953,27 @@ pub async fn push_profiles(datas: &[PushProfileData<'_>]) -> Result<(), PushProf
             })
             .collect();
 
-        command::Command::new(make_copy_command(&group.key, &paths))
-            .status()
-            .await
-            .map_err(|source| PushProfileError::CopyGroup {
-                nodes: nodes_str.clone(),
-                target: target.clone(),
-                profiles: profiles_str.clone(),
-                source: Box::new(source),
-            })?;
+        let result = if let Some(progress) = progress {
+            let pb = progress.add(ProgressBar::new_spinner().with_style(progress_style()));
+            pb.enable_steady_tick(std::time::Duration::from_millis(80));
+            pb.set_prefix(format!("Copying profiles to host '{}'", group.key.hostname));
+            let result =
+                run_nix_with_progress::<CopyError>(make_copy_command(&group.key, &paths), &pb)
+                    .await;
+            finish_progress(&pb, &result);
+            result
+        } else {
+            command::Command::new(make_copy_command(&group.key, &paths))
+                .status()
+                .await
+                .map(|_| ())
+        };
+        result.map_err(|source| PushProfileError::CopyGroup {
+            nodes: nodes_str.clone(),
+            target: target.clone(),
+            profiles: profiles_str.clone(),
+            source: Box::new(source),
+        })?;
         Ok::<(), PushProfileError>(())
     }))
     .await;
