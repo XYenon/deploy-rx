@@ -262,6 +262,7 @@ dependencies = [
  "rpassword",
  "serde",
  "serde_json",
+ "shlex",
  "signal-hook",
  "tempfile",
  "thiserror",

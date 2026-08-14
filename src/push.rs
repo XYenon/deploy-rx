@@ -121,6 +121,8 @@ pub enum PushProfileError {
     BuildStdoutInvalidDerivation,
     #[error("The legacy nix-build command cannot build the non-default `{0}` derivation output")]
     LegacyNonDefaultOutput(String),
+    #[error("Failed to encode SSH options: {0}")]
+    SshOptionsQuote(#[from] shlex::QuoteError),
 }
 
 impl PushProfileError {
@@ -321,16 +323,20 @@ fn make_remote_build_command(
     build_command
 }
 
-fn remote_store(data: &PushProfileData<'_>) -> (String, String) {
+fn encode_ssh_opts(ssh_opts: &[String]) -> Result<String, PushProfileError> {
+    Ok(shlex::try_join(ssh_opts.iter().map(String::as_str))?)
+}
+
+fn remote_store(data: &PushProfileData<'_>) -> Result<(String, String), PushProfileError> {
     let hostname = match data.deploy_data.cmd_overrides.hostname {
         Some(ref x) => x,
         None => &data.deploy_data.node.node_settings.hostname,
     };
 
-    (
+    Ok((
         format!("ssh-ng://{}@{}", data.deploy_defs.ssh_user, hostname),
-        data.deploy_data.merged_settings.ssh_opts.join(" "),
-    )
+        encode_ssh_opts(&data.deploy_data.merged_settings.ssh_opts)?,
+    ))
 }
 
 pub async fn build_profile_remotely(
@@ -342,7 +348,7 @@ pub async fn build_profile_remotely(
         data.deploy_data.node_name, data.deploy_data.profile_name
     );
 
-    let (store_address, ssh_opts_str) = remote_store(data);
+    let (store_address, ssh_opts_str) = remote_store(data)?;
 
     // copy the derivation to remote host so it can be built there
     command::Command::new(make_remote_derivation_copy_command(
@@ -408,7 +414,7 @@ async fn check_and_sign_remote_profile(
     data: &PushProfileData<'_>,
     closure: &str,
 ) -> Result<(), PushProfileError> {
-    let (store_address, ssh_opts) = remote_store(data);
+    let (store_address, ssh_opts) = remote_store(data)?;
 
     // Fetch both activation-script entries in one request so a later transport
     // failure cannot be misclassified as a missing script.
@@ -937,27 +943,19 @@ struct CopyGroup {
     indexes: Vec<usize>,
 }
 
-fn copy_group_key(data: &PushProfileData<'_>) -> CopyGroupKey {
+fn copy_group_key(data: &PushProfileData<'_>) -> Result<CopyGroupKey, PushProfileError> {
     let hostname = match data.deploy_data.cmd_overrides.hostname {
         Some(ref x) => x,
         None => &data.deploy_data.node.node_settings.hostname,
     };
 
-    CopyGroupKey {
+    Ok(CopyGroupKey {
         hostname: hostname.clone(),
         ssh_user: data.deploy_defs.ssh_user.clone(),
-        ssh_opts: data
-            .deploy_data
-            .merged_settings
-            .ssh_opts
-            // This should provide some extra safety, but it also breaks for some reason, oh well
-            // .iter()
-            // .map(|x| format!("'{}'", x))
-            // .collect::<Vec<String>>()
-            .join(" "),
+        ssh_opts: encode_ssh_opts(&data.deploy_data.merged_settings.ssh_opts)?,
         fast_connection: data.deploy_data.merged_settings.fast_connection,
         check_sigs: data.check_sigs,
-    }
+    })
 }
 
 fn make_copy_command(key: &CopyGroupKey, paths: &[&str]) -> Command {
@@ -1013,7 +1011,7 @@ pub async fn push_profiles(
             continue;
         }
 
-        let key = copy_group_key(data);
+        let key = copy_group_key(data)?;
         if let Some(group) = copy_groups.iter_mut().find(|group| group.key == key) {
             group.indexes.push(index);
         } else {
@@ -1103,6 +1101,19 @@ mod tests {
         let mut permissions = std::fs::metadata(path).unwrap().permissions();
         permissions.set_mode(0o755);
         std::fs::set_permissions(path, permissions).unwrap();
+    }
+
+    #[test]
+    fn ssh_option_encoding_preserves_argument_boundaries() {
+        let options = vec![
+            "-o".to_string(),
+            "ProxyCommand=ssh jump host -W %h:%p".to_string(),
+            "-i".to_string(),
+            "/keys/user's key".to_string(),
+        ];
+
+        let encoded = encode_ssh_opts(&options).unwrap();
+        assert_eq!(shlex::split(&encoded).unwrap(), options);
     }
 
     #[test]

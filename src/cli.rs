@@ -29,6 +29,10 @@ fn add_nix_command_and_flakes(cmd: &mut Command) {
     ]);
 }
 
+fn parse_ssh_opts(value: &str) -> Result<Vec<String>, String> {
+    shlex::split(value).ok_or_else(|| "SSH options contain invalid shell quoting".to_string())
+}
+
 /// Simple Rust rewrite of a simple Nix Flake deployment tool
 #[derive(Parser, Debug, Clone)]
 #[command(version = "1.0", author = "Serokell <https://serokell.io/>")]
@@ -97,8 +101,8 @@ pub struct Opts {
     #[arg(long)]
     profile_user: Option<String>,
     /// Override the SSH options used
-    #[arg(long, allow_hyphen_values = true)]
-    ssh_opts: Option<String>,
+    #[arg(long, allow_hyphen_values = true, value_parser = parse_ssh_opts)]
+    ssh_opts: Option<Vec<String>>,
     /// Override if the connecting to the target node should be considered fast
     #[arg(long)]
     fast_connection: Option<bool>,
@@ -1035,6 +1039,24 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     #[cfg(unix)]
     use std::path::Path;
+
+    #[test]
+    fn parses_quoted_ssh_option_arguments() {
+        assert_eq!(
+            parse_ssh_opts("-o 'ProxyCommand=ssh jump host -W %h:%p' -i '/keys/key file'").unwrap(),
+            vec![
+                "-o",
+                "ProxyCommand=ssh jump host -W %h:%p",
+                "-i",
+                "/keys/key file",
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_unterminated_ssh_option_quotes() {
+        assert!(parse_ssh_opts("-o 'ProxyCommand=ssh jump").is_err());
+    }
 
     #[cfg(unix)]
     fn write_executable(path: &Path, contents: &str) {
