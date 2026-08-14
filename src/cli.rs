@@ -29,8 +29,13 @@ fn add_nix_command_and_flakes(cmd: &mut Command) {
     ]);
 }
 
-fn parse_ssh_opts(value: &str) -> Result<Vec<String>, String> {
-    shlex::split(value).ok_or_else(|| "SSH options contain invalid shell quoting".to_string())
+#[derive(Debug, Clone)]
+struct SshOpts(Vec<String>);
+
+fn parse_ssh_opts(value: &str) -> Result<SshOpts, String> {
+    shlex::split(value)
+        .map(SshOpts)
+        .ok_or_else(|| "SSH options contain invalid shell quoting".to_string())
 }
 
 /// Simple Rust rewrite of a simple Nix Flake deployment tool
@@ -102,7 +107,7 @@ pub struct Opts {
     profile_user: Option<String>,
     /// Override the SSH options used
     #[arg(long, allow_hyphen_values = true, value_parser = parse_ssh_opts)]
-    ssh_opts: Option<Vec<String>>,
+    ssh_opts: Option<SshOpts>,
     /// Override if the connecting to the target node should be considered fast
     #[arg(long)]
     fast_connection: Option<bool>,
@@ -1043,7 +1048,9 @@ mod tests {
     #[test]
     fn parses_quoted_ssh_option_arguments() {
         assert_eq!(
-            parse_ssh_opts("-o 'ProxyCommand=ssh jump host -W %h:%p' -i '/keys/key file'").unwrap(),
+            parse_ssh_opts("-o 'ProxyCommand=ssh jump host -W %h:%p' -i '/keys/key file'")
+                .unwrap()
+                .0,
             vec![
                 "-o",
                 "ProxyCommand=ssh jump host -W %h:%p",
@@ -1056,6 +1063,33 @@ mod tests {
     #[test]
     fn rejects_unterminated_ssh_option_quotes() {
         assert!(parse_ssh_opts("-o 'ProxyCommand=ssh jump").is_err());
+    }
+
+    #[test]
+    fn parses_hyphen_prefixed_ssh_options_from_cli() {
+        let opts = Opts::try_parse_from([
+            "deploy",
+            "-s",
+            ".#profile",
+            "--ssh-opts",
+            "-p 22 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null",
+            "--",
+            "--offline",
+        ])
+        .unwrap();
+
+        assert_eq!(
+            opts.ssh_opts.unwrap().0,
+            vec![
+                "-p",
+                "22",
+                "-o",
+                "StrictHostKeyChecking=no",
+                "-o",
+                "UserKnownHostsFile=/dev/null",
+            ]
+        );
+        assert_eq!(opts.extra_build_args, vec!["--offline"]);
     }
 
     #[cfg(unix)]
@@ -1729,7 +1763,7 @@ pub async fn run(args: Option<&ArgMatches>) -> Result<(), RunError> {
     let cmd_overrides = deploy::CmdOverrides {
         ssh_user: opts.ssh_user,
         profile_user: opts.profile_user,
-        ssh_opts: opts.ssh_opts,
+        ssh_opts: opts.ssh_opts.map(|opts| opts.0),
         fast_connection: opts.fast_connection,
         auto_rollback: opts.auto_rollback,
         hostname: opts.hostname,
