@@ -64,6 +64,14 @@ impl command::HasCommandError for PathInfoError {
 }
 
 #[derive(Error, Debug)]
+pub enum StoreLsError {}
+impl command::HasCommandError for StoreLsError {
+    fn title() -> String {
+        "Nix store ls".to_string()
+    }
+}
+
+#[derive(Error, Debug)]
 pub enum PushProfileError {
     #[error("{0}")]
     ShowDerivation(#[from] command::CommandError<ShowDerivationError>),
@@ -91,6 +99,10 @@ pub enum PushProfileError {
 
     #[error("{0}")]
     PathInfo(#[from] command::CommandError<PathInfoError>),
+    #[error("{0}")]
+    StoreLs(#[from] command::CommandError<StoreLsError>),
+    #[error("Failed to parse the JSON output of nix store ls: {0}")]
+    StoreLsParse(serde_json::Error),
     #[error("Nix build command output contained an invalid UTF-8 sequence: {0}")]
     BuildStdoutUtf8(std::str::Utf8Error),
     #[error("Nix build command succeeded but printed no output path")]
@@ -307,6 +319,18 @@ fn make_remote_build_command(
     build_command
 }
 
+fn remote_store(data: &PushProfileData<'_>) -> (String, String) {
+    let hostname = match data.deploy_data.cmd_overrides.hostname {
+        Some(ref x) => x,
+        None => &data.deploy_data.node.node_settings.hostname,
+    };
+
+    (
+        format!("ssh-ng://{}@{}", data.deploy_defs.ssh_user, hostname),
+        data.deploy_data.merged_settings.ssh_opts.join(" "),
+    )
+}
+
 pub async fn build_profile_remotely(
     data: &PushProfileData<'_>,
     derivation_name: &str,
@@ -316,14 +340,7 @@ pub async fn build_profile_remotely(
         data.deploy_data.node_name, data.deploy_data.profile_name
     );
 
-    // TODO: this should probably be handled more nicely during 'data' construction
-    let hostname = match data.deploy_data.cmd_overrides.hostname {
-        Some(ref x) => x,
-        None => &data.deploy_data.node.node_settings.hostname,
-    };
-    let store_address = format!("ssh-ng://{}@{}", data.deploy_defs.ssh_user, hostname);
-
-    let ssh_opts_str = data.deploy_data.merged_settings.ssh_opts.join(" ");
+    let (store_address, ssh_opts_str) = remote_store(data);
 
     // copy the derivation to remote host so it can be built there
     command::Command::new(make_remote_derivation_copy_command(
@@ -345,6 +362,92 @@ pub async fn build_profile_remotely(
     let stdout = run_build_command(build_command, data.build_tree && data.supports_flakes).await?;
 
     parse_build_json(&stdout, &[derivation_name]).map(|mut paths| paths.remove(0))
+}
+
+fn make_remote_store_ls_command(store_address: &str, ssh_opts: &str, path: &str) -> Command {
+    let mut command = Command::new("nix");
+    command
+        .arg("--experimental-features")
+        .arg("nix-command")
+        .arg("store")
+        .arg("ls")
+        .arg("--json")
+        .arg("--store")
+        .arg(store_address)
+        .arg(path)
+        .env("NIX_SSHOPTS", ssh_opts)
+        .stdout(Stdio::null());
+    command
+}
+
+fn make_remote_sign_command(
+    store_address: &str,
+    ssh_opts: &str,
+    key_file: &str,
+    closure: &str,
+) -> Command {
+    let mut command = Command::new("nix");
+    command
+        .arg("--experimental-features")
+        .arg("nix-command")
+        .arg("store")
+        .arg("sign")
+        .arg("--store")
+        .arg(store_address)
+        .arg("--recursive")
+        .arg("--key-file")
+        .arg(key_file)
+        .arg(closure)
+        .env("NIX_SSHOPTS", ssh_opts);
+    command
+}
+
+async fn check_and_sign_remote_profile(
+    data: &PushProfileData<'_>,
+    closure: &str,
+) -> Result<(), PushProfileError> {
+    let (store_address, ssh_opts) = remote_store(data);
+
+    // Fetch both activation-script entries in one request so a later transport
+    // failure cannot be misclassified as a missing script.
+    let output = command::Command::new(make_remote_store_ls_command(
+        &store_address,
+        &ssh_opts,
+        closure,
+    ))
+    .run()
+    .await
+    .map_err(PushProfileError::StoreLs)?;
+    let listing: serde_json::Value =
+        serde_json::from_slice(&output.stdout).map_err(PushProfileError::StoreLsParse)?;
+    let entries = listing
+        .get("entries")
+        .and_then(serde_json::Value::as_object);
+
+    if !entries.is_some_and(|entries| entries.contains_key("deploy-rx-activate")) {
+        return Err(PushProfileError::DeployRsActivateDoesntExist);
+    }
+    if !entries.is_some_and(|entries| entries.contains_key("activate-rs")) {
+        return Err(PushProfileError::ActivateRsDoesntExist);
+    }
+
+    if let Ok(local_key) = std::env::var("LOCAL_KEY") {
+        info!(
+            "Signing key present! Signing profile `{}` for node `{}`",
+            data.deploy_data.profile_name, data.deploy_data.node_name
+        );
+        command::Command::new(make_remote_sign_command(
+            &store_address,
+            &ssh_opts,
+            &local_key,
+            closure,
+        ))
+        .status()
+        .await
+        .map_err(PushProfileError::Sign)?;
+    }
+
+    Ok(())
 }
 
 /// Resolve the derivation path for a profile, returning the derivation name suitable for building.
@@ -764,7 +867,9 @@ pub async fn build_profiles(
             if !data.supports_flakes {
                 warn!("remote builds using non-flake nix are experimental");
             }
-            closures[index] = Some(build_profile_remotely(data, deriver).await?);
+            let closure = build_profile_remotely(data, deriver).await?;
+            check_and_sign_remote_profile(data, &closure).await?;
+            closures[index] = Some(closure);
         } else {
             local_builds.push((data, deriver.as_str()));
             local_indexes.push(index);
@@ -1070,6 +1175,47 @@ mod tests {
                 "--store",
                 "ssh-ng://deploy@example.com",
                 "--json",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_remote_profile_check_and_sign_commands_use_remote_store() {
+        let store = "ssh-ng://deploy@example.com";
+        let ssh_opts = "-p 2222";
+        let closure = "/nix/store/abc-profile";
+        let check =
+            make_remote_store_ls_command(store, ssh_opts, "/nix/store/abc-profile/activate-rs");
+        let sign = make_remote_sign_command(store, ssh_opts, "/keys/cache.sec", closure);
+
+        assert_eq!(
+            get_args(&check),
+            vec![
+                "nix",
+                "--experimental-features",
+                "nix-command",
+                "store",
+                "ls",
+                "--json",
+                "--store",
+                "ssh-ng://deploy@example.com",
+                "/nix/store/abc-profile/activate-rs",
+            ]
+        );
+        assert_eq!(
+            get_args(&sign),
+            vec![
+                "nix",
+                "--experimental-features",
+                "nix-command",
+                "store",
+                "sign",
+                "--store",
+                "ssh-ng://deploy@example.com",
+                "--recursive",
+                "--key-file",
+                "/keys/cache.sec",
+                "/nix/store/abc-profile",
             ]
         );
     }
