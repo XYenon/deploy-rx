@@ -5,6 +5,9 @@
 name: CI
 
 on:
+  push:
+    branches:
+      - master
   pull_request:
 
 jobs:
