@@ -9,6 +9,10 @@ use std::path::PathBuf;
 
 use crate::sudo::SudoCommand;
 
+fn default_output_name() -> String {
+    "out".to_string()
+}
+
 #[derive(Deserialize, Debug, Clone, Merge)]
 pub struct GenericSettings {
     #[serde(rename(deserialize = "sshUser"))]
@@ -68,6 +72,10 @@ pub struct ProfileSettings {
     /// is wire-format plumbing, not a user setting.
     #[serde(rename(deserialize = "drvPath"))]
     pub(crate) drv_path: Option<String>,
+    /// Output selected from `drv_path`. Like `drv_path`, this is populated by
+    /// the internal eval transformation and is not part of the public interface.
+    #[serde(default = "default_output_name", rename(deserialize = "outputName"))]
+    pub(crate) output_name: String,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -103,6 +111,7 @@ mod tests {
             serde_json::from_str(r#"{"path":"/nix/store/profile"}"#).unwrap();
 
         assert!(profile.tags.is_empty());
+        assert_eq!(profile.output_name, "out");
     }
 
     #[test]

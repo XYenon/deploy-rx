@@ -579,6 +579,7 @@ mod deploy_data_tests {
                 profile_path: Some("".to_string()),
                 tags: vec![],
                 drv_path: None,
+                output_name: "out".to_string(),
             },
             generic_settings: data::GenericSettings {
                 user: Some("root".to_string()),

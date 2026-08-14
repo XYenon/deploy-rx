@@ -7,7 +7,7 @@
 # cheap enough to run on every `nix flake check`.
 #
 # Asserts:
-#   - a derivation-typed `path` is rewritten to `{ path = outPath; drvPath = drvPath; }`.
+#   - a derivation-typed `path` exposes its outPath, drvPath, and selected output.
 #   - other profile attrs are preserved.
 #   - top-level deploy attrs are preserved.
 #   - a hand-written string-typed `path` passes through unchanged.
@@ -18,6 +18,9 @@ let
 
   # A real, cheap derivation to stand in for what `activate.nixos cfg` returns.
   fakeProfile = pkgs.runCommand "fake-deploy-rx-profile" { } "touch $out";
+  multiOutputProfile = pkgs.runCommand "fake-deploy-rx-multi-output-profile" {
+    outputs = [ "out" "dev" ];
+  } "touch $out $dev";
 
   derivationDeploy = {
     sshUser = "deployer";
@@ -27,6 +30,7 @@ let
         path = fakeProfile;
         sshUser = "root";
       };
+      profiles.dev.path = multiOutputProfile.dev;
     };
   };
 
@@ -43,11 +47,16 @@ let
   strOut = transformDeploy stringDeploy;
 
   drvProfile = drvOut.nodes.demo.profiles.system;
+  devProfile = drvOut.nodes.demo.profiles.dev;
   strProfile = strOut.nodes.demo.profiles.system;
 in
-# A derivation-typed path is split into outPath and drvPath.
+# A derivation-typed path is split into outPath, drvPath, and outputName.
 assert drvProfile.path == fakeProfile.outPath;
 assert drvProfile.drvPath == fakeProfile.drvPath;
+assert drvProfile.outputName == "out";
+assert devProfile.path == multiOutputProfile.dev.outPath;
+assert devProfile.drvPath == multiOutputProfile.dev.drvPath;
+assert devProfile.outputName == "dev";
 # Sibling attrs are preserved.
 assert drvProfile.sshUser == "root";
 assert drvOut.sshUser == "deployer";

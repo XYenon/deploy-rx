@@ -1068,6 +1068,7 @@ mod tests {
                 profile_path: None,
                 tags: tags.iter().map(|tag| tag.to_string()).collect(),
                 drv_path: None,
+                output_name: "out".to_string(),
             },
             generic_settings: empty_generic_settings(),
         }

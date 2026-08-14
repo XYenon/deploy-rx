@@ -115,10 +115,12 @@ pub enum PushProfileError {
     },
     #[error("Failed to parse the JSON output of nix build: {0}")]
     BuildStdoutParse(serde_json::Error),
-    #[error("Nix build JSON output did not contain an `out` path for derivation {0}")]
+    #[error("Nix build JSON output did not contain the requested derivation output {0}")]
     BuildStdoutMissingDerivation(String),
     #[error("Nix build JSON output contained an invalid derivation identity")]
     BuildStdoutInvalidDerivation,
+    #[error("The legacy nix-build command cannot build the non-default `{0}` derivation output")]
+    LegacyNonDefaultOutput(String),
 }
 
 impl PushProfileError {
@@ -468,7 +470,12 @@ pub async fn resolve_derivation(data: &PushProfileData<'_>) -> Result<String, Pu
     // the user wrote a literal store path string in their `deploy` attribute.
     if let Some(drv_path) = &profile_settings.drv_path {
         debug!("Using drvPath from flake: {}", drv_path);
-        return deriver_for_build(drv_path.clone(), supports_caret).await;
+        return deriver_for_build(
+            drv_path.clone(),
+            &profile_settings.output_name,
+            supports_caret,
+        )
+        .await;
     }
 
     debug!(
@@ -526,7 +533,7 @@ pub async fn resolve_derivation(data: &PushProfileData<'_>) -> Result<String, Pu
         format!("/nix/store/{}", deriver_key)
     };
 
-    deriver_for_build(deriver, supports_caret).await
+    deriver_for_build(deriver, &profile_settings.output_name, supports_caret).await
 }
 
 /// Picks the `nix build` argument shape for a given deriver, accounting for the
@@ -538,9 +545,15 @@ pub async fn resolve_derivation(data: &PushProfileData<'_>) -> Result<String, Pu
 /// realised output or errors out if the output is not yet built.
 async fn deriver_for_build(
     deriver: String,
+    output_name: &str,
     supports_caret: bool,
 ) -> Result<String, PushProfileError> {
     if !supports_caret {
+        if output_name != "out" {
+            return Err(PushProfileError::LegacyNonDefaultOutput(
+                output_name.to_string(),
+            ));
+        }
         return Ok(deriver);
     }
 
@@ -556,7 +569,11 @@ async fn deriver_for_build(
         .map_err(PushProfileError::PathInfo)?;
 
     if std::str::from_utf8(&path_info_output.stdout).map(|s| s.trim()) == Ok(deriver.as_str()) {
-        Ok(format!("{}^out", deriver))
+        Ok(format!("{}^{}", deriver, output_name))
+    } else if output_name != "out" {
+        Err(PushProfileError::LegacyNonDefaultOutput(
+            output_name.to_string(),
+        ))
     } else {
         Ok(deriver)
     }
@@ -708,29 +725,39 @@ fn json_drv_path(value: &serde_json::Value) -> Result<String, PushProfileError> 
 fn parse_build_json(stdout: &[u8], derivations: &[&str]) -> Result<Vec<String>, PushProfileError> {
     let results: Vec<serde_json::Value> =
         serde_json::from_slice(stdout).map_err(PushProfileError::BuildStdoutParse)?;
-    let mut outputs = HashMap::new();
+    let mut realised_outputs = HashMap::new();
 
     for result in results {
         let drv_path = result
             .get("drvPath")
             .ok_or(PushProfileError::BuildStdoutInvalidDerivation)?;
         let identity = json_drv_path(drv_path)?;
-        let output = result
+        let outputs = result
             .get("outputs")
-            .and_then(|outputs| outputs.get("out"))
-            .and_then(serde_json::Value::as_str)
+            .and_then(serde_json::Value::as_object)
             .ok_or_else(|| PushProfileError::BuildStdoutMissingDerivation(identity.clone()))?;
-        outputs.insert(identity, output.to_string());
+        for (output_name, output_path) in outputs {
+            let output_path = output_path
+                .as_str()
+                .ok_or_else(|| PushProfileError::BuildStdoutMissingDerivation(identity.clone()))?;
+            realised_outputs.insert(
+                (identity.clone(), output_name.clone()),
+                output_path.to_string(),
+            );
+        }
     }
 
     derivations
         .iter()
         .map(|derivation| {
-            let drv_path = derivation.strip_suffix("^out").unwrap_or(derivation);
-            outputs
-                .get(drv_path)
+            let (drv_path, output_name) =
+                derivation.rsplit_once('^').unwrap_or((derivation, "out"));
+            realised_outputs
+                .get(&(drv_path.to_string(), output_name.to_string()))
                 .cloned()
-                .ok_or_else(|| PushProfileError::BuildStdoutMissingDerivation(drv_path.to_string()))
+                .ok_or_else(|| {
+                    PushProfileError::BuildStdoutMissingDerivation((*derivation).to_string())
+                })
         })
         .collect()
 }
@@ -1389,6 +1416,52 @@ mod tests {
     }
 
     #[test]
+    fn parse_build_json_selects_requested_output() {
+        let stdout = br#"[{
+            "drvPath":"/nix/store/a.drv",
+            "outputs":{
+                "out":"/nix/store/a",
+                "dev":"/nix/store/a-dev"
+            }
+        }]"#;
+        let paths = parse_build_json(stdout, &["/nix/store/a.drv^dev"])
+            .expect("the requested non-default output must be selected");
+
+        assert_eq!(paths, vec!["/nix/store/a-dev"]);
+    }
+
+    #[test]
+    fn parse_build_json_selects_nested_dynamic_non_default_output() {
+        let stdout = br#"[{
+            "drvPath": {
+                "drvPath": "/nix/store/outer.drv",
+                "output": "out",
+                "outputPath": "/nix/store/generated.drv"
+            },
+            "outputs": {
+                "out":"/nix/store/final",
+                "dev":"/nix/store/final-dev"
+            }
+        }]"#;
+        let paths = parse_build_json(stdout, &["/nix/store/outer.drv^out^dev"])
+            .expect("the final output of a nested derivation must be selected");
+
+        assert_eq!(paths, vec!["/nix/store/final-dev"]);
+    }
+
+    #[tokio::test]
+    async fn legacy_build_rejects_non_default_output() {
+        let err = deriver_for_build("/nix/store/a.drv".to_string(), "dev", false)
+            .await
+            .expect_err("nix-build cannot reliably select a non-default output");
+
+        assert!(matches!(
+            err,
+            PushProfileError::LegacyNonDefaultOutput(output) if output == "dev"
+        ));
+    }
+
+    #[test]
     fn parse_build_json_rejects_missing_derivation() {
         let stdout = br#"[{"drvPath":"/nix/store/a.drv","outputs":{"out":"/nix/store/a"}}]"#;
         let err = parse_build_json(stdout, &["/nix/store/b.drv^out"])
@@ -1397,7 +1470,7 @@ mod tests {
         assert!(matches!(
             err,
             PushProfileError::BuildStdoutMissingDerivation(path)
-                if path == "/nix/store/b.drv"
+                if path == "/nix/store/b.drv^out"
         ));
     }
 
@@ -1583,6 +1656,7 @@ mod tests {
                 profile_path: None,
                 tags: vec![],
                 drv_path: None,
+                output_name: "out".to_string(),
             },
             generic_settings: empty_settings(),
         };
@@ -1631,6 +1705,7 @@ mod tests {
                 profile_path: None,
                 tags: vec![],
                 drv_path: None,
+                output_name: "out".to_string(),
             },
             generic_settings: empty_settings(),
         };
@@ -1683,6 +1758,7 @@ mod tests {
                 profile_path: None,
                 tags: vec![],
                 drv_path: None,
+                output_name: "out".to_string(),
             },
             generic_settings: empty_settings(),
         };
