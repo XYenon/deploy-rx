@@ -401,6 +401,7 @@ pub async fn deploy_profile(
     deploy_defs: &super::DeployDefs,
     dry_activate: bool,
     boot: bool,
+    test: bool,
     rollback_fresh_connection: bool,
     review_changes: bool,
 ) -> Result<(), DeployProfileError> {
@@ -423,6 +424,7 @@ pub async fn deploy_profile(
         review_changes,
         dry_activate,
         boot,
+        test,
         auto_rollback: deploy_data.merged_settings.auto_rollback.unwrap_or(true),
         magic_rollback: deploy_data.merged_settings.magic_rollback.unwrap_or(true),
         confirm_timeout: deploy_data.merged_settings.confirm_timeout.unwrap_or(30),

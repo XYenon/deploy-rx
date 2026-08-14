@@ -67,6 +67,7 @@
       activateValue,
       dryValue,
       bootValue,
+      testValue,
     }: let
       writeMode = value: ''
         ${pkgs.coreutils}/bin/mkdir -p ${lib.escapeShellArg (builtins.dirOf marker)}
@@ -78,6 +79,7 @@
         // {
           dryActivate = writeMode dryValue;
           boot = writeMode bootValue;
+          test = writeMode testValue;
         };
     in custom (pkgs.writeShellScriptBin "mode-aware-base" ''
       set -euo pipefail
@@ -165,6 +167,7 @@
           activateValue = "switch";
           dryValue = "dry";
           bootValue = "boot";
+          testValue = "test";
         };
         profiles.app.profilePath = "/home/${user}/.local/state/nix/profiles/mode-aware";
       };

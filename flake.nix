@@ -75,6 +75,9 @@
                             elif [[ "''${BOOT:-}" == "1" ]]
                             then
                                 ${customSelf.boot or "echo ${final.writeScript "activate" activate}"}
+                            elif [[ "''${TEST:-}" == "1" ]]
+                            then
+                                ${customSelf.test or "echo ${final.writeScript "activate" activate}"}
                             else
                                 ${activate}
                             fi
@@ -99,6 +102,7 @@
               (custom // {
                 dryActivate = "$PROFILE/bin/switch-to-configuration dry-activate";
                 boot = "$PROFILE/bin/switch-to-configuration boot";
+                test = "$PROFILE/bin/switch-to-configuration test";
               })
               base.config.system.build.toplevel
               ''

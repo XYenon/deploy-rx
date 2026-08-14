@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::sudo::SudoCommand;
 
-pub const REMOTE_PROTOCOL_VERSION: u16 = 1;
+pub const REMOTE_PROTOCOL_VERSION: u16 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ProfileTarget {
@@ -27,6 +27,7 @@ pub struct RemoteDeployRequest {
     pub review_changes: bool,
     pub dry_activate: bool,
     pub boot: bool,
+    pub test: bool,
     pub auto_rollback: bool,
     pub magic_rollback: bool,
     pub confirm_timeout: u16,

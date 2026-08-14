@@ -357,6 +357,17 @@ in {
     '';
   };
 
+  test-selects-test-script = mkTest {
+    name = "test-selects-test-script";
+    scenarioScript = ''
+      server.succeed("rm -rf /tmp/mode-select /home/deploy/.local/state/nix/profiles/mode-aware")
+      work("deploy -s --no-build-tree --no-review-changes --test .#mode-aware -- --offline > /tmp/test.out 2>&1", timeout=600)
+      server.succeed("grep -Fx test /tmp/mode-select/result")
+      server.succeed("test -L /home/deploy/.local/state/nix/profiles/mode-aware")
+      client_sh("grep -F 'Success activating, done!' /tmp/test.out")
+    '';
+  };
+
   system-manager-profile = mkTest {
     name = "system-manager-profile";
     scenarioScript = ''

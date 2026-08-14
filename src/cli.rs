@@ -121,11 +121,14 @@ pub struct Opts {
     #[arg(long)]
     temp_path: Option<PathBuf>,
     /// Show what will be activated on the machines
-    #[arg(long)]
+    #[arg(long, conflicts_with_all = ["test", "boot"])]
     dry_activate: bool,
     /// Don't activate, but update the boot loader to boot into the new profile
-    #[arg(long)]
+    #[arg(long, conflicts_with_all = ["test", "dry_activate"])]
     boot: bool,
+    /// Activate the configuration, but don't update the boot loader
+    #[arg(long, conflicts_with_all = ["boot", "dry_activate"])]
+    test: bool,
     /// Revoke all previously succeeded deploys when deploying multiple profiles
     #[arg(long)]
     rollback_succeeded: Option<bool>,
@@ -813,6 +816,7 @@ async fn run_deploy(
     debug_logs: bool,
     dry_activate: bool,
     boot: bool,
+    test: bool,
     log_dir: &Option<String>,
     rollback_succeeded: bool,
     ssh_multiplexing: bool,
@@ -961,6 +965,7 @@ async fn run_deploy(
             deploy_defs,
             dry_activate,
             boot,
+            test,
             rollback_fresh_connection,
             review_changes,
         )
@@ -1419,6 +1424,7 @@ mod tests {
             false,
             false,
             false,
+            false,
             &log_dir,
             true,
             false,
@@ -1654,10 +1660,6 @@ pub async fn run(args: Option<&ArgMatches>) -> Result<(), RunError> {
         &deploy::LoggerType::Deploy,
     )?;
 
-    if opts.dry_activate && opts.boot {
-        error!("Cannot use both --dry-activate & --boot!");
-    }
-
     let deploys = opts
         .clone()
         .targets
@@ -1740,6 +1742,7 @@ pub async fn run(args: Option<&ArgMatches>) -> Result<(), RunError> {
         opts.debug_logs,
         opts.dry_activate,
         opts.boot,
+        opts.test,
         &opts.log_dir,
         opts.rollback_succeeded.unwrap_or(true),
         !opts.no_ssh_multiplexing,
