@@ -423,6 +423,13 @@ async fn get_deployment_data(
 
     let repo_reqs = build_repo_reqs(flakes)?;
 
+    // Auto-extracts `drvPath` for profiles whose `path` is a derivation, so the
+    // binary can resolve content-addressed and floating-output derivations
+    // whose eval-time `outPath` is a placeholder. The Nix file is a
+    // self-contained function from `deploy` to `deploy`; see
+    // `nix/transform-deploy.nix`.
+    let patch_deploy = include_str!("../nix/transform-deploy.nix");
+
     let mut repo_data_futures = Vec::new();
     for (repo, req) in repo_reqs {
         let extra_build_args = extra_build_args.to_vec();
@@ -464,7 +471,10 @@ in
                     .arg("--json")
                     .arg(format!("{}#deploy", repo))
                     .arg("--apply")
-                    .arg(format!("({}) (builtins.fromJSON ''{}'')", filter_expr, req_json));
+                    .arg(format!(
+                        "deploy: ({0}) (({1}) (builtins.fromJSON ''{2}'') deploy)",
+                        patch_deploy, filter_expr, req_json
+                    ));
                 c
             } else {
                 let mut c = Command::new("nix-instantiate");
@@ -473,7 +483,10 @@ in
                     .arg("--json")
                     .arg("--eval")
                     .arg("-E")
-                    .arg(format!("let r = import {}/.; in if builtins.isFunction r then (r {{}}).deploy else r.deploy", repo));
+                    .arg(format!(
+                        "({1}) (let r = import {0}/.; in if builtins.isFunction r then (r {{}}).deploy else r.deploy)",
+                        repo, patch_deploy
+                    ));
                 c
             };
             c.args(extra_build_args);
@@ -535,6 +548,11 @@ fn print_deployment(
     let mut part_map: HashMap<String, HashMap<String, PromptPart>> = HashMap::new();
 
     for (_, data, defs) in parts {
+        let settings = &data.profile.profile_settings;
+        // Pre-build, a derivation-typed profile's `path` may be a floating
+        // placeholder or a dynamically generated `.drv`. Show the producing
+        // derivation instead so the preview is meaningful.
+        let displayed_path = settings.drv_path.as_deref().unwrap_or(&settings.path);
         part_map
             .entry(data.node_name.to_string())
             .or_default()
@@ -543,7 +561,7 @@ fn print_deployment(
                 PromptPart {
                     user: &defs.profile_user,
                     ssh_user: &defs.ssh_user,
-                    path: &data.profile.profile_settings.path,
+                    path: displayed_path,
                     hostname: &data.node.node_settings.hostname,
                     tags: &data.profile.profile_settings.tags,
                     ssh_opts: &data.merged_settings.ssh_opts,
@@ -900,7 +918,7 @@ async fn run_deploy(
     let push_profile_datas = make_push_profile_datas(&parts, &push_profile_data_options);
 
     // Resolve derivations, then build all profiles (remote individually, local batched)
-    deploy::push::build_profiles(&push_profile_datas)
+    let closures = deploy::push::build_profiles(&push_profile_datas)
         .await
         .map_err(|e| {
             let node_names: Vec<_> = push_profile_datas
@@ -940,7 +958,7 @@ async fn run_deploy(
 
     let push_profile_datas = make_push_profile_datas(&parts, &push_profile_data_options);
 
-    deploy::push::push_profiles(&push_profile_datas)
+    deploy::push::push_profiles(&push_profile_datas, &closures)
         .await
         .map_err(|e| {
             let node_names = e.node_context().map(str::to_string).unwrap_or_else(|| {
@@ -953,16 +971,17 @@ async fn run_deploy(
             RunDeployError::PushProfile(node_names, e)
         })?;
 
-    let mut succeeded: Vec<(&deploy::DeployData, &deploy::DeployDefs)> = vec![];
+    let mut succeeded: Vec<(&deploy::DeployData, &deploy::DeployDefs, &str)> = vec![];
 
     // Run all deployments
     // In case of an error rollback any previoulsy made deployment.
     // Rollbacks adhere to the global seeting to auto_rollback and secondary
     // the profile's configuration
-    for (_, deploy_data, deploy_defs) in &parts {
+    for ((_, deploy_data, deploy_defs), closure) in parts.iter().zip(&closures) {
         if let Err(e) = deploy::deploy::deploy_profile(
             deploy_data,
             deploy_defs,
+            closure,
             dry_activate,
             boot,
             test,
@@ -980,9 +999,9 @@ async fn run_deploy(
                 // revoking all previous deploys
                 // (adheres to profile configuration if not set explicitely by
                 //  the command line)
-                for (deploy_data, deploy_defs) in &succeeded {
+                for (deploy_data, deploy_defs, closure) in &succeeded {
                     if deploy_data.merged_settings.auto_rollback.unwrap_or(true) {
-                        deploy::deploy::revoke(deploy_data, deploy_defs)
+                        deploy::deploy::revoke(deploy_data, deploy_defs, closure)
                             .await
                             .map_err(|e| {
                                 RunDeployError::RevokeProfile(deploy_data.node_name.to_string(), e)
@@ -996,7 +1015,7 @@ async fn run_deploy(
                 e,
             ));
         }
-        succeeded.push((deploy_data, deploy_defs))
+        succeeded.push((deploy_data, deploy_defs, closure.as_str()))
     }
 
     if let Some(multiplexer) = ssh_multiplexer {
@@ -1048,6 +1067,7 @@ mod tests {
                 path: "/nix/store/test-profile".to_string(),
                 profile_path: None,
                 tags: tags.iter().map(|tag| tag.to_string()).collect(),
+                drv_path: None,
             },
             generic_settings: empty_generic_settings(),
         }

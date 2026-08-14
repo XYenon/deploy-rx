@@ -492,4 +492,6 @@ in {
       server.succeed("grep -Fx b /tmp/review/version")
     '';
   };
+  # Pure-evaluation test for the drvPath auto-extraction. Runs without a VM.
+  transform-deploy = import ./transform-deploy.nix { inherit pkgs; };
 }

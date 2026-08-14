@@ -60,6 +60,14 @@ pub struct ProfileSettings {
     pub profile_path: Option<String>,
     #[serde(default)]
     pub tags: Vec<String>,
+    /// `.drv` path of the derivation that produces `path`. Populated by the
+    /// internal eval transformation in `nix/transform-deploy.nix` so the binary
+    /// knows which derivation to build when `path` is only a placeholder, as
+    /// happens for content-addressed and floating-output derivations. The field
+    /// is deliberately omitted from `interface.json` and kept `pub(crate)`; it
+    /// is wire-format plumbing, not a user setting.
+    #[serde(rename(deserialize = "drvPath"))]
+    pub(crate) drv_path: Option<String>,
 }
 
 #[derive(Deserialize, Debug, Clone)]

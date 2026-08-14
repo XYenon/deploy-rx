@@ -396,9 +396,11 @@ pub enum DeployProfileError {
     InvalidDeployDataDefs(#[from] DeployDataDefsError),
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn deploy_profile(
     deploy_data: &super::DeployData<'_>,
     deploy_defs: &super::DeployDefs,
+    closure: &str,
     dry_activate: bool,
     boot: bool,
     test: bool,
@@ -418,7 +420,7 @@ pub async fn deploy_profile(
     };
 
     let request = RemoteDeployRequest {
-        closure: deploy_data.profile.profile_settings.path.clone(),
+        closure: closure.to_string(),
         profile: profile_target(deploy_data.get_profile_info()?),
         profile_user: deploy_defs.profile_user.clone(),
         review_changes,
@@ -464,6 +466,7 @@ pub enum RevokeProfileError {
 pub async fn revoke(
     deploy_data: &crate::DeployData<'_>,
     deploy_defs: &crate::DeployDefs,
+    closure: &str,
 ) -> Result<(), RevokeProfileError> {
     let temp_path: &Path = match &deploy_data.merged_settings.temp_path {
         Some(x) => x,
@@ -471,7 +474,7 @@ pub async fn revoke(
     };
 
     let request = RemoteRevokeRequest {
-        closure: deploy_data.profile.profile_settings.path.clone(),
+        closure: closure.to_string(),
         profile: profile_target(deploy_data.get_profile_info()?),
         profile_user: deploy_defs.profile_user.clone(),
         temp_path: temp_path.display().to_string(),

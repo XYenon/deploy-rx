@@ -3,7 +3,9 @@
 // SPDX-License-Identifier: MPL-2.0
 
 use log::{debug, info, warn};
+use std::collections::HashMap;
 use std::ffi::OsStr;
+use std::io::Read;
 use std::path::Path;
 use std::process::{Command as StdCommand, Stdio};
 use thiserror::Error;
@@ -89,6 +91,22 @@ pub enum PushProfileError {
 
     #[error("{0}")]
     PathInfo(#[from] command::CommandError<PathInfoError>),
+    #[error("Nix build command output contained an invalid UTF-8 sequence: {0}")]
+    BuildStdoutUtf8(std::str::Utf8Error),
+    #[error("Nix build command succeeded but printed no output path")]
+    BuildStdoutEmpty,
+    #[error("Nix build command printed {actual} output paths, expected {expected}: {paths}")]
+    BuildStdoutPathCount {
+        actual: usize,
+        expected: usize,
+        paths: String,
+    },
+    #[error("Failed to parse the JSON output of nix build: {0}")]
+    BuildStdoutParse(serde_json::Error),
+    #[error("Nix build JSON output did not contain an `out` path for derivation {0}")]
+    BuildStdoutMissingDerivation(String),
+    #[error("Nix build JSON output contained an invalid derivation identity")]
+    BuildStdoutInvalidDerivation,
 }
 
 impl PushProfileError {
@@ -130,7 +148,7 @@ async fn command_exists(command: &str, path: Option<&OsStr>) -> bool {
 async fn run_build_command(
     mut build_command: Command,
     build_tree: bool,
-) -> Result<(), PushProfileError> {
+) -> Result<Vec<u8>, PushProfileError> {
     debug!("build command: {:?}", build_command);
 
     let path = build_command
@@ -149,15 +167,24 @@ async fn run_build_command(
                 .arg("--log-format")
                 .arg("internal-json")
                 .arg("--verbose")
-                .stdout(Stdio::null())
+                .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
 
-            let (nix_status, nom_status) =
+            let (nix_status, nom_status, stdout) =
                 tokio::task::spawn_blocking(move || -> Result<_, PushProfileError> {
                     let mut nix_child = build_command.into_std().spawn().map_err(|err| {
                         PushProfileError::Build(command::CommandError::RunError(err))
                     })?;
 
+                    let mut nix_stdout = nix_child.stdout.take().ok_or_else(|| {
+                        PushProfileError::Build(command::CommandError::RunError(
+                            std::io::Error::other("failed to capture nix build stdout"),
+                        ))
+                    })?;
+                    let stdout_task = std::thread::spawn(move || {
+                        let mut stdout = Vec::new();
+                        nix_stdout.read_to_end(&mut stdout).map(|_| stdout)
+                    });
                     let nix_stderr = nix_child.stderr.take().ok_or_else(|| {
                         PushProfileError::Build(command::CommandError::RunError(
                             std::io::Error::other("failed to capture nix build stderr for nom"),
@@ -182,8 +209,18 @@ async fn run_build_command(
                     let nix_status = nix_child.wait().map_err(|err| {
                         PushProfileError::Build(command::CommandError::RunError(err))
                     })?;
+                    let stdout = stdout_task
+                        .join()
+                        .map_err(|_| {
+                            PushProfileError::Build(command::CommandError::RunError(
+                                std::io::Error::other("failed joining nix build stdout reader"),
+                            ))
+                        })?
+                        .map_err(|err| {
+                            PushProfileError::Build(command::CommandError::RunError(err))
+                        })?;
 
-                    Ok((nix_status, nom_status))
+                    Ok((nix_status, nom_status, stdout))
                 })
                 .await
                 .map_err(|err| {
@@ -200,7 +237,7 @@ async fn run_build_command(
             }
 
             return match nix_status.code() {
-                Some(0) => Ok(()),
+                Some(0) => Ok(stdout),
                 a => Err(PushProfileError::Build(command::CommandError::RunError(
                     std::io::Error::other(format!(
                         "Nix build command resulted in a bad exit code: {:?}",
@@ -211,19 +248,69 @@ async fn run_build_command(
         }
     }
 
-    build_command.stdout(Stdio::null());
-    command::Command::new(build_command)
-        .status()
+    build_command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit());
+    let output = command::Command::new(build_command)
+        .run()
         .await
         .map_err(PushProfileError::Build)?;
 
-    Ok(())
+    Ok(output.stdout)
+}
+
+fn make_remote_derivation_copy_command(
+    store_address: &str,
+    ssh_opts: &str,
+    derivation_name: &str,
+) -> Command {
+    // A nested dynamic installable such as `outer.drv^out^out` must be
+    // discovered on the build host. Copying only the concrete outer `.drv`
+    // avoids realising the intermediate derivation locally.
+    let outer_derivation = derivation_name.split('^').next().unwrap_or(derivation_name);
+    let mut copy_command = Command::new("nix");
+    copy_command
+        .arg("--experimental-features")
+        .arg("nix-command")
+        .arg("copy")
+        .arg("-s") // fetch dependencies from substitutes, not localhost
+        .arg("--to")
+        .arg(store_address)
+        .arg("--derivation")
+        .arg(outer_derivation)
+        .env("NIX_SSHOPTS", ssh_opts)
+        .stdout(Stdio::null());
+
+    copy_command
+}
+
+fn make_remote_build_command(
+    store_address: &str,
+    ssh_opts: &str,
+    derivation_name: &str,
+    extra_build_args: &[String],
+) -> Command {
+    let mut build_command = Command::new("nix");
+    build_command
+        .arg("--experimental-features")
+        .arg("nix-command")
+        .arg("build")
+        .arg(derivation_name)
+        .arg("--eval-store")
+        .arg("auto")
+        .arg("--store")
+        .arg(store_address)
+        .arg("--json")
+        .args(extra_build_args)
+        .env("NIX_SSHOPTS", ssh_opts);
+
+    build_command
 }
 
 pub async fn build_profile_remotely(
     data: &PushProfileData<'_>,
     derivation_name: &str,
-) -> Result<(), PushProfileError> {
+) -> Result<String, PushProfileError> {
     info!(
         "Building profile `{}.{}` on remote host",
         data.deploy_data.node_name, data.deploy_data.profile_name
@@ -239,46 +326,51 @@ pub async fn build_profile_remotely(
     let ssh_opts_str = data.deploy_data.merged_settings.ssh_opts.join(" ");
 
     // copy the derivation to remote host so it can be built there
-    let mut copy_command = Command::new("nix");
-    copy_command
-        .arg("--experimental-features")
-        .arg("nix-command")
-        .arg("copy")
-        .arg("-s") // fetch dependencies from substitutes, not localhost
-        .arg("--to")
-        .arg(&store_address)
-        .arg("--derivation")
-        .arg(derivation_name)
-        .env("NIX_SSHOPTS", ssh_opts_str.clone())
-        .stdout(Stdio::null());
-    command::Command::new(copy_command)
-        .status()
-        .await
-        .map_err(PushProfileError::Copy)?;
+    command::Command::new(make_remote_derivation_copy_command(
+        &store_address,
+        &ssh_opts_str,
+        derivation_name,
+    ))
+    .status()
+    .await
+    .map_err(PushProfileError::Copy)?;
 
-    let mut build_command = Command::new("nix");
-    build_command
-        .arg("--experimental-features")
-        .arg("nix-command")
-        .arg("build")
-        .arg(derivation_name)
-        .arg("--eval-store")
-        .arg("auto")
-        .arg("--store")
-        .arg(&store_address)
-        .args(data.extra_build_args)
-        .env("NIX_SSHOPTS", ssh_opts_str.clone());
+    let build_command = make_remote_build_command(
+        &store_address,
+        &ssh_opts_str,
+        derivation_name,
+        data.extra_build_args,
+    );
 
-    run_build_command(build_command, data.build_tree && data.supports_flakes).await?;
+    let stdout = run_build_command(build_command, data.build_tree && data.supports_flakes).await?;
 
-    Ok(())
+    parse_build_json(&stdout, &[derivation_name]).map(|mut paths| paths.remove(0))
 }
 
 /// Resolve the derivation path for a profile, returning the derivation name suitable for building.
 pub async fn resolve_derivation(data: &PushProfileData<'_>) -> Result<String, PushProfileError> {
+    let profile_settings = &data.deploy_data.profile.profile_settings;
+    let supports_caret = data.supports_flakes
+        || data
+            .deploy_data
+            .merged_settings
+            .remote_build
+            .unwrap_or(false);
+
+    // The eval transformation in `nix/transform-deploy.nix` attaches `drvPath`
+    // to every derivation-typed profile path, so this branch is hit whenever
+    // the user's `path` resolves to a derivation. Using `drvPath` directly also
+    // bypasses `nix show-derivation`, which cannot resolve floating-output
+    // placeholder paths. The legacy branch below remains for the case where
+    // the user wrote a literal store path string in their `deploy` attribute.
+    if let Some(drv_path) = &profile_settings.drv_path {
+        debug!("Using drvPath from flake: {}", drv_path);
+        return deriver_for_build(drv_path.clone(), supports_caret).await;
+    }
+
     debug!(
         "Finding the deriver of store path for {}",
-        &data.deploy_data.profile.profile_settings.path
+        &profile_settings.path
     );
 
     // `nix-store --query --deriver` doesn't work on invalid paths, so we parse output of show-derivation :(
@@ -287,7 +379,7 @@ pub async fn resolve_derivation(data: &PushProfileData<'_>) -> Result<String, Pu
         .arg("--experimental-features")
         .arg("nix-command")
         .arg("show-derivation")
-        .arg(&data.deploy_data.profile.profile_settings.path);
+        .arg(&profile_settings.path);
 
     let show_derivation_output = command::Command::new(show_derivation_command)
         .run()
@@ -331,19 +423,23 @@ pub async fn resolve_derivation(data: &PushProfileData<'_>) -> Result<String, Pu
         format!("/nix/store/{}", deriver_key)
     };
 
-    let new_deriver = if data.supports_flakes
-        || data
-            .deploy_data
-            .merged_settings
-            .remote_build
-            .unwrap_or(false)
-    {
-        // Since nix 2.15.0 'nix build <path>.drv' will build only the .drv file itself, not the
-        // derivation outputs, '^out' is used to refer to outputs explicitly
-        deriver.clone() + "^out"
-    } else {
-        deriver.clone()
-    };
+    deriver_for_build(deriver, supports_caret).await
+}
+
+/// Picks the `nix build` argument shape for a given deriver, accounting for the
+/// pre/post 2.15 split: on 2.15 and newer, `nix build <drv>` builds only the
+/// `.drv` itself and `^out` is needed to select outputs; on older Nix,
+/// `nix build <drv>` already builds outputs and `^out` is not understood. We
+/// detect which case applies by asking `nix path-info <drv>`; on 2.15 and newer
+/// it echoes the `.drv` back, while on older versions it resolves to the
+/// realised output or errors out if the output is not yet built.
+async fn deriver_for_build(
+    deriver: String,
+    supports_caret: bool,
+) -> Result<String, PushProfileError> {
+    if !supports_caret {
+        return Ok(deriver);
+    }
 
     let mut path_info_command = Command::new("nix");
     path_info_command
@@ -356,40 +452,23 @@ pub async fn resolve_derivation(data: &PushProfileData<'_>) -> Result<String, Pu
         .await
         .map_err(PushProfileError::PathInfo)?;
 
-    let deriver = if std::str::from_utf8(&path_info_output.stdout).map(|s| s.trim())
-        == Ok(deriver.as_str())
-    {
-        new_deriver
+    if std::str::from_utf8(&path_info_output.stdout).map(|s| s.trim()) == Ok(deriver.as_str()) {
+        Ok(format!("{}^out", deriver))
     } else {
-        deriver
-    };
-
-    Ok(deriver)
+        Ok(deriver)
+    }
 }
 
 /// Check that the built profile contains the expected activation scripts, and sign if needed.
-pub async fn check_and_sign_profile(data: &PushProfileData<'_>) -> Result<(), PushProfileError> {
-    if !Path::new(
-        format!(
-            "{}/deploy-rx-activate",
-            data.deploy_data.profile.profile_settings.path
-        )
-        .as_str(),
-    )
-    .exists()
-    {
+pub async fn check_and_sign_profile(
+    data: &PushProfileData<'_>,
+    closure: &str,
+) -> Result<(), PushProfileError> {
+    if !Path::new(format!("{}/deploy-rx-activate", closure).as_str()).exists() {
         return Err(PushProfileError::DeployRsActivateDoesntExist);
     }
 
-    if !Path::new(
-        format!(
-            "{}/activate-rs",
-            data.deploy_data.profile.profile_settings.path
-        )
-        .as_str(),
-    )
-    .exists()
-    {
+    if !Path::new(format!("{}/activate-rs", closure).as_str()).exists() {
         return Err(PushProfileError::ActivateRsDoesntExist);
     }
 
@@ -405,7 +484,7 @@ pub async fn check_and_sign_profile(data: &PushProfileData<'_>) -> Result<(), Pu
             .arg("-r")
             .arg("-k")
             .arg(local_key)
-            .arg(&data.deploy_data.profile.profile_settings.path);
+            .arg(closure);
         command::Command::new(sign_command)
             .status()
             .await
@@ -435,7 +514,11 @@ fn make_build_command(
     };
 
     if supports_flakes {
-        build_command.arg("build");
+        // JSON associates each realised output with its derivation identity,
+        // avoiding any dependency on the order of `--print-out-paths` lines.
+        // `nix-build` writes output paths to stdout by default, so the legacy
+        // branch continues to use its plain-text output.
+        build_command.arg("build").arg("--json");
     }
 
     for derivation in derivations {
@@ -465,12 +548,96 @@ fn make_build_command(
     build_command
 }
 
+/// Extracts the realised `/nix/store/...` paths from `nix build`'s stdout.
+///
+/// Both `nix build --print-out-paths` and `nix-build` write one path per
+/// line. A batched deploy-rx build asks for one output per profile, so any
+/// other number is rejected rather than silently misassigning closures.
+fn parse_build_out_paths(stdout: &[u8], expected: usize) -> Result<Vec<String>, PushProfileError> {
+    let text = std::str::from_utf8(stdout).map_err(PushProfileError::BuildStdoutUtf8)?;
+    let trimmed = text.trim();
+
+    if trimmed.is_empty() {
+        return Err(PushProfileError::BuildStdoutEmpty);
+    }
+
+    let paths: Vec<String> = trimmed
+        .lines()
+        .map(|line| line.trim().to_string())
+        .collect();
+    if paths.len() != expected {
+        return Err(PushProfileError::BuildStdoutPathCount {
+            actual: paths.len(),
+            expected,
+            paths: trimmed.to_string(),
+        });
+    }
+
+    for path in &paths {
+        debug!("Built closure {}", path);
+    }
+    Ok(paths)
+}
+
+fn json_drv_path(value: &serde_json::Value) -> Result<String, PushProfileError> {
+    if let Some(path) = value.as_str() {
+        return Ok(path.to_string());
+    }
+
+    let object = value
+        .as_object()
+        .ok_or(PushProfileError::BuildStdoutInvalidDerivation)?;
+    let drv_path = object
+        .get("drvPath")
+        .ok_or(PushProfileError::BuildStdoutInvalidDerivation)?;
+    let output = object
+        .get("output")
+        .and_then(serde_json::Value::as_str)
+        .ok_or(PushProfileError::BuildStdoutInvalidDerivation)?;
+
+    Ok(format!("{}^{}", json_drv_path(drv_path)?, output))
+}
+
+/// Extracts realised outputs from `nix build --json`, associating them by
+/// derivation identity rather than by array position. Recursive `drvPath`
+/// objects represent nested dynamic derivations and are converted back to
+/// their textual `outer.drv^output` form for matching.
+fn parse_build_json(stdout: &[u8], derivations: &[&str]) -> Result<Vec<String>, PushProfileError> {
+    let results: Vec<serde_json::Value> =
+        serde_json::from_slice(stdout).map_err(PushProfileError::BuildStdoutParse)?;
+    let mut outputs = HashMap::new();
+
+    for result in results {
+        let drv_path = result
+            .get("drvPath")
+            .ok_or(PushProfileError::BuildStdoutInvalidDerivation)?;
+        let identity = json_drv_path(drv_path)?;
+        let output = result
+            .get("outputs")
+            .and_then(|outputs| outputs.get("out"))
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| PushProfileError::BuildStdoutMissingDerivation(identity.clone()))?;
+        outputs.insert(identity, output.to_string());
+    }
+
+    derivations
+        .iter()
+        .map(|derivation| {
+            let drv_path = derivation.strip_suffix("^out").unwrap_or(derivation);
+            outputs
+                .get(drv_path)
+                .cloned()
+                .ok_or_else(|| PushProfileError::BuildStdoutMissingDerivation(drv_path.to_string()))
+        })
+        .collect()
+}
+
 /// Build multiple profiles locally in a single nix build invocation.
 pub async fn build_profiles_locally(
     items: &[(&PushProfileData<'_>, &str)],
-) -> Result<(), PushProfileError> {
+) -> Result<Vec<String>, PushProfileError> {
     if items.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
 
     let data = items[0].0;
@@ -516,7 +683,21 @@ pub async fn build_profiles_locally(
         profiles_str
     );
 
-    let derivations: Vec<&str> = items.iter().map(|&(_, d)| d).collect();
+    // Nix implementations may multiply results for repeated installables.
+    // Build each derivation once, then map its realised closure back to every
+    // profile that requested it.
+    let mut derivations: Vec<&str> = Vec::new();
+    let derivation_indexes: Vec<usize> = items
+        .iter()
+        .map(|&(_, derivation)| {
+            if let Some(index) = derivations.iter().position(|&item| item == derivation) {
+                index
+            } else {
+                derivations.push(derivation);
+                derivations.len() - 1
+            }
+        })
+        .collect();
     let profiles: Vec<BuildCommandInfo> = items
         .iter()
         .map(|&(d, _)| BuildCommandInfo {
@@ -540,27 +721,40 @@ pub async fn build_profiles_locally(
         );
     }
 
-    run_build_command(build_command, data.build_tree && data.supports_flakes).await?;
+    let stdout = run_build_command(build_command, data.build_tree && data.supports_flakes).await?;
+    let built_closures = if data.supports_flakes {
+        parse_build_json(&stdout, &derivations)?
+    } else {
+        parse_build_out_paths(&stdout, derivations.len())?
+    };
+    let closures: Vec<String> = derivation_indexes
+        .into_iter()
+        .map(|index| built_closures[index].clone())
+        .collect();
 
-    for &(d, _) in items {
-        check_and_sign_profile(d).await?;
+    for ((d, _), closure) in items.iter().zip(&closures) {
+        check_and_sign_profile(d, closure).await?;
     }
 
-    Ok(())
+    Ok(closures)
 }
 
 /// Resolve derivations, then build all profiles (dispatching remote vs local).
 ///
 /// Remote profiles are built individually; local profiles are batched into a
 /// single `nix build` invocation for efficiency.
-pub async fn build_profiles(datas: &[PushProfileData<'_>]) -> Result<(), PushProfileError> {
+pub async fn build_profiles(
+    datas: &[PushProfileData<'_>],
+) -> Result<Vec<String>, PushProfileError> {
     // Resolve derivations for every profile concurrently
     let derivations: Vec<String> =
         futures_util::future::try_join_all(datas.iter().map(resolve_derivation)).await?;
 
     // Separate remote vs local, building remote ones immediately
+    let mut closures = vec![None; datas.len()];
     let mut local_builds: Vec<(&PushProfileData<'_>, &str)> = Vec::new();
-    for (data, deriver) in datas.iter().zip(derivations.iter()) {
+    let mut local_indexes = Vec::new();
+    for (index, (data, deriver)) in datas.iter().zip(derivations.iter()).enumerate() {
         if data
             .deploy_data
             .merged_settings
@@ -570,22 +764,31 @@ pub async fn build_profiles(datas: &[PushProfileData<'_>]) -> Result<(), PushPro
             if !data.supports_flakes {
                 warn!("remote builds using non-flake nix are experimental");
             }
-            build_profile_remotely(data, deriver).await?;
+            closures[index] = Some(build_profile_remotely(data, deriver).await?);
         } else {
             local_builds.push((data, deriver.as_str()));
+            local_indexes.push(index);
         }
     }
 
     // Build all local profiles in a single nix build invocation
     if !local_builds.is_empty() {
-        build_profiles_locally(&local_builds).await?;
+        let local_closures = build_profiles_locally(&local_builds).await?;
+        for (index, closure) in local_indexes.into_iter().zip(local_closures) {
+            closures[index] = Some(closure);
+        }
     }
 
-    Ok(())
+    Ok(closures
+        .into_iter()
+        .map(|closure| closure.expect("every profile should have a build closure recorded"))
+        .collect())
 }
 
-pub async fn build_profile(data: PushProfileData<'_>) -> Result<(), PushProfileError> {
-    build_profiles(&[data]).await
+pub async fn build_profile(data: PushProfileData<'_>) -> Result<String, PushProfileError> {
+    build_profiles(&[data])
+        .await
+        .map(|mut closures| closures.remove(0))
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -659,7 +862,11 @@ fn copy_group_nodes(datas: &[PushProfileData<'_>], group: &CopyGroup) -> String 
     nodes.join(", ")
 }
 
-pub async fn push_profiles(datas: &[PushProfileData<'_>]) -> Result<(), PushProfileError> {
+pub async fn push_profiles(
+    datas: &[PushProfileData<'_>],
+    closures: &[String],
+) -> Result<(), PushProfileError> {
+    debug_assert_eq!(datas.len(), closures.len());
     let mut copy_groups: Vec<CopyGroup> = Vec::new();
 
     for (index, data) in datas.iter().enumerate() {
@@ -715,14 +922,7 @@ pub async fn push_profiles(datas: &[PushProfileData<'_>]) -> Result<(), PushProf
         let paths: Vec<&str> = group
             .indexes
             .iter()
-            .map(|&index| {
-                datas[index]
-                    .deploy_data
-                    .profile
-                    .profile_settings
-                    .path
-                    .as_str()
-            })
+            .map(|&index| closures[index].as_str())
             .collect();
 
         command::Command::new(make_copy_command(&group.key, &paths))
@@ -739,8 +939,11 @@ pub async fn push_profiles(datas: &[PushProfileData<'_>]) -> Result<(), PushProf
     Ok(())
 }
 
-pub async fn push_profile(data: PushProfileData<'_>) -> Result<(), PushProfileError> {
-    push_profiles(&[data]).await
+pub async fn push_profile(
+    data: PushProfileData<'_>,
+    closure: &str,
+) -> Result<(), PushProfileError> {
+    push_profiles(&[data], &[closure.to_string()]).await
 }
 
 #[cfg(test)]
@@ -775,7 +978,13 @@ mod tests {
         let cmd = make_build_command(true, false, None, &[], &["/nix/store/abc.drv^out"], &[]);
         assert_eq!(
             get_args(&cmd),
-            vec!["nix", "build", "/nix/store/abc.drv^out", "--no-link"]
+            vec![
+                "nix",
+                "build",
+                "--json",
+                "/nix/store/abc.drv^out",
+                "--no-link"
+            ]
         );
     }
 
@@ -794,6 +1003,7 @@ mod tests {
             vec![
                 "nix",
                 "build",
+                "--json",
                 "/nix/store/abc.drv^out",
                 "/nix/store/def.drv^out",
                 "--no-link"
@@ -823,6 +1033,48 @@ mod tests {
     }
 
     #[test]
+    fn test_nested_remote_commands_copy_outer_drv_and_build_full_installable() {
+        let derivation = "/nix/store/outer.drv^out^out";
+        let copy = make_remote_derivation_copy_command(
+            "ssh-ng://deploy@example.com",
+            "-p 2222",
+            derivation,
+        );
+        let build =
+            make_remote_build_command("ssh-ng://deploy@example.com", "-p 2222", derivation, &[]);
+
+        assert_eq!(
+            get_args(&copy),
+            vec![
+                "nix",
+                "--experimental-features",
+                "nix-command",
+                "copy",
+                "-s",
+                "--to",
+                "ssh-ng://deploy@example.com",
+                "--derivation",
+                "/nix/store/outer.drv",
+            ]
+        );
+        assert_eq!(
+            get_args(&build),
+            vec![
+                "nix",
+                "--experimental-features",
+                "nix-command",
+                "build",
+                "/nix/store/outer.drv^out^out",
+                "--eval-store",
+                "auto",
+                "--store",
+                "ssh-ng://deploy@example.com",
+                "--json",
+            ]
+        );
+    }
+
+    #[test]
     fn test_make_build_command_keep_result() {
         let profiles = vec![BuildCommandInfo {
             node_name: "node1",
@@ -841,6 +1093,7 @@ mod tests {
             vec![
                 "nix",
                 "build",
+                "--json",
                 "/nix/store/abc.drv^out",
                 "--out-link",
                 "./results/node1/system",
@@ -873,6 +1126,7 @@ mod tests {
             vec![
                 "nix",
                 "build",
+                "--json",
                 "/nix/store/abc.drv^out",
                 "/nix/store/def.drv^out",
                 "--out-link",
@@ -900,6 +1154,7 @@ mod tests {
             vec![
                 "nix",
                 "build",
+                "--json",
                 "/nix/store/abc.drv^out",
                 "--out-link",
                 "./.deploy-gc/mynode/web",
@@ -916,6 +1171,7 @@ mod tests {
             vec![
                 "nix",
                 "build",
+                "--json",
                 "/nix/store/abc.drv^out",
                 "--no-link",
                 "--option",
@@ -923,6 +1179,80 @@ mod tests {
                 "bar"
             ]
         );
+    }
+
+    #[test]
+    fn parse_build_out_paths_returns_batch_in_order() {
+        let stdout = b"/nix/store/abc123-example\n/nix/store/def456-example\n";
+        let paths = parse_build_out_paths(stdout, 2).expect("two-line stdout must parse");
+        assert_eq!(
+            paths,
+            vec![
+                "/nix/store/abc123-example".to_string(),
+                "/nix/store/def456-example".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_build_out_paths_rejects_empty_output() {
+        let err = parse_build_out_paths(b"", 1).expect_err("empty stdout must error");
+        assert!(matches!(err, PushProfileError::BuildStdoutEmpty));
+    }
+
+    #[test]
+    fn parse_build_out_paths_rejects_wrong_number_of_outputs() {
+        let stdout = b"/nix/store/a\n/nix/store/b\n";
+        let err = parse_build_out_paths(stdout, 1).expect_err("wrong path count must error");
+        assert!(matches!(
+            err,
+            PushProfileError::BuildStdoutPathCount {
+                actual: 2,
+                expected: 1,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn parse_build_json_matches_reordered_results_by_drv_path() {
+        let stdout = br#"[
+            {"drvPath":"/nix/store/b.drv","outputs":{"out":"/nix/store/b"}},
+            {"drvPath":"/nix/store/a.drv","outputs":{"out":"/nix/store/a"}}
+        ]"#;
+        let paths = parse_build_json(stdout, &["/nix/store/a.drv^out", "/nix/store/b.drv^out"])
+            .expect("JSON results must be associated by drvPath");
+
+        assert_eq!(paths, vec!["/nix/store/a", "/nix/store/b"]);
+    }
+
+    #[test]
+    fn parse_build_json_matches_nested_dynamic_drv_path() {
+        let stdout = br#"[{
+            "drvPath": {
+                "drvPath": "/nix/store/outer.drv",
+                "output": "out",
+                "outputPath": "/nix/store/generated.drv"
+            },
+            "outputs": {"out":"/nix/store/final"}
+        }]"#;
+        let paths = parse_build_json(stdout, &["/nix/store/outer.drv^out^out"])
+            .expect("recursive drvPath identity must match nested installable");
+
+        assert_eq!(paths, vec!["/nix/store/final"]);
+    }
+
+    #[test]
+    fn parse_build_json_rejects_missing_derivation() {
+        let stdout = br#"[{"drvPath":"/nix/store/a.drv","outputs":{"out":"/nix/store/a"}}]"#;
+        let err = parse_build_json(stdout, &["/nix/store/b.drv^out"])
+            .expect_err("missing derivation identity must error");
+
+        assert!(matches!(
+            err,
+            PushProfileError::BuildStdoutMissingDerivation(path)
+                if path == "/nix/store/b.drv"
+        ));
     }
 
     #[cfg(unix)]
@@ -1106,6 +1436,7 @@ mod tests {
                 path: "/nonexistent/path".to_string(),
                 profile_path: None,
                 tags: vec![],
+                drv_path: None,
             },
             generic_settings: empty_settings(),
         };
@@ -1134,7 +1465,7 @@ mod tests {
         };
 
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let result = rt.block_on(check_and_sign_profile(&data));
+        let result = rt.block_on(check_and_sign_profile(&data, "/nonexistent/path"));
         assert!(matches!(
             result,
             Err(PushProfileError::DeployRsActivateDoesntExist)
@@ -1153,6 +1484,7 @@ mod tests {
                 path: dir.path().to_string_lossy().into_owned(),
                 profile_path: None,
                 tags: vec![],
+                drv_path: None,
             },
             generic_settings: empty_settings(),
         };
@@ -1181,7 +1513,10 @@ mod tests {
         };
 
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let result = rt.block_on(check_and_sign_profile(&data));
+        let result = rt.block_on(check_and_sign_profile(
+            &data,
+            dir.path().to_string_lossy().as_ref(),
+        ));
         assert!(matches!(
             result,
             Err(PushProfileError::ActivateRsDoesntExist)
@@ -1201,6 +1536,7 @@ mod tests {
                 path: dir.path().to_string_lossy().into_owned(),
                 profile_path: None,
                 tags: vec![],
+                drv_path: None,
             },
             generic_settings: empty_settings(),
         };
@@ -1229,7 +1565,10 @@ mod tests {
         };
 
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let result = rt.block_on(check_and_sign_profile(&data));
+        let result = rt.block_on(check_and_sign_profile(
+            &data,
+            dir.path().to_string_lossy().as_ref(),
+        ));
         assert!(result.is_ok());
     }
 }
