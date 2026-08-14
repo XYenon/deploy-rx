@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2026 XYenon <i@xyenon.bid>
+#
+# SPDX-License-Identifier: MPL-2.0
+
+set -euo pipefail
+
+nix_profile="/nix/var/nix/profiles/default"
+
+if [ ! -x "$nix_profile/bin/nix" ]; then
+  echo "Nix is missing; run .agents/setup to install it." >&2
+  exit 1
+fi
+
+# Verify the daemon is ready without doing work that could delay orb resumption.
+# shellcheck disable=SC1091
+source "$nix_profile/etc/profile.d/nix-daemon.sh"
+nix store info >/dev/null

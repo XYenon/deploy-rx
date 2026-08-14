@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2026 XYenon <i@xyenon.bid>
+#
+# SPDX-License-Identifier: MPL-2.0
+
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+nix_profile="/nix/var/nix/profiles/default"
+
+step() {
+  printf '\n==> %s\n' "$1"
+}
+
+if ! command -v nix >/dev/null 2>&1 && [ ! -x "$nix_profile/bin/nix" ]; then
+  step "Installing Determinate Nix"
+  curl --proto '=https' --tlsv1.2 -fsSL https://install.determinate.systems/nix |
+    sh -s -- install --no-confirm
+fi
+
+# The installer cannot update this process's environment.
+# shellcheck disable=SC1091
+source "$nix_profile/etc/profile.d/nix-daemon.sh"
+
+step "Configuring Nix for login shells"
+profile_marker="# deploy-rx Nix environment"
+if ! grep -Fqx "$profile_marker" "$HOME/.bash_profile" 2>/dev/null; then
+  cat >> "$HOME/.bash_profile" <<'EOF'
+
+# deploy-rx Nix environment
+if [ -f /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh ]; then
+  # shellcheck disable=SC1091
+  unset __ETC_PROFILE_NIX_SOURCED
+  . /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh
+fi
+EOF
+fi
+
+step "Warming the Nix development shell"
+nix develop "$repo_root" --command true
