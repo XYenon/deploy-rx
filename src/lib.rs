@@ -6,7 +6,7 @@
 
 pub mod command;
 
-use rnix::{types::*, SyntaxKind::*};
+use rnix::ast::{self, AstToken, InterpolPart};
 
 use merge::Merge;
 
@@ -190,67 +190,54 @@ pub enum ParseFlakeError {
 }
 
 fn parse_fragment(fragment: &str) -> Result<(Option<String>, Option<String>), ParseFlakeError> {
-    let mut node: Option<String> = None;
-    let mut profile: Option<String> = None;
+    fn parse_string(string: ast::Str) -> Result<String, ParseFlakeError> {
+        string
+            .parts()
+            .try_fold(String::new(), |mut value, part| match part {
+                InterpolPart::Literal(content) => {
+                    value.push_str(content.syntax().text());
+                    Ok(value)
+                }
+                InterpolPart::Interpolation(_) => Err(ParseFlakeError::Unrecognized),
+            })
+    }
 
-    let ast = rnix::parse(fragment);
-
-    let first_child = match ast.root().node().first_child() {
-        Some(x) => x,
-        None => return Ok((None, None)),
-    };
-
-    let mut node_over = false;
-
-    for entry in first_child.children_with_tokens() {
-        let x: Option<String> = match (entry.kind(), node_over) {
-            (TOKEN_DOT, false) => {
-                node_over = true;
-                None
-            }
-            (TOKEN_DOT, true) => {
-                return Err(ParseFlakeError::PathTooLong);
-            }
-            (NODE_IDENT, _) => Some(
-                entry
-                    .into_node()
-                    .ok_or(ParseFlakeError::Unrecognized)?
-                    .text()
-                    .to_string(),
-            ),
-            (TOKEN_IDENT, _) => Some(
-                entry
-                    .into_token()
-                    .ok_or(ParseFlakeError::Unrecognized)?
-                    .text()
-                    .to_string(),
-            ),
-            (NODE_STRING, _) => {
-                let c = entry
-                    .into_node()
-                    .ok_or(ParseFlakeError::Unrecognized)?
-                    .children_with_tokens()
-                    .nth(1)
-                    .ok_or(ParseFlakeError::Unrecognized)?;
-
-                Some(
-                    c.into_token()
-                        .ok_or(ParseFlakeError::Unrecognized)?
-                        .text()
-                        .to_string(),
-                )
-            }
-            _ => return Err(ParseFlakeError::Unrecognized),
-        };
-
-        if !node_over {
-            node = x;
-        } else {
-            profile = x;
+    fn parse_expr(expr: ast::Expr) -> Result<String, ParseFlakeError> {
+        match expr {
+            ast::Expr::Ident(ident) => Ok(ident.to_string()),
+            ast::Expr::Str(string) => parse_string(string),
+            _ => Err(ParseFlakeError::Unrecognized),
         }
     }
 
-    Ok((node, profile))
+    fn parse_attr(attr: ast::Attr) -> Result<String, ParseFlakeError> {
+        match attr {
+            ast::Attr::Ident(ident) => Ok(ident.to_string()),
+            ast::Attr::Str(string) => parse_string(string),
+            ast::Attr::Dynamic(_) => Err(ParseFlakeError::Unrecognized),
+        }
+    }
+
+    let root = rnix::Root::parse(fragment).tree();
+    let Some(expr) = root.expr() else {
+        return Ok((None, None));
+    };
+
+    match expr {
+        ast::Expr::Select(select) => {
+            let node = parse_expr(select.expr().ok_or(ParseFlakeError::Unrecognized)?)?;
+            let attrpath = select.attrpath().ok_or(ParseFlakeError::Unrecognized)?;
+            let mut attrs = attrpath.attrs();
+            let profile = parse_attr(attrs.next().ok_or(ParseFlakeError::Unrecognized)?)?;
+
+            if attrs.next().is_some() {
+                return Err(ParseFlakeError::PathTooLong);
+            }
+
+            Ok((Some(node), Some(profile)))
+        }
+        expr => Ok((Some(parse_expr(expr)?), None)),
+    }
 }
 
 pub fn parse_flake(flake: &str) -> Result<DeployFlake<'_>, ParseFlakeError> {
