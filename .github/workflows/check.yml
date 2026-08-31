@@ -45,20 +45,62 @@ jobs:
             nix eval --json .#check-matrix.x86_64-linux |
               jq -c '
                 [.include[] | select(.check != "clippy" and .check != "rustfmt")] as $checks
+                # Full VM test-script seconds measured in CI run 33379073615.
                 | {
-                    include: [
-                      range(0; 6) as $shard
-                      | {
-                          shard: ($shard + 1),
-                          checks: [
-                            $checks
-                            | to_entries[]
-                            | select((.key % 6) == $shard)
-                            | ".#checks.x86_64-linux.\(.value.check)"
-                          ]
-                        }
-                    ]
-                  }
+                    "activation-modes": 759.30,
+                    "file-mode-with-flake-capable-nix": 683.44,
+                    "flake-build-with-flakes-disabled-in-config": 646.19,
+                    "flake-remote-build-with-flakes-disabled-in-config": 362.43,
+                    "hyphen-ssh-opts-regression": 453.88,
+                    "local-build": 605.72,
+                    "multi-host-scenarios": 635.90,
+                    "options-overriding": 362.94,
+                    "profile": 485.13,
+                    "remote-build": 592.29,
+                    "rollback-scenarios": 868.49,
+                    "ssh-multiplexing": 550.59,
+                    "ssh-rollback": 849.20
+                  } as $weights
+                | ["deploy-rx", "reuse", "transform-deploy"] as $lightChecks
+                | [$checks[] | select($weights[.check] != null) | . + {weight: $weights[.check]}] as $weighted
+                | [
+                    $checks[]
+                    | . as $check
+                    | select($lightChecks | index($check.check))
+                  ] as $light
+                | [
+                    $checks[]
+                    | . as $check
+                    | select(
+                        $weights[$check.check] == null
+                        and ($lightChecks | index($check.check) | not)
+                      )
+                  ] as $unweighted
+                | (($weighted | length) / 2 | ceil) as $shardCount
+                | reduce ($weighted | sort_by(-.weight)[]) as $check (
+                    [range(1; $shardCount + 1) | {shard: ., weight: 0, checks: []}];
+                    ([
+                      to_entries[]
+                      | select(.value.checks | length < 2)
+                    ] | min_by(.value.weight) | .key) as $index
+                    | .[$index].weight += $check.weight
+                    | .[$index].checks += [".#checks.x86_64-linux.\($check.check)"]
+                  )
+                | (map(.weight) | min) as $minimum
+                | (map(.weight == $minimum) | index(true)) as $lightest
+                | .[$lightest].checks += [
+                    $light[] | ".#checks.x86_64-linux.\(.check)"
+                  ]
+                | map(select(.checks | length > 0) | del(.weight)) as $balanced
+                | if ($unweighted | length) > 0 then
+                    $balanced + [{
+                      shard: (($balanced | map(.shard) | max) + 1),
+                      checks: [$unweighted[] | ".#checks.x86_64-linux.\(.check)"]
+                    }]
+                  else
+                    $balanced
+                  end
+                | {include: .}
               '
           )"
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"

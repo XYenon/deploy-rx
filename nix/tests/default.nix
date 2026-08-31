@@ -335,161 +335,136 @@ in {
     deployArgs = "--file . --targets server";
   };
 
-  dry-activate-selects-dry-script = mkTest {
-    name = "dry-activate-selects-dry-script";
+  activation-modes = mkTest {
+    name = "activation-modes";
     scenarioScript = ''
-      server.succeed("rm -rf /tmp/mode-select /home/deploy/.local/state/nix/profiles/mode-aware")
-      work("deploy -s --no-build-tree --no-review-changes --dry-activate .#mode-aware -- --offline > /tmp/dry-activate.out 2>&1", timeout=600)
-      server.succeed("grep -Fx dry /tmp/mode-select/result")
-      server.succeed("test ! -e /home/deploy/.local/state/nix/profiles/mode-aware")
-      client_sh("grep -F 'Completed dry-activate!' /tmp/dry-activate.out")
+      with subtest("dry-activate-selects-dry-script"):
+        server.succeed("rm -rf /tmp/mode-select /home/deploy/.local/state/nix/profiles/mode-aware")
+        work("deploy -s --no-build-tree --no-review-changes --dry-activate .#mode-aware -- --offline > /tmp/dry-activate.out 2>&1", timeout=600)
+        server.succeed("grep -Fx dry /tmp/mode-select/result")
+        server.succeed("test ! -e /home/deploy/.local/state/nix/profiles/mode-aware")
+        client_sh("grep -F 'Completed dry-activate!' /tmp/dry-activate.out")
+
+      with subtest("boot-selects-boot-script"):
+        server.succeed("rm -rf /tmp/mode-select /home/deploy/.local/state/nix/profiles/mode-aware")
+        work("deploy -s --no-build-tree --no-review-changes --boot .#mode-aware -- --offline > /tmp/boot.out 2>&1", timeout=600)
+        server.succeed("grep -Fx boot /tmp/mode-select/result")
+        server.succeed("test -L /home/deploy/.local/state/nix/profiles/mode-aware")
+        client_sh("grep -F 'Success activating for next boot, done!' /tmp/boot.out")
+
+      with subtest("test-selects-test-script"):
+        server.succeed("rm -rf /tmp/mode-select /home/deploy/.local/state/nix/profiles/mode-aware")
+        work("deploy -s --no-build-tree --no-review-changes --test .#mode-aware -- --offline > /tmp/test.out 2>&1", timeout=600)
+        server.succeed("grep -Fx test /tmp/mode-select/result")
+        server.succeed("test -L /home/deploy/.local/state/nix/profiles/mode-aware")
+        client_sh("grep -F 'Success activating, done!' /tmp/test.out")
+
+      with subtest("system-manager-profile"):
+        server.succeed("rm -rf /tmp/system-manager && mkdir -p /nix/var/nix/profiles/system-manager-profiles")
+        work("deploy -s --no-build-tree --no-review-changes .#system-manager-target -- --offline", timeout=600)
+        server.succeed("grep -Fx activated /tmp/system-manager/state")
+        server.succeed("test -L /nix/var/nix/profiles/system-manager-profiles/system-manager")
+        server.succeed("test -x /nix/var/nix/profiles/system-manager-profiles/system-manager/bin/activate")
     '';
   };
 
-  boot-selects-boot-script = mkTest {
-    name = "boot-selects-boot-script";
+  rollback-scenarios = mkTest {
+    name = "rollback-scenarios";
     scenarioScript = ''
-      server.succeed("rm -rf /tmp/mode-select /home/deploy/.local/state/nix/profiles/mode-aware")
-      work("deploy -s --no-build-tree --no-review-changes --boot .#mode-aware -- --offline > /tmp/boot.out 2>&1", timeout=600)
-      server.succeed("grep -Fx boot /tmp/mode-select/result")
-      server.succeed("test -L /home/deploy/.local/state/nix/profiles/mode-aware")
-      client_sh("grep -F 'Success activating for next boot, done!' /tmp/boot.out")
+      with subtest("activation-failure-rolls-back"):
+        server.succeed("rm -rf /tmp/activation")
+        work("deploy -s --no-build-tree --no-review-changes .#activation-baseline -- --offline", timeout=600)
+        server.succeed("grep -Fx baseline /tmp/activation/version")
+        work_fail("deploy -s --no-build-tree --no-review-changes .#activation-fail -- --offline > /tmp/activation-fail.out 2>&1", timeout=600)
+        server.succeed("grep -Fx baseline /tmp/activation/version")
+
+      with subtest("multi-target-rollback-succeeded"):
+        server.succeed("rm -rf /tmp/multi-rollback")
+        work("deploy -s --no-build-tree --no-review-changes .#multi-rollback-baseline -- --offline", timeout=600)
+        server.succeed("grep -Fx baseline /tmp/multi-rollback/app")
+        server.succeed("grep -Fx baseline /tmp/multi-rollback/bad")
+        work_fail("deploy -s --no-build-tree --no-review-changes --targets .#multi-rollback-ok .#multi-rollback-fail -- --offline > /tmp/multi-rollback.out 2>&1", timeout=600)
+        client_sh("grep -F 'Revoking previous deploys' /tmp/multi-rollback.out")
+        server.succeed("grep -Fx baseline /tmp/multi-rollback/app")
+        server.succeed("grep -Fx baseline /tmp/multi-rollback/bad")
+
+      with subtest("review-changes-on-off"):
+        server.succeed("rm -rf /tmp/review")
+        work("deploy -s --no-build-tree --no-review-changes .#review-baseline -- --offline", timeout=600)
+        work("deploy -s --no-build-tree .#review-a -- --offline > /tmp/review-on.out 2>&1", timeout=600)
+        client_sh("grep -F 'Derivation changes for ' /tmp/review-on.out")
+        work("deploy -s --no-build-tree --no-review-changes .#review-b -- --offline > /tmp/review-off.out 2>&1", timeout=600)
+        client_fail("grep -F 'Derivation changes for ' /tmp/review-off.out")
+        server.succeed("grep -Fx b /tmp/review/version")
     '';
   };
 
-  test-selects-test-script = mkTest {
-    name = "test-selects-test-script";
-    scenarioScript = ''
-      server.succeed("rm -rf /tmp/mode-select /home/deploy/.local/state/nix/profiles/mode-aware")
-      work("deploy -s --no-build-tree --no-review-changes --test .#mode-aware -- --offline > /tmp/test.out 2>&1", timeout=600)
-      server.succeed("grep -Fx test /tmp/mode-select/result")
-      server.succeed("test -L /home/deploy/.local/state/nix/profiles/mode-aware")
-      client_sh("grep -F 'Success activating, done!' /tmp/test.out")
-    '';
-  };
-
-  system-manager-profile = mkTest {
-    name = "system-manager-profile";
-    scenarioScript = ''
-      server.succeed("rm -rf /tmp/system-manager && mkdir -p /nix/var/nix/profiles/system-manager-profiles")
-      work("deploy -s --no-build-tree --no-review-changes .#system-manager-target -- --offline", timeout=600)
-      server.succeed("grep -Fx activated /tmp/system-manager/state")
-      server.succeed("test -L /nix/var/nix/profiles/system-manager-profiles/system-manager")
-      server.succeed("test -x /nix/var/nix/profiles/system-manager-profiles/system-manager/bin/activate")
-    '';
-  };
-
-  activation-failure-rolls-back = mkTest {
-    name = "activation-failure-rolls-back";
-    scenarioScript = ''
-      server.succeed("rm -rf /tmp/activation")
-      work("deploy -s --no-build-tree --no-review-changes .#activation-baseline -- --offline", timeout=600)
-      server.succeed("grep -Fx baseline /tmp/activation/version")
-      work_fail("deploy -s --no-build-tree --no-review-changes .#activation-fail -- --offline > /tmp/activation-fail.out 2>&1", timeout=600)
-      server.succeed("grep -Fx baseline /tmp/activation/version")
-    '';
-  };
-
-  multi-target-rollback-succeeded = mkTest {
-    name = "multi-target-rollback-succeeded";
-    scenarioScript = ''
-      server.succeed("rm -rf /tmp/multi-rollback")
-      work("deploy -s --no-build-tree --no-review-changes .#multi-rollback-baseline -- --offline", timeout=600)
-      server.succeed("grep -Fx baseline /tmp/multi-rollback/app")
-      server.succeed("grep -Fx baseline /tmp/multi-rollback/bad")
-      work_fail("deploy -s --no-build-tree --no-review-changes --targets .#multi-rollback-ok .#multi-rollback-fail -- --offline > /tmp/multi-rollback.out 2>&1", timeout=600)
-      client_sh("grep -F 'Revoking previous deploys' /tmp/multi-rollback.out")
-      server.succeed("grep -Fx baseline /tmp/multi-rollback/app")
-      server.succeed("grep -Fx baseline /tmp/multi-rollback/bad")
-    '';
-  };
-
-  multi-host-heterogeneous-targets = mkTest {
-    name = "multi-host-heterogeneous-targets";
+  multi-host-scenarios = mkTest {
+    name = "multi-host-scenarios";
     multiHost = true;
     scenarioScript = ''
-      server.succeed("rm -rf /tmp/multi-host")
-      server2.succeed("rm -rf /tmp/multi-host")
-      client_fail("ssh -o ConnectTimeout=5 -o ConnectionAttempts=1 -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no server2 true", timeout=10)
-      client_sh("ssh -p 2222 -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no server2 true", timeout=30)
-      work("deploy -s --no-build-tree --no-review-changes --targets .#multi-host-a-updated .#multi-host-b-updated -- --offline", timeout=600)
-      server.succeed("grep -Fx updated /tmp/multi-host/a")
-      server2.succeed("grep -Fx updated /tmp/multi-host/b")
+      with subtest("multi-host-heterogeneous-targets"):
+        server.succeed("rm -rf /tmp/multi-host")
+        server2.succeed("rm -rf /tmp/multi-host")
+        client_fail("ssh -o ConnectTimeout=5 -o ConnectionAttempts=1 -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no server2 true", timeout=10)
+        client_sh("ssh -p 2222 -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no server2 true", timeout=30)
+        work("deploy -s --no-build-tree --no-review-changes --targets .#multi-host-a-updated .#multi-host-b-updated -- --offline", timeout=600)
+        server.succeed("grep -Fx updated /tmp/multi-host/a")
+        server2.succeed("grep -Fx updated /tmp/multi-host/b")
+
+      with subtest("multi-host-rollback-succeeded"):
+        server.succeed("rm -rf /tmp/multi-host")
+        server2.succeed("rm -rf /tmp/multi-host")
+        work("deploy -s --no-build-tree --no-review-changes --targets .#multi-host-a-baseline .#multi-host-b-baseline -- --offline", timeout=600)
+        server.succeed("grep -Fx baseline /tmp/multi-host/a")
+        server2.succeed("grep -Fx baseline /tmp/multi-host/b")
+        work_fail("deploy -s --no-build-tree --no-review-changes --targets .#multi-host-a-updated .#multi-host-b-fail -- --offline > /tmp/multi-host-rollback.out 2>&1", timeout=600)
+        client_sh("grep -F 'Revoking previous deploys' /tmp/multi-host-rollback.out")
+        server.succeed("grep -Fx baseline /tmp/multi-host/a")
+        server2.succeed("grep -Fx baseline /tmp/multi-host/b")
     '';
   };
 
-  multi-host-rollback-succeeded = mkTest {
-    name = "multi-host-rollback-succeeded";
-    multiHost = true;
+  ssh-multiplexing = mkTest {
+    name = "ssh-multiplexing";
     scenarioScript = ''
-      server.succeed("rm -rf /tmp/multi-host")
-      server2.succeed("rm -rf /tmp/multi-host")
-      work("deploy -s --no-build-tree --no-review-changes --targets .#multi-host-a-baseline .#multi-host-b-baseline -- --offline", timeout=600)
-      server.succeed("grep -Fx baseline /tmp/multi-host/a")
-      server2.succeed("grep -Fx baseline /tmp/multi-host/b")
-      work_fail("deploy -s --no-build-tree --no-review-changes --targets .#multi-host-a-updated .#multi-host-b-fail -- --offline > /tmp/multi-host-rollback.out 2>&1", timeout=600)
-      client_sh("grep -F 'Revoking previous deploys' /tmp/multi-host-rollback.out")
-      server.succeed("grep -Fx baseline /tmp/multi-host/a")
-      server2.succeed("grep -Fx baseline /tmp/multi-host/b")
+      with subtest("ssh-multiplexing-reuse"):
+        install_wrapper("ssh", ssh_wrapper_source)
+        work("PATH=/tmp/wrappers:$PATH deploy -s --no-build-tree --no-review-changes .#multiplex -- --offline > /tmp/ssh-multiplexing.out 2>&1", timeout=600)
+        server.succeed("grep -Fx first /tmp/multiplex/first")
+        server.succeed("grep -Fx second /tmp/multiplex/second")
+        client_sh("count=$(grep -c 'ControlMaster=yes' /tmp/deploy-rx-e2e/ssh.log || true); test \"$count\" = 1")
+        client_sh("count=$(grep -c 'deploy-rx-ssh-server' /tmp/deploy-rx-e2e/ssh.log || true); test \"$count\" -ge 3")
+
+      with subtest("no-ssh-multiplexing"):
+        reset_logs()
+        install_wrapper("deploy", deploy_wrapper_source)
+        install_wrapper("ssh", ssh_wrapper_source)
+        server.succeed("rm -rf /tmp/multiplex /home/deploy/.local/state/nix/profiles/multiplex-first* /home/deploy/.local/state/nix/profiles/multiplex-second*")
+        work("PATH=/tmp/wrappers:$PATH deploy -s --no-build-tree --no-review-changes --no-ssh-multiplexing .#multiplex -- --offline > /tmp/no-ssh-multiplexing.out 2>&1", timeout=600)
+        server.succeed("grep -Fx first /tmp/multiplex/first")
+        server.succeed("grep -Fx second /tmp/multiplex/second")
+        client_sh("count=$(grep -c 'ControlMaster=yes' /tmp/deploy-rx-e2e/ssh.log || true); test \"$count\" = 0")
+        client_sh("count=$(grep -c 'deploy-rx-ssh-server' /tmp/deploy-rx-e2e/ssh.log || true); test \"$count\" = 0")
     '';
   };
 
-  magic-rollback-default = mkTest {
-    name = "magic-rollback-default";
+  ssh-rollback = mkTest {
+    name = "ssh-rollback";
     scenarioScript = ''
-      work_fail("deploy -s --no-build-tree --no-review-changes .#broken-ssh -- --offline > /tmp/broken-ssh.out 2>&1", timeout=900)
-      client_sh("sed -n '1,200p' /tmp/broken-ssh.out >&2 || true")
-      server.succeed("ss -tlnp | sed -n '1,200p' >&2 || true")
-      server.wait_for_open_port(22, timeout=60)
-      client_sh("ssh -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no server true", timeout=30)
-      client_fail("ssh -p 2222 -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no server true", timeout=30)
-    '';
-  };
+      with subtest("magic-rollback-default"):
+        work_fail("deploy -s --no-build-tree --no-review-changes .#broken-ssh -- --offline > /tmp/broken-ssh.out 2>&1", timeout=900)
+        client_sh("sed -n '1,200p' /tmp/broken-ssh.out >&2 || true")
+        server.succeed("ss -tlnp | sed -n '1,200p' >&2 || true")
+        server.wait_for_open_port(22, timeout=60)
+        client_sh("ssh -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no server true", timeout=30)
+        client_fail("ssh -p 2222 -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no server true", timeout=30)
 
-  ssh-multiplexing-reuse = mkTest {
-    name = "ssh-multiplexing-reuse";
-    scenarioScript = ''
-      install_wrapper("ssh", ssh_wrapper_source)
-      work("PATH=/tmp/wrappers:$PATH deploy -s --no-build-tree --no-review-changes .#multiplex -- --offline > /tmp/ssh-multiplexing.out 2>&1", timeout=600)
-      server.succeed("grep -Fx first /tmp/multiplex/first")
-      server.succeed("grep -Fx second /tmp/multiplex/second")
-      client_sh("count=$(grep -c 'ControlMaster=yes' /tmp/deploy-rx-e2e/ssh.log || true); test \"$count\" = 1")
-      client_sh("count=$(grep -c 'deploy-rx-ssh-server' /tmp/deploy-rx-e2e/ssh.log || true); test \"$count\" -ge 3")
-    '';
-  };
-
-  no-ssh-multiplexing = mkTest {
-    name = "no-ssh-multiplexing";
-    scenarioScript = ''
-      install_wrapper("ssh", ssh_wrapper_source)
-      work("PATH=/tmp/wrappers:$PATH deploy -s --no-build-tree --no-review-changes --no-ssh-multiplexing .#multiplex -- --offline > /tmp/no-ssh-multiplexing.out 2>&1", timeout=600)
-      server.succeed("grep -Fx first /tmp/multiplex/first")
-      server.succeed("grep -Fx second /tmp/multiplex/second")
-      client_sh("count=$(grep -c 'ControlMaster=yes' /tmp/deploy-rx-e2e/ssh.log || true); test \"$count\" = 0")
-      client_sh("count=$(grep -c 'deploy-rx-ssh-server' /tmp/deploy-rx-e2e/ssh.log || true); test \"$count\" = 0")
-    '';
-  };
-
-  rollback-fresh-connection-toggle = mkTest {
-    name = "rollback-fresh-connection-toggle";
-    scenarioScript = ''
-      work("deploy -s --no-build-tree --no-review-changes --no-rollback-fresh-connection .#broken-ssh -- --offline > /tmp/no-fresh-connection.out 2>&1", timeout=900)
-      server.wait_for_open_port(2222)
-      client_fail("ssh -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no server true", timeout=30)
-      client_sh("ssh -p 2222 -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no server true", timeout=30)
-    '';
-  };
-
-  review-changes-on-off = mkTest {
-    name = "review-changes-on-off";
-    scenarioScript = ''
-      server.succeed("rm -rf /tmp/review")
-      work("deploy -s --no-build-tree --no-review-changes .#review-baseline -- --offline", timeout=600)
-      work("deploy -s --no-build-tree .#review-a -- --offline > /tmp/review-on.out 2>&1", timeout=600)
-      client_sh("grep -F 'Derivation changes for ' /tmp/review-on.out")
-      work("deploy -s --no-build-tree --no-review-changes .#review-b -- --offline > /tmp/review-off.out 2>&1", timeout=600)
-      client_fail("grep -F 'Derivation changes for ' /tmp/review-off.out")
-      server.succeed("grep -Fx b /tmp/review/version")
+      with subtest("rollback-fresh-connection-toggle"):
+        work("deploy -s --no-build-tree --no-review-changes --no-rollback-fresh-connection .#broken-ssh -- --offline > /tmp/no-fresh-connection.out 2>&1", timeout=900)
+        server.wait_for_open_port(2222)
+        client_fail("ssh -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no server true", timeout=30)
+        client_sh("ssh -p 2222 -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no server true", timeout=30)
     '';
   };
   # Pure-evaluation test for the drvPath auto-extraction. Runs without a VM.
