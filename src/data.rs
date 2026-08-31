@@ -14,6 +14,7 @@ fn default_output_name() -> String {
 }
 
 #[derive(Deserialize, Debug, Clone, Merge)]
+#[merge(strategy = merge::option::overwrite_none)]
 pub struct GenericSettings {
     #[serde(rename(deserialize = "sshUser"))]
     pub ssh_user: Option<String>,
@@ -104,6 +105,26 @@ pub struct Data {
 #[cfg(test)]
 mod tests {
     use super::{GenericSettings, ProfileSettings};
+    use merge::Merge;
+
+    #[test]
+    fn test_generic_settings_merge_preserves_precedence() {
+        let mut profile: GenericSettings = serde_json::from_str(
+            r#"{"user":"profile","sshOpts":["profile-opt"],"remoteBuild":false}"#,
+        )
+        .unwrap();
+        let node: GenericSettings = serde_json::from_str(
+            r#"{"user":"node","sshUser":"node-ssh","sshOpts":["node-opt"],"remoteBuild":true}"#,
+        )
+        .unwrap();
+
+        profile.merge(node);
+
+        assert_eq!(profile.user.as_deref(), Some("profile"));
+        assert_eq!(profile.ssh_user.as_deref(), Some("node-ssh"));
+        assert_eq!(profile.remote_build, Some(false));
+        assert_eq!(profile.ssh_opts, vec!["profile-opt", "node-opt"]);
+    }
 
     #[test]
     fn test_profile_settings_tags_default_to_empty() {
