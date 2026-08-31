@@ -45,20 +45,45 @@ jobs:
             nix eval --json .#check-matrix.x86_64-linux |
               jq -c '
                 [.include[] | select(.check != "clippy" and .check != "rustfmt")] as $checks
+                # Seconds measured in PR #37. Grouped VM checks use the sum of their subtests;
+                # non-VM checks add no measured VM runtime when built alongside a VM check.
                 | {
-                    include: [
-                      range(0; 6) as $shard
-                      | {
-                          shard: ($shard + 1),
-                          checks: [
-                            $checks
-                            | to_entries[]
-                            | select((.key % 6) == $shard)
-                            | ".#checks.x86_64-linux.\(.value.check)"
-                          ]
-                        }
-                    ]
-                  }
+                    "activation-modes": 728.99,
+                    "deploy-rx": 0,
+                    "file-mode-with-flake-capable-nix": 481.77,
+                    "flake-build-with-flakes-disabled-in-config": 566.17,
+                    "flake-remote-build-with-flakes-disabled-in-config": 368.74,
+                    "hyphen-ssh-opts-regression": 370.88,
+                    "local-build": 890.08,
+                    "multi-host-scenarios": 450.14,
+                    "options-overriding": 460.91,
+                    "profile": 450.75,
+                    "remote-build": 369.07,
+                    "reuse": 0,
+                    "rollback-scenarios": 1007.33,
+                    "ssh-multiplexing": 346.64,
+                    "ssh-rollback": 442.89,
+                    "transform-deploy": 0
+                  } as $weights
+                | [$checks[] | select($weights[.check] != null) | . + {weight: $weights[.check]}] as $weighted
+                | [$checks[] | select($weights[.check] == null)] as $unweighted
+                | reduce ($weighted | sort_by(-.weight)[]) as $check (
+                    [range(1; 7) | {shard: ., weight: 0, checks: []}];
+                    (map(.weight) | min) as $minimum
+                    | (map(.weight == $minimum) | index(true)) as $index
+                    | .[$index].weight += $check.weight
+                    | .[$index].checks += [".#checks.x86_64-linux.\($check.check)"]
+                  )
+                | map(select(.checks | length > 0) | del(.weight)) as $balanced
+                | if ($unweighted | length) > 0 then
+                    $balanced + [{
+                      shard: (($balanced | map(.shard) | max) + 1),
+                      checks: [$unweighted[] | ".#checks.x86_64-linux.\(.check)"]
+                    }]
+                  else
+                    $balanced
+                  end
+                | {include: .}
               '
           )"
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
