@@ -45,21 +45,21 @@ jobs:
             nix eval --json .#check-matrix.x86_64-linux |
               jq -c '
                 [.include[] | select(.check != "clippy" and .check != "rustfmt")] as $checks
-                # Full VM test-script seconds measured in CI run 33373569579.
+                # Full VM test-script seconds measured in CI run 33379073615.
                 | {
-                    "activation-modes": 762.60,
-                    "file-mode-with-flake-capable-nix": 894.60,
-                    "flake-build-with-flakes-disabled-in-config": 591.93,
-                    "flake-remote-build-with-flakes-disabled-in-config": 748.07,
-                    "hyphen-ssh-opts-regression": 484.96,
-                    "local-build": 629.94,
-                    "multi-host-scenarios": 917.45,
-                    "options-overriding": 752.40,
-                    "profile": 638.22,
-                    "remote-build": 630.09,
-                    "rollback-scenarios": 936.87,
-                    "ssh-multiplexing": 810.69,
-                    "ssh-rollback": 835.54
+                    "activation-modes": 759.30,
+                    "file-mode-with-flake-capable-nix": 683.44,
+                    "flake-build-with-flakes-disabled-in-config": 646.19,
+                    "flake-remote-build-with-flakes-disabled-in-config": 362.43,
+                    "hyphen-ssh-opts-regression": 453.88,
+                    "local-build": 605.72,
+                    "multi-host-scenarios": 635.90,
+                    "options-overriding": 362.94,
+                    "profile": 485.13,
+                    "remote-build": 592.29,
+                    "rollback-scenarios": 868.49,
+                    "ssh-multiplexing": 550.59,
+                    "ssh-rollback": 849.20
                   } as $weights
                 | ["deploy-rx", "reuse", "transform-deploy"] as $lightChecks
                 | [$checks[] | select($weights[.check] != null) | . + {weight: $weights[.check]}] as $weighted
