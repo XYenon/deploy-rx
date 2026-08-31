@@ -390,13 +390,15 @@ pub enum ProfileInfo {
 pub enum DeployDataDefsError {
     #[error("Neither `user` nor `sshUser` are set for profile {0} of node {1}")]
     NoProfileUser(String, String),
+    #[error("Failed to determine the SSH user: {0}")]
+    WhoAmI(#[from] whoami::Error),
 }
 
 impl<'a> DeployData<'a> {
     pub fn defs(&'a self) -> Result<DeployDefs, DeployDataDefsError> {
         let ssh_user = match self.merged_settings.ssh_user {
             Some(ref u) => u.clone(),
-            None => whoami::username(),
+            None => whoami::username()?,
         };
 
         let profile_user = self.get_profile_user()?;

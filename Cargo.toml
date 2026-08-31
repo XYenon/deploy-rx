@@ -27,7 +27,7 @@ signal-hook = "0.4"
 thiserror = "2.0"
 tokio = { version = "1.44.2", features = [ "process", "macros", "sync", "rt-multi-thread", "fs", "time", "io-util" ] }
 toml = "1.0"
-whoami = "1.6"
+whoami = "2.0"
 yn = "0.1"
 rpassword = "7.5.0"
 unescape = "0.1.0"
