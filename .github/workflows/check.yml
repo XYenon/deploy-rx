@@ -10,16 +10,25 @@ on:
       - master
   pull_request:
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  cargo-test:
-    name: Cargo test
+  rust:
+    name: Rust checks
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@main
       - uses: DeterminateSystems/determinate-nix-action@main
       - uses: DeterminateSystems/magic-nix-cache-action@main
-      - name: Run cargo test
-        run: nix develop --command cargo test
+      - name: Run Rust checks
+        run: |
+          nix develop --command bash -euo pipefail -c '
+            cargo fmt --check
+            cargo clippy --all-targets -- --deny warnings
+            cargo test
+          '
 
   get-matrix:
     name: Get matrix
@@ -31,11 +40,32 @@ jobs:
       - uses: DeterminateSystems/determinate-nix-action@main
       - uses: DeterminateSystems/magic-nix-cache-action@main
       - id: set-check-matrix
-        run: echo "matrix=$(nix eval --json .#check-matrix.x86_64-linux)" >> $GITHUB_OUTPUT
+        run: |
+          matrix="$(
+            nix eval --json .#check-matrix.x86_64-linux |
+              jq -c '
+                [.include[] | select(.check != "clippy" and .check != "rustfmt")] as $checks
+                | {
+                    include: [
+                      range(0; 6) as $shard
+                      | {
+                          shard: ($shard + 1),
+                          checks: [
+                            $checks
+                            | to_entries[]
+                            | select((.key % 6) == $shard)
+                            | ".#checks.x86_64-linux.\(.value.check)"
+                          ]
+                        }
+                    ]
+                  }
+              '
+          )"
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
 
   check:
     needs: get-matrix
-    name: Check ${{ matrix.check }}
+    name: Check shard ${{ matrix.shard }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -46,4 +76,4 @@ jobs:
       - uses: DeterminateSystems/determinate-nix-action@main
       - uses: DeterminateSystems/magic-nix-cache-action@main
       - name: Check
-        run: nix build -L .#checks.x86_64-linux.${{ matrix.check }}
+        run: nix build -L ${{ join(matrix.checks, ' ') }}
