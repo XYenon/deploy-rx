@@ -63,6 +63,7 @@ profiles.system = {
 
 ---
 
+<!-- Keep the original deploy-rs documentation below unchanged. Document all deploy-rx-specific changes above this line. -->
 *Below is the original documentation for `deploy-rs`. The core functionality and architecture largely apply to `deploy-rx` as well:*
 
 ![deploy-rs logo](./docs/logo.svg "deploy-rs")
