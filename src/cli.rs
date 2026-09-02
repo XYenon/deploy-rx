@@ -190,19 +190,26 @@ pub enum CheckDeploymentError {
     NixCheck(#[from] command::CommandError<NixCheckError>),
 }
 
-async fn command_exists(command: &str, path: Option<&OsStr>) -> bool {
+async fn command_exists(command: &str, path: Option<&OsStr>) -> std::io::Result<bool> {
     let mut command = Command::new(command);
     if let Some(path) = path {
         command.env("PATH", path);
     }
 
-    command
+    match command
         .arg("--version")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
         .await
-        .is_ok()
+    {
+        Ok(_) => Ok(true),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(std::io::Error::new(
+            err.kind(),
+            format!("failed to check whether `nom` is available: {err}"),
+        )),
+    }
 }
 
 async fn run_check_command(
@@ -218,7 +225,10 @@ async fn run_check_command(
         .and_then(|(_, value)| value.map(|value| value.to_os_string()));
 
     if build_tree {
-        if !command_exists("nom", path.as_deref()).await {
+        let nom_available = command_exists("nom", path.as_deref())
+            .await
+            .map_err(|err| CheckDeploymentError::NixCheck(command::CommandError::RunError(err)))?;
+        if !nom_available {
             warn!(
                 "Build tree visualization requested for checks but `nom` is not available in PATH; falling back to regular check logs"
             );
@@ -1520,6 +1530,24 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn test_command_exists_propagates_probe_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        std::fs::write(bin.join("nom"), "not executable").unwrap();
+
+        let err = command_exists("nom", Some(bin.as_os_str()))
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(err
+            .to_string()
+            .contains("failed to check whether `nom` is available"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn test_run_check_command_uses_nom_from_command_path() {
         let dir = tempfile::tempdir().unwrap();
         let bin = dir.path().join("bin");
@@ -1537,7 +1565,7 @@ mod tests {
         write_executable(
             &bin.join("nom"),
             &format!(
-                "#!/bin/sh\nif [ \"$1\" = --version ]; then exit 0; fi\nprintf '%s\\n' \"$@\" > {}\n/bin/cat >/dev/null\nexit 0\n",
+                "#!/bin/sh\nif [ \"$1\" = --version ]; then exit 0; fi\nprintf '%s\\n' \"$@\" > {}\nwhile IFS= read -r _; do :; done\nexit 0\n",
                 nom_args.display()
             ),
         );
