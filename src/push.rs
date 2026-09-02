@@ -267,10 +267,21 @@ async fn run_build_command(
     build_command
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit());
-    let output = command::Command::new(build_command)
-        .run()
+    let command_debug = format!("{:?}", build_command);
+    let child = build_command
+        .spawn()
+        .map_err(|err| PushProfileError::Build(command::CommandError::RunError(err)))?;
+    let output = child
+        .wait_with_output()
         .await
-        .map_err(PushProfileError::Build)?;
+        .map_err(|err| PushProfileError::Build(command::CommandError::RunError(err)))?;
+
+    if !output.status.success() {
+        return Err(PushProfileError::Build(command::CommandError::Exit(
+            output,
+            command_debug,
+        )));
+    }
 
     Ok(output.stdout)
 }

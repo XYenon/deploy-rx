@@ -14,12 +14,7 @@ use thiserror::Error;
 
 use flexi_logger::*;
 
-use std::path::{Path, PathBuf};
-
-pub fn make_lock_path(temp_path: &Path, closure: &str) -> PathBuf {
-    let lock_hash = &closure["/nix/store/".len()..closure.find('-').unwrap_or(closure.len())];
-    temp_path.join(format!("deploy-rx-canary-{}", lock_hash))
-}
+use std::path::PathBuf;
 
 const fn make_emoji(level: log::Level) -> &'static str {
     match level {
@@ -41,22 +36,6 @@ pub fn logger_formatter_activate(
     write!(
         w,
         "⭐ {} [activate] [{}] {}",
-        make_emoji(level),
-        style(level).paint(level.to_string()),
-        record.args()
-    )
-}
-
-pub fn logger_formatter_wait(
-    w: &mut dyn std::io::Write,
-    _now: &mut DeferredNow,
-    record: &Record,
-) -> Result<(), std::io::Error> {
-    let level = record.level();
-
-    write!(
-        w,
-        "👀 {} [wait] [{}] {}",
         make_emoji(level),
         style(level).paint(level.to_string()),
         record.args()
@@ -98,7 +77,6 @@ pub fn logger_formatter_deploy(
 pub enum LoggerType {
     Deploy,
     Activate,
-    Wait,
     Revoke,
 }
 
@@ -110,7 +88,6 @@ pub fn init_logger(
     let logger_formatter = match &logger_type {
         LoggerType::Deploy => logger_formatter_deploy,
         LoggerType::Activate => logger_formatter_activate,
-        LoggerType::Wait => logger_formatter_wait,
         LoggerType::Revoke => logger_formatter_revoke,
     };
 
@@ -119,7 +96,6 @@ pub fn init_logger(
 
         match logger_type {
             LoggerType::Activate => file_spec = file_spec.discriminant("activate"),
-            LoggerType::Wait => file_spec = file_spec.discriminant("wait"),
             LoggerType::Revoke => file_spec = file_spec.discriminant("revoke"),
             LoggerType::Deploy => (),
         }

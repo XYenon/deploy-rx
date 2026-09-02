@@ -32,7 +32,7 @@
             "src/bin"
             ".*.rs$"
             "nix"
-            "nix/.*\.nix$"
+            "nix/.*.nix$"
           ];
 
           cargoLock.lockFile = ./Cargo.lock;
