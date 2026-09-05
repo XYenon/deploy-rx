@@ -12,7 +12,7 @@ edition = "2018"
 
 [dependencies]
 clap = { version = "4", features = [ "wrap_help", "derive" ] }
-dirs = "6"
+dirs = "7"
 flexi_logger = "0.31"
 fork = "0.10"
 futures-util = "0.3.31"
