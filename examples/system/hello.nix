@@ -21,7 +21,8 @@ let
       script = "hello";
     };
   };
-in pkgs.writeShellScriptBin "activate" ''
+in
+pkgs.writeShellScriptBin "activate" ''
   mkdir -p $HOME/.config/systemd/user
   rm $HOME/.config/systemd/user/hello.service
   ln -s ${service} $HOME/.config/systemd/user/hello.service

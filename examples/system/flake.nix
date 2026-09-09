@@ -7,41 +7,53 @@
 
   inputs.deploy-rx.url = "github:XYenon/deploy-rx";
 
-  outputs = { self, nixpkgs, deploy-rx }: {
-    nixosConfigurations.example-nixos-system = nixpkgs.lib.nixosSystem {
-      system = "x86_64-linux";
-      modules = [ ./configuration.nix ];
-    };
+  outputs =
+    {
+      self,
+      nixpkgs,
+      deploy-rx,
+    }:
+    {
+      nixosConfigurations.example-nixos-system = nixpkgs.lib.nixosSystem {
+        system = "x86_64-linux";
+        modules = [
+          ./configuration.nix
+          "${nixpkgs}/nixos/modules/virtualisation/qemu-vm.nix"
+        ];
+      };
 
-    nixosConfigurations.bare = nixpkgs.lib.nixosSystem {
-      system = "x86_64-linux";
-      modules =
-        [ ./bare.nix "${nixpkgs}/nixos/modules/virtualisation/qemu-vm.nix" ];
-    };
+      nixosConfigurations.bare = nixpkgs.lib.nixosSystem {
+        system = "x86_64-linux";
+        modules = [
+          ./bare.nix
+          "${nixpkgs}/nixos/modules/virtualisation/qemu-vm.nix"
+        ];
+      };
 
-    # This is the application we actually want to run
-    defaultPackage.x86_64-linux = import ./hello.nix nixpkgs;
+      # This is the application we actually want to run
+      packages.x86_64-linux.default = import ./hello.nix nixpkgs;
 
-    deploy.nodes.example = {
-      sshOpts = [ "-p" "2221" ];
-      hostname = "localhost";
-      fastConnection = true;
-      interactiveSudo = true;
-      profiles = {
-        system = {
-          sshUser = "admin";
-          path =
-            deploy-rx.lib.x86_64-linux.activate.nixos self.nixosConfigurations.example-nixos-system;
-          user = "root";
-        };
-        hello = {
-          sshUser = "hello";
-          path = deploy-rx.lib.x86_64-linux.activate.custom self.defaultPackage.x86_64-linux "./bin/activate";
-          user = "hello";
+      deploy.nodes.example = {
+        sshOpts = [
+          "-p"
+          "2221"
+        ];
+        hostname = "localhost";
+        fastConnection = true;
+        profiles = {
+          system = {
+            sshUser = "admin";
+            path = deploy-rx.lib.x86_64-linux.activate.nixos self.nixosConfigurations.example-nixos-system;
+            user = "root";
+          };
+          hello = {
+            sshUser = "hello";
+            path = deploy-rx.lib.x86_64-linux.activate.custom self.packages.x86_64-linux.default "./bin/activate";
+            user = "hello";
+          };
         };
       };
-    };
 
-    checks = builtins.mapAttrs (system: deployLib: deployLib.deployChecks self.deploy) deploy-rx.lib;
-  };
+      checks = builtins.mapAttrs (system: deployLib: deployLib.deployChecks self.deploy) deploy-rx.lib;
+    };
 }
