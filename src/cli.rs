@@ -38,6 +38,14 @@ fn parse_ssh_opts(value: &str) -> Result<SshOpts, String> {
         .ok_or_else(|| "SSH options contain invalid shell quoting".to_string())
 }
 
+fn unique_repos<'a>(deploy_flakes: &[DeployFlake<'a>]) -> Vec<&'a str> {
+    let mut seen = HashSet::new();
+    deploy_flakes
+        .iter()
+        .filter_map(|deploy_flake| seen.insert(deploy_flake.repo).then_some(deploy_flake.repo))
+        .collect()
+}
+
 /// Simple Rust rewrite of a simple Nix Flake deployment tool
 #[derive(Parser, Debug, Clone)]
 #[command(version = "1.0", author = "Serokell <https://serokell.io/>")]
@@ -1056,6 +1064,29 @@ mod tests {
     use std::path::Path;
 
     #[test]
+    fn unique_repos_deduplicates_without_reordering() {
+        let deploy_flakes = vec![
+            DeployFlake {
+                repo: "repo-b",
+                node: Some("node-1".to_string()),
+                profile: None,
+            },
+            DeployFlake {
+                repo: "repo-a",
+                node: None,
+                profile: None,
+            },
+            DeployFlake {
+                repo: "repo-b",
+                node: Some("node-2".to_string()),
+                profile: Some("profile".to_string()),
+            },
+        ];
+
+        assert_eq!(unique_repos(&deploy_flakes), vec!["repo-b", "repo-a"]);
+    }
+
+    #[test]
     fn parses_quoted_ssh_option_arguments() {
         assert_eq!(
             parse_ssh_opts("-o 'ProxyCommand=ssh jump host -W %h:%p' -i '/keys/key file'")
@@ -1821,14 +1852,8 @@ pub async fn run(args: Option<&ArgMatches>) -> Result<(), RunError> {
     let review_changes = opts.review_changes && !opts.no_review_changes;
 
     if !opts.skip_checks {
-        for deploy_flake in &deploy_flakes {
-            check_deployment(
-                using_flakes,
-                deploy_flake.repo,
-                &opts.extra_build_args,
-                build_tree,
-            )
-            .await?;
+        for repo in unique_repos(&deploy_flakes) {
+            check_deployment(using_flakes, repo, &opts.extra_build_args, build_tree).await?;
         }
     }
     let result_path = opts.result_path.as_deref();
