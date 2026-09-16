@@ -91,6 +91,9 @@ pub struct Opts {
     /// Directory to print logs to (including the background activation process)
     #[arg(long)]
     log_dir: Option<String>,
+    /// Disable prefixing lines from remote hosts with an emoji
+    #[arg(long)]
+    no_demarcate_output: bool,
 
     /// Keep the build outputs of each built profile
     #[arg(short, long)]
@@ -868,6 +871,7 @@ async fn run_deploy(
     rollback_fresh_connection: bool,
     build_tree: bool,
     review_changes: bool,
+    demarcate_output: bool,
     tags: &[String],
 ) -> Result<(), RunDeployError> {
     let to_deploy = collect_to_deploy(&deploy_flakes, &data, tags)?;
@@ -1014,6 +1018,7 @@ async fn run_deploy(
             test,
             rollback_fresh_connection,
             review_changes,
+            demarcate_output,
         )
         .await
         {
@@ -1028,7 +1033,7 @@ async fn run_deploy(
                 //  the command line)
                 for (deploy_data, deploy_defs, closure) in &succeeded {
                     if deploy_data.merged_settings.auto_rollback.unwrap_or(true) {
-                        deploy::deploy::revoke(deploy_data, deploy_defs, closure)
+                        deploy::deploy::revoke(deploy_data, deploy_defs, closure, demarcate_output)
                             .await
                             .map_err(|e| {
                                 RunDeployError::RevokeProfile(deploy_data.node_name.to_string(), e)
@@ -1104,6 +1109,13 @@ mod tests {
     #[test]
     fn rejects_unterminated_ssh_option_quotes() {
         assert!(parse_ssh_opts("-o 'ProxyCommand=ssh jump").is_err());
+    }
+
+    #[test]
+    fn parses_no_demarcate_output_flag() {
+        let opts = Opts::try_parse_from(["deploy", "--no-demarcate-output", "."]).unwrap();
+
+        assert!(opts.no_demarcate_output);
     }
 
     #[test]
@@ -1549,6 +1561,7 @@ mod tests {
             false,
             false,
             false,
+            false,
             &tags,
         )
         .await;
@@ -1879,6 +1892,7 @@ pub async fn run(args: Option<&ArgMatches>) -> Result<(), RunError> {
         !opts.no_rollback_fresh_connection,
         build_tree,
         review_changes,
+        !opts.no_demarcate_output,
         &opts.tags,
     )
     .await?;
