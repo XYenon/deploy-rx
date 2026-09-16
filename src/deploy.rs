@@ -8,7 +8,7 @@ use log::{info, warn};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use thiserror::Error;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 
 use crate::remote_protocol::{
@@ -165,6 +165,57 @@ fn decode_remote_event_line(
     }
 }
 
+async fn forward_remote_output<R, W>(mut reader: R, mut writer: W) -> std::io::Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    const BUFFER_SIZE: usize = 65536;
+    const PREFIX: &[u8] = "📠 ".as_bytes();
+
+    let mut buffer = [0_u8; BUFFER_SIZE];
+    let mut output = Vec::with_capacity(BUFFER_SIZE);
+    let mut previous_byte = b'\n';
+
+    loop {
+        let bytes_read = reader.read(&mut buffer).await?;
+        if bytes_read == 0 {
+            return Ok(());
+        }
+
+        output.clear();
+        for &byte in &buffer[..bytes_read] {
+            if previous_byte == b'\n' {
+                output.extend_from_slice(PREFIX);
+            }
+            output.push(byte);
+            previous_byte = byte;
+        }
+
+        if let Err(error) = writer.write_all(&output).await {
+            // Keep draining the pipe so the remote process cannot block after
+            // the local output stream has closed.
+            while reader.read(&mut buffer).await? != 0 {}
+            return Err(error);
+        }
+    }
+}
+
+async fn forward_optional_remote_stderr(
+    stderr: Option<tokio::process::ChildStderr>,
+) -> std::io::Result<()> {
+    match stderr {
+        Some(stderr) => forward_remote_output(stderr, tokio::io::stderr()).await,
+        None => Ok(()),
+    }
+}
+
+fn warn_remote_stderr_error(result: Result<(), std::io::Error>) {
+    if let Err(error) = result {
+        warn!("Error while forwarding remote stderr: {}", error);
+    }
+}
+
 #[derive(Error, Debug)]
 pub enum RemoteConfirmError {
     #[error("failed to build remote confirm command: {0}")]
@@ -192,6 +243,7 @@ struct RemoteConfirmData<'a> {
     session_id: String,
     nonce: String,
     rollback_fresh_connection: bool,
+    demarcate_output: bool,
 }
 
 async fn confirm_remote_session(data: RemoteConfirmData<'_>) -> Result<(), RemoteConfirmError> {
@@ -220,6 +272,9 @@ async fn confirm_remote_session(data: RemoteConfirmData<'_>) -> Result<(), Remot
 
     let mut command = Command::new("ssh");
     command.arg(&ssh_addr).stdin(Stdio::piped());
+    if data.demarcate_output {
+        command.stderr(Stdio::piped());
+    }
 
     if data.rollback_fresh_connection {
         for ssh_opt in ssh_opts_without_control_master(&data.deploy_data.merged_settings.ssh_opts) {
@@ -257,7 +312,11 @@ async fn confirm_remote_session(data: RemoteConfirmData<'_>) -> Result<(), Remot
         .await
         .map_err(RemoteConfirmError::WriteRequest)?;
 
-    let status = child.wait().await.map_err(RemoteConfirmError::Wait)?;
+    let stderr = child.stderr.take();
+    let (status, stderr_result) =
+        tokio::join!(child.wait(), forward_optional_remote_stderr(stderr),);
+    warn_remote_stderr_error(stderr_result);
+    let status = status.map_err(RemoteConfirmError::Wait)?;
 
     if !status.success() {
         return Err(RemoteConfirmError::Exit(status.code()));
@@ -271,6 +330,7 @@ async fn run_remote_operation(
     deploy_defs: &super::DeployDefs,
     operation: RemoteOperation,
     rollback_fresh_connection: bool,
+    demarcate_output: bool,
 ) -> Result<(), RemoteSessionError> {
     let hostname = match deploy_data.cmd_overrides.hostname {
         Some(ref x) => x,
@@ -301,8 +361,12 @@ async fn run_remote_operation(
     command
         .arg(&ssh_addr)
         .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit());
+        .stdout(Stdio::piped());
+    if demarcate_output {
+        command.stderr(Stdio::piped());
+    } else {
+        command.stderr(Stdio::inherit());
+    }
 
     for ssh_opt in &deploy_data.merged_settings.ssh_opts {
         command.arg(ssh_opt);
@@ -331,61 +395,79 @@ async fn run_remote_operation(
         .stdout
         .take()
         .ok_or(RemoteSessionError::MissingStdout)?;
-    let mut lines = BufReader::new(stdout).lines();
-    let mut finished: Option<(bool, String)> = None;
-    let mut saw_protocol_event = false;
+    let stderr = child.stderr.take();
 
-    while let Some(line) = lines
-        .next_line()
-        .await
-        .map_err(RemoteSessionError::ReadEvent)?
-    {
-        let Some(event) = decode_remote_event_line(&line, saw_protocol_event)? else {
-            continue;
-        };
-        saw_protocol_event = true;
+    let stderr_task = tokio::spawn(forward_optional_remote_stderr(stderr));
+    let session_result = async {
+        let mut lines = BufReader::new(stdout).lines();
+        let mut finished: Option<(bool, String)> = None;
+        let mut saw_protocol_event = false;
 
-        match event {
-            RemoteEvent::Hello { protocol_version } => {
-                if protocol_version != REMOTE_PROTOCOL_VERSION {
-                    return Err(RemoteSessionError::ProtocolVersion {
-                        local: REMOTE_PROTOCOL_VERSION,
-                        remote: protocol_version,
-                    });
+        while let Some(line) = lines
+            .next_line()
+            .await
+            .map_err(RemoteSessionError::ReadEvent)?
+        {
+            let Some(event) = decode_remote_event_line(&line, saw_protocol_event)? else {
+                continue;
+            };
+            saw_protocol_event = true;
+
+            match event {
+                RemoteEvent::Hello { protocol_version } => {
+                    if protocol_version != REMOTE_PROTOCOL_VERSION {
+                        return Err(RemoteSessionError::ProtocolVersion {
+                            local: REMOTE_PROTOCOL_VERSION,
+                            remote: protocol_version,
+                        });
+                    }
                 }
-            }
-            RemoteEvent::AwaitingConfirm { session_id, nonce } => {
-                info!("Activation is waiting for fresh SSH confirmation");
-                if let Err(err) = confirm_remote_session(RemoteConfirmData {
-                    deploy_data,
-                    deploy_defs,
-                    hostname,
-                    closure: &closure,
-                    temp_path: &temp_path,
-                    session_id,
-                    nonce,
-                    rollback_fresh_connection,
-                })
-                .await
-                {
-                    warn!("Fresh SSH confirmation failed: {}", err);
+                RemoteEvent::AwaitingConfirm { session_id, nonce } => {
+                    info!("Activation is waiting for fresh SSH confirmation");
+                    if let Err(err) = confirm_remote_session(RemoteConfirmData {
+                        deploy_data,
+                        deploy_defs,
+                        hostname,
+                        closure: &closure,
+                        temp_path: &temp_path,
+                        session_id,
+                        nonce,
+                        rollback_fresh_connection,
+                        demarcate_output,
+                    })
+                    .await
+                    {
+                        warn!("Fresh SSH confirmation failed: {}", err);
+                    }
                 }
-            }
-            RemoteEvent::Finished {
-                ok,
-                rolled_back: _,
-                message,
-            } => {
-                finished = Some((ok, message));
-                break;
+                RemoteEvent::Finished {
+                    ok,
+                    rolled_back: _,
+                    message,
+                } => {
+                    finished = Some((ok, message));
+                    break;
+                }
             }
         }
+
+        let status = child.wait().await.map_err(RemoteSessionError::Wait)?;
+
+        // Prefer the descriptive error message from the `Finished` event when available.
+        interpret_remote_session_completion(finished, status.success(), status.code())
+    }
+    .await;
+
+    if session_result.is_err() {
+        let _ = child.kill().await;
+        let _ = child.wait().await;
     }
 
-    let status = child.wait().await.map_err(RemoteSessionError::Wait)?;
-
-    // Prefer the descriptive error message from the `Finished` event when available.
-    interpret_remote_session_completion(finished, status.success(), status.code())
+    match stderr_task.await {
+        Ok(stderr_result) => warn_remote_stderr_error(stderr_result),
+        Err(error) => warn!("Remote stderr forwarding task failed: {}", error),
+    }
+    session_result
 }
 
 #[derive(Error, Debug)]
@@ -406,6 +488,7 @@ pub async fn deploy_profile(
     test: bool,
     rollback_fresh_connection: bool,
     review_changes: bool,
+    demarcate_output: bool,
 ) -> Result<(), DeployProfileError> {
     if !dry_activate {
         info!(
@@ -441,6 +524,7 @@ pub async fn deploy_profile(
         deploy_defs,
         RemoteOperation::Deploy(request),
         rollback_fresh_connection,
+        demarcate_output,
     )
     .await?;
 
@@ -467,6 +551,7 @@ pub async fn revoke(
     deploy_data: &crate::DeployData<'_>,
     deploy_defs: &crate::DeployDefs,
     closure: &str,
+    demarcate_output: bool,
 ) -> Result<(), RevokeProfileError> {
     let temp_path: &Path = match &deploy_data.merged_settings.temp_path {
         Some(x) => x,
@@ -487,6 +572,7 @@ pub async fn revoke(
         deploy_defs,
         RemoteOperation::Revoke(request),
         true,
+        demarcate_output,
     )
     .await?;
 
@@ -496,6 +582,7 @@ pub async fn revoke(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{duplex, AsyncReadExt};
 
     #[test]
     fn quotes_remote_activate_rs_path() {
@@ -540,5 +627,33 @@ mod tests {
             err,
             RemoteSessionError::DecodeEvent { line, .. } if line == "Last login: just now"
         ));
+    }
+
+    #[tokio::test]
+    async fn prefixes_each_remote_output_line_and_preserves_unterminated_output() {
+        let (mut input_writer, input_reader) = duplex(64);
+        let (output_writer, mut output_reader) = duplex(64);
+
+        let write_input = async move {
+            input_writer
+                .write_all(b"first line\nsecond line\nunterminated")
+                .await
+                .unwrap();
+            input_writer.shutdown().await.unwrap();
+        };
+        let forward = forward_remote_output(input_reader, output_writer);
+        let read_output = async move {
+            let mut output = Vec::new();
+            output_reader.read_to_end(&mut output).await.unwrap();
+            output
+        };
+
+        let ((), forward_result, output) = tokio::join!(write_input, forward, read_output);
+        forward_result.unwrap();
+
+        assert_eq!(
+            output,
+            "📠 first line\n📠 second line\n📠 unterminated".as_bytes()
+        );
     }
 }
