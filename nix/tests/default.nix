@@ -384,7 +384,7 @@ in {
         server.succeed("grep -Fx baseline /tmp/multi-rollback/app")
         server.succeed("grep -Fx baseline /tmp/multi-rollback/bad")
         work_fail("deploy -s --no-build-tree --no-review-changes --targets .#multi-rollback-ok .#multi-rollback-fail -- --offline > /tmp/multi-rollback.out 2>&1", timeout=600)
-        client_sh("grep -F 'Revoking previous deploys' /tmp/multi-rollback.out")
+        client_sh("grep -F 'Revoking 1 previously deployed profile(s)' /tmp/multi-rollback.out")
         server.succeed("grep -Fx baseline /tmp/multi-rollback/app")
         server.succeed("grep -Fx baseline /tmp/multi-rollback/bad")
 
@@ -419,7 +419,7 @@ in {
         server.succeed("grep -Fx baseline /tmp/multi-host/a")
         server2.succeed("grep -Fx baseline /tmp/multi-host/b")
         work_fail("deploy -s --no-build-tree --no-review-changes --targets .#multi-host-a-updated .#multi-host-b-fail -- --offline > /tmp/multi-host-rollback.out 2>&1", timeout=600)
-        client_sh("grep -F 'Revoking previous deploys' /tmp/multi-host-rollback.out")
+        client_sh("grep -F 'Revoking 1 previously deployed profile(s)' /tmp/multi-host-rollback.out")
         server.succeed("grep -Fx baseline /tmp/multi-host/a")
         server2.succeed("grep -Fx baseline /tmp/multi-host/b")
     '';

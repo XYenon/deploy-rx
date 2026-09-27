@@ -12,7 +12,7 @@ use crate as deploy;
 
 use self::deploy::{command, DeployFlake, ParseFlakeError};
 use futures_util::future::try_join_all;
-use log::{debug, error, info, warn};
+use log::{debug, info, warn};
 use serde::Serialize;
 use std::ffi::OsStr;
 use std::path::PathBuf;
@@ -689,10 +689,15 @@ pub enum RunDeployError {
     TomlFormat(#[from] toml::ser::Error),
     #[error("{0}")]
     PromptDeployment(#[from] PromptDeploymentError),
-    #[error("Failed to revoke profile for node {0}: {1}")]
-    RevokeProfile(String, deploy::deploy::RevokeProfileError),
-    #[error("Deployment to node {0} failed, rolled back to previous generation")]
-    Rollback(String),
+    #[error("Deployment to node {0} failed; eligible previous profiles were revoked: {1}")]
+    Rollback(String, deploy::deploy::DeployProfileError),
+    #[error("Deployment to node {node} failed: {deployment}; revoked {revoked} previous profile(s), but rollback failed for: {failures}")]
+    RollbackFailed {
+        node: String,
+        deployment: deploy::deploy::DeployProfileError,
+        revoked: usize,
+        failures: String,
+    },
     #[error("Failed to establish SSH control master: {0}")]
     SshControlMaster(#[from] deploy::ssh::SshError),
     #[error("No profiles matched the requested tags: {0}")]
@@ -713,6 +718,37 @@ type DeployPart<'a> = (
     deploy::DeployData<'a>,
     deploy::DeployDefs,
 );
+
+fn rollback_targets(
+    dry_activate: bool,
+    rollback_succeeded: bool,
+    global_auto_rollback: bool,
+    profiles: impl Iterator<Item = Option<bool>>,
+) -> Vec<usize> {
+    if dry_activate || !rollback_succeeded || !global_auto_rollback {
+        return Vec::new();
+    }
+    profiles
+        .enumerate()
+        .filter_map(|(index, enabled)| enabled.unwrap_or(true).then_some(index))
+        .collect()
+}
+
+async fn revoke_all<F, Fut, E>(targets: &[usize], mut revoke: F) -> (usize, Vec<(usize, E)>)
+where
+    F: FnMut(usize) -> Fut,
+    Fut: std::future::Future<Output = Result<(), E>>,
+{
+    let mut revoked = 0;
+    let mut failures = Vec::new();
+    for &index in targets {
+        match revoke(index).await {
+            Ok(()) => revoked += 1,
+            Err(error) => failures.push((index, error)),
+        }
+    }
+    (revoked, failures)
+}
 
 struct PushProfileDataOptions<'a> {
     supports_flakes: bool,
@@ -1015,10 +1051,8 @@ async fn run_deploy(
 
     let mut succeeded: Vec<(&deploy::DeployData, &deploy::DeployDefs, &str)> = vec![];
 
-    // Run all deployments
-    // In case of an error rollback any previoulsy made deployment.
-    // Rollbacks adhere to the global seeting to auto_rollback and secondary
-    // the profile's configuration
+    // Only revoke profiles activated earlier in this run. A dry activation
+    // must not revoke profiles from earlier dry runs.
     for ((_, deploy_data, deploy_defs), closure) in parts.iter().zip(&closures) {
         if let Err(e) = deploy::deploy::deploy_profile(
             deploy_data,
@@ -1033,25 +1067,44 @@ async fn run_deploy(
         )
         .await
         {
-            error!("{}", e);
-            if dry_activate {
-                info!("dry run, not rolling back");
-            }
-            if rollback_succeeded && cmd_overrides.auto_rollback.unwrap_or(true) {
-                info!("Revoking previous deploys");
-                // revoking all previous deploys
-                // (adheres to profile configuration if not set explicitely by
-                //  the command line)
-                for (deploy_data, deploy_defs, closure) in &succeeded {
-                    if deploy_data.merged_settings.auto_rollback.unwrap_or(true) {
-                        deploy::deploy::revoke(deploy_data, deploy_defs, closure, demarcate_output)
-                            .await
-                            .map_err(|e| {
-                                RunDeployError::RevokeProfile(deploy_data.node_name.to_string(), e)
-                            })?;
-                    }
+            let to_revoke = rollback_targets(
+                dry_activate,
+                rollback_succeeded,
+                cmd_overrides.auto_rollback.unwrap_or(true),
+                succeeded
+                    .iter()
+                    .map(|(data, _, _)| data.merged_settings.auto_rollback),
+            );
+            if !to_revoke.is_empty() {
+                info!(
+                    "Revoking {} previously deployed profile(s)",
+                    to_revoke.len()
+                );
+                let (revoked, failures) = revoke_all(&to_revoke, |index| {
+                    let (deploy_data, deploy_defs, closure) = succeeded[index];
+                    deploy::deploy::revoke(deploy_data, deploy_defs, closure, demarcate_output)
+                })
+                .await;
+                if !failures.is_empty() {
+                    let failures = failures
+                        .into_iter()
+                        .map(|(index, error)| {
+                            let (data, _, _) = succeeded[index];
+                            format!("{}.{}: {}", data.node_name, data.profile_name, error)
+                        })
+                        .collect::<Vec<_>>()
+                        .join("; ");
+                    return Err(RunDeployError::RollbackFailed {
+                        node: deploy_data.node_name.to_string(),
+                        deployment: e,
+                        revoked,
+                        failures,
+                    });
                 }
-                return Err(RunDeployError::Rollback(deploy_data.node_name.to_string()));
+                return Err(RunDeployError::Rollback(
+                    deploy_data.node_name.to_string(),
+                    e,
+                ));
             }
             return Err(RunDeployError::DeployProfile(
                 deploy_data.node_name.to_string(),
@@ -1078,6 +1131,69 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     #[cfg(unix)]
     use std::path::Path;
+
+    #[test]
+    fn dry_activation_never_revokes_a_previous_profile() {
+        assert_eq!(
+            rollback_targets(true, true, true, [Some(true), None].iter().copied()),
+            Vec::<usize>::new()
+        );
+    }
+
+    #[test]
+    fn previous_profile_rollback_respects_global_and_profile_settings() {
+        let profiles = [Some(false), None, Some(true)];
+        assert_eq!(
+            rollback_targets(false, true, true, profiles.iter().copied()),
+            vec![1, 2]
+        );
+        assert!(rollback_targets(false, false, true, profiles.iter().copied()).is_empty());
+        assert!(rollback_targets(false, true, false, profiles.iter().copied()).is_empty());
+        assert!(rollback_targets(false, true, true, [Some(false)].iter().copied()).is_empty());
+        assert!(rollback_targets(false, true, true, std::iter::empty()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn revoke_all_attempts_later_profiles_after_failures() {
+        let mut attempted = Vec::new();
+        let (revoked, failures) = revoke_all(&[0, 1, 2, 3], |index| {
+            attempted.push(index);
+            async move {
+                if index == 0 || index == 2 {
+                    Err(format!("failed to revoke profile {}", index))
+                } else {
+                    Ok(())
+                }
+            }
+        })
+        .await;
+
+        assert_eq!(attempted, vec![0, 1, 2, 3]);
+        assert_eq!(revoked, 2);
+        assert_eq!(
+            failures,
+            vec![
+                (0, "failed to revoke profile 0".to_string()),
+                (2, "failed to revoke profile 2".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn incomplete_rollback_reports_original_and_each_failed_target() {
+        let error = RunDeployError::RollbackFailed {
+            node: "node-c".to_string(),
+            deployment: deploy::deploy::DeployProfileError::RemoteSession(
+                deploy::deploy::RemoteSessionError::MissingFinished,
+            ),
+            revoked: 1,
+            failures: "node-a.system: SSH failed; node-b.web: nix-env failed".to_string(),
+        };
+        let message = error.to_string();
+        assert!(message.contains("node-c failed: Error running remote deployment session"));
+        assert!(message.contains("revoked 1 previous profile(s)"));
+        assert!(message.contains("node-a.system: SSH failed; node-b.web: nix-env failed"));
+    }
 
     #[test]
     fn unique_repos_deduplicates_without_reordering() {
