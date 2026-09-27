@@ -1204,7 +1204,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut signals = Signals::new([SIGHUP])?;
     std::thread::spawn(move || {
         for _ in signals.forever() {
-            eprintln!("Received SIGHUP - ignoring...");
+            debug!("Received SIGHUP; ignoring it to keep activation running");
         }
     });
 
