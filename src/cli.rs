@@ -91,7 +91,7 @@ pub struct Opts {
     /// Directory to print logs to (including the background activation process)
     #[arg(long)]
     log_dir: Option<String>,
-    /// Disable prefixing lines from remote hosts with an emoji
+    /// Disable labeling lines from remote hosts with node and profile
     #[arg(long)]
     no_demarcate_output: bool,
 
