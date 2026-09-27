@@ -123,18 +123,22 @@ pub enum RemoteSessionError {
 }
 
 fn interpret_remote_session_completion(
-    finished: Option<(bool, String)>,
+    finished: Option<(bool, bool, String)>,
     exit_success: bool,
     exit_code: Option<i32>,
 ) -> Result<(), RemoteSessionError> {
     match finished {
-        Some((true, _)) => {
+        Some((true, _, _)) => {
             if !exit_success {
                 return Err(RemoteSessionError::RemoteExit(exit_code));
             }
             Ok(())
         }
-        Some((false, message)) => Err(RemoteSessionError::RemoteFailed(message)),
+        Some((false, true, message)) => Err(RemoteSessionError::RemoteFailed(format!(
+            "{}; rollback completed",
+            message
+        ))),
+        Some((false, false, message)) => Err(RemoteSessionError::RemoteFailed(message)),
         None => {
             if !exit_success {
                 return Err(RemoteSessionError::RemoteExit(exit_code));
@@ -414,7 +418,7 @@ async fn run_remote_operation(
         tokio::spawn(async move { forward_optional_remote_stderr(stderr, &label).await });
     let session_result = async {
         let mut lines = BufReader::new(stdout).lines();
-        let mut finished: Option<(bool, String)> = None;
+        let mut finished: Option<(bool, bool, String)> = None;
         let mut saw_protocol_event = false;
 
         while let Some(line) = lines
@@ -437,7 +441,6 @@ async fn run_remote_operation(
                     }
                 }
                 RemoteEvent::AwaitingConfirm { session_id, nonce } => {
-                    info!("Activation is waiting for fresh SSH confirmation");
                     if let Err(err) = confirm_remote_session(RemoteConfirmData {
                         deploy_data,
                         deploy_defs,
@@ -451,15 +454,18 @@ async fn run_remote_operation(
                     })
                     .await
                     {
-                        warn!("Fresh SSH confirmation failed: {}", err);
+                        warn!(
+                            "Fresh SSH confirmation failed for `{}.{}`: {}",
+                            deploy_data.node_name, deploy_data.profile_name, err
+                        );
                     }
                 }
                 RemoteEvent::Finished {
                     ok,
-                    rolled_back: _,
+                    rolled_back,
                     message,
                 } => {
-                    finished = Some((ok, message));
+                    finished = Some((ok, rolled_back, message));
                     break;
                 }
             }
@@ -504,12 +510,19 @@ pub async fn deploy_profile(
     review_changes: bool,
     demarcate_output: bool,
 ) -> Result<(), DeployProfileError> {
-    if !dry_activate {
-        info!(
-            "Activating profile `{}` for node `{}`",
-            deploy_data.profile_name, deploy_data.node_name
-        );
-    }
+    let action = if dry_activate {
+        "Dry-activating"
+    } else if boot {
+        "Preparing next-boot activation for"
+    } else if test {
+        "Testing activation of"
+    } else {
+        "Activating"
+    };
+    info!(
+        "{} profile `{}.{}`",
+        action, deploy_data.node_name, deploy_data.profile_name
+    );
 
     let temp_path: &Path = match &deploy_data.merged_settings.temp_path {
         Some(x) => x,
@@ -543,11 +556,25 @@ pub async fn deploy_profile(
     .await?;
 
     if dry_activate {
-        info!("Completed dry-activate!");
+        info!(
+            "Dry activation completed for `{}.{}`",
+            deploy_data.node_name, deploy_data.profile_name
+        );
     } else if boot {
-        info!("Success activating for next boot, done!");
+        info!(
+            "Next-boot activation prepared for `{}.{}`",
+            deploy_data.node_name, deploy_data.profile_name
+        );
+    } else if test {
+        info!(
+            "Test activation completed for `{}.{}`",
+            deploy_data.node_name, deploy_data.profile_name
+        );
     } else {
-        info!("Success activating, done!");
+        info!(
+            "Activation completed for `{}.{}`",
+            deploy_data.node_name, deploy_data.profile_name
+        );
     }
 
     Ok(())
@@ -616,13 +643,31 @@ mod tests {
 
     #[test]
     fn remote_session_prefers_finished_error_over_exit_code() {
-        let err =
-            interpret_remote_session_completion(Some((false, "boom".to_string())), false, Some(1))
-                .unwrap_err();
+        let err = interpret_remote_session_completion(
+            Some((false, false, "boom".to_string())),
+            false,
+            Some(1),
+        )
+        .unwrap_err();
 
         assert!(matches!(
             err,
             RemoteSessionError::RemoteFailed(message) if message == "boom"
+        ));
+    }
+
+    #[test]
+    fn remote_session_reports_successful_rollback() {
+        let err = interpret_remote_session_completion(
+            Some((false, true, "activation failed".to_string())),
+            true,
+            Some(0),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            RemoteSessionError::RemoteFailed(message)
+                if message == "activation failed; rollback completed"
         ));
     }
 
