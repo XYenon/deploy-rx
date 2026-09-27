@@ -16,14 +16,16 @@ use flexi_logger::*;
 
 use std::path::PathBuf;
 
-const fn make_emoji(level: log::Level) -> &'static str {
-    match level {
-        log::Level::Error => "❌",
-        log::Level::Warn => "⚠️",
-        log::Level::Info => "ℹ️",
-        log::Level::Debug => "❓",
-        log::Level::Trace => "🖊️",
+fn format_record(w: &mut dyn std::io::Write, source: &str, record: &Record) -> std::io::Result<()> {
+    let prefix = format!("[{source} {}] ", record.level());
+    let message = record.args().to_string();
+    for (index, line) in message.split('\n').enumerate() {
+        if index > 0 {
+            writeln!(w)?;
+        }
+        write!(w, "{prefix}{line}")?;
     }
+    Ok(())
 }
 
 pub fn logger_formatter_activate(
@@ -31,15 +33,7 @@ pub fn logger_formatter_activate(
     _now: &mut DeferredNow,
     record: &Record,
 ) -> Result<(), std::io::Error> {
-    let level = record.level();
-
-    write!(
-        w,
-        "⭐ {} [activate] [{}] {}",
-        make_emoji(level),
-        style(level).paint(level.to_string()),
-        record.args()
-    )
+    format_record(w, "activate", record)
 }
 
 pub fn logger_formatter_revoke(
@@ -47,15 +41,7 @@ pub fn logger_formatter_revoke(
     _now: &mut DeferredNow,
     record: &Record,
 ) -> Result<(), std::io::Error> {
-    let level = record.level();
-
-    write!(
-        w,
-        "↩️ {} [revoke] [{}] {}",
-        make_emoji(level),
-        style(level).paint(level.to_string()),
-        record.args()
-    )
+    format_record(w, "revoke", record)
 }
 
 pub fn logger_formatter_deploy(
@@ -63,15 +49,7 @@ pub fn logger_formatter_deploy(
     _now: &mut DeferredNow,
     record: &Record,
 ) -> Result<(), std::io::Error> {
-    let level = record.level();
-
-    write!(
-        w,
-        "🚀 {} [deploy] [{}] {}",
-        make_emoji(level),
-        style(level).paint(level.to_string()),
-        record.args()
-    )
+    format_record(w, "deploy", record)
 }
 
 pub enum LoggerType {
@@ -103,7 +81,7 @@ pub fn init_logger(
         let _logger_handle = Logger::try_with_env_or_str("debug")?
             .log_to_file(file_spec)
             .format_for_stderr(logger_formatter)
-            .set_palette("196;208;51;7;8".to_string())
+            .format_for_files(logger_formatter)
             .duplicate_to_stderr(match debug_logs {
                 true => Duplicate::Debug,
                 false => Duplicate::Info,
@@ -117,11 +95,29 @@ pub fn init_logger(
         })?
         .log_to_stderr()
         .format(logger_formatter)
-        .set_palette("196;208;51;7;8".to_string())
         .start()?;
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod logger_tests {
+    use super::*;
+
+    #[test]
+    fn multiline_records_keep_source_and_level_on_every_line() {
+        let mut output = Vec::new();
+        let record = Record::builder()
+            .args(format_args!("failure:\nfirst detail\nsecond detail"))
+            .level(log::Level::Error)
+            .build();
+        format_record(&mut output, "deploy", &record).unwrap();
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            "[deploy ERROR] failure:\n[deploy ERROR] first detail\n[deploy ERROR] second detail"
+        );
+    }
 }
 
 pub mod cli;

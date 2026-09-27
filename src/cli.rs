@@ -934,7 +934,18 @@ async fn run_deploy(
     if interactive {
         prompt_deployment(&parts[..])?;
     } else {
-        print_deployment(&parts[..])?;
+        info!("Deploying {} profile(s)", parts.len());
+        for (_, data, _) in &parts {
+            info!(
+                "  {}.{} → {}",
+                data.node_name,
+                data.profile_name,
+                data.cmd_overrides
+                    .hostname
+                    .as_deref()
+                    .unwrap_or(&data.node.node_settings.hostname)
+            );
+        }
     }
 
     let push_profile_data_options = PushProfileDataOptions {
