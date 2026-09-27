@@ -280,11 +280,96 @@ fn get_profile_path(
 
 #[cfg(test)]
 mod tests {
-    use super::{get_profile_path, resolve_interactive_sudo_password, write_confirmation_file};
+    use super::{
+        get_profile_path, process_deploy_session, resolve_interactive_sudo_password,
+        session_error_after_rollback, write_confirmation_file,
+    };
+    use deploy::remote_protocol::{ProfileTarget, RemoteDeployRequest};
     use std::env;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+    use std::path::Path;
     use tempfile::tempdir;
+
+    fn dry_request(closure: &Path) -> RemoteDeployRequest {
+        RemoteDeployRequest {
+            closure: closure.display().to_string(),
+            profile: ProfileTarget::ProfilePath {
+                profile_path: closure.join("unused-profile").display().to_string(),
+            },
+            profile_user: "root".to_string(),
+            review_changes: false,
+            dry_activate: true,
+            boot: false,
+            test: false,
+            auto_rollback: true,
+            magic_rollback: true,
+            confirm_timeout: 1,
+            activation_timeout: None,
+            temp_path: closure.display().to_string(),
+            debug_logs: false,
+            log_dir: None,
+        }
+    }
+
+    #[test]
+    fn rollback_status_reflects_the_actual_restore_result() {
+        let restored = session_error_after_rollback("activation failed".to_string(), Ok(()));
+        assert!(restored.did_rollback());
+        assert_eq!(restored.to_string(), "activation failed");
+
+        let failed = session_error_after_rollback(
+            "activation failed".to_string(),
+            Err("nix-env could not restore the profile".to_string()),
+        );
+        assert!(!failed.did_rollback());
+        assert_eq!(
+            failed.to_string(),
+            "activation failed; rollback also failed: nix-env could not restore the profile"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dry_activation_script_failure_is_reported_without_rollback() {
+        let dir = tempdir().unwrap();
+        let script = dir.path().join("deploy-rx-activate");
+        std::fs::write(&script, "#!/bin/sh\nexit 7\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let err = process_deploy_session(dry_request(dir.path()))
+            .await
+            .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("dry activation script exited with code 7"));
+        assert!(!err.did_rollback());
+    }
+
+    #[tokio::test]
+    async fn dry_activation_spawn_failure_is_reported_without_rollback() {
+        let dir = tempdir().unwrap();
+        let err = process_deploy_session(dry_request(dir.path()))
+            .await
+            .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("dry activation failed: failed to spawn command"));
+        assert!(!err.did_rollback());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn successful_dry_activation_does_not_wait_for_confirmation() {
+        let dir = tempdir().unwrap();
+        let script = dir.path().join("deploy-rx-activate");
+        std::fs::write(&script, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(process_deploy_session(dry_request(dir.path()))
+            .await
+            .is_ok());
+    }
 
     #[test]
     fn test_get_profile_path_for_root_system_profile() {
@@ -850,20 +935,20 @@ async fn deactivate_session(
     reactivate_profile(profile_path).await
 }
 
-async fn rollback_after_confirmation_failure(
+fn session_error_after_rollback(reason: String, rollback: Result<(), String>) -> SessionError {
+    match rollback {
+        Ok(()) => SessionError::rolled_back(reason),
+        Err(error) => SessionError::failed(format!("{}; rollback also failed: {}", reason, error)),
+    }
+}
+
+async fn rollback_after_failure(
     profile_path: &str,
     previous_profile_target: Option<&Path>,
-    err: impl Into<String>,
+    reason: impl Into<String>,
 ) -> SessionError {
-    let err = err.into();
     let rollback = deactivate_session(profile_path, previous_profile_target).await;
-    SessionError::rolled_back(match rollback {
-        Ok(()) => format!("confirmation failed: {}", err),
-        Err(rollback_err) => format!(
-            "confirmation failed: {}; rollback also failed: {}",
-            err, rollback_err
-        ),
-    })
+    session_error_after_rollback(reason.into(), rollback)
 }
 
 async fn process_deploy_session(
@@ -898,7 +983,7 @@ async fn process_deploy_session(
     }
 
     if !request.dry_activate {
-        info!("Activating profile");
+        info!("Setting profile generation");
         // Only attempt a destructive rollback if `nix-env --set` actually advanced the profile to a
         // new generation. If `--set` fails without creating a new generation, rolling back here
         // would revert a previously-good deployment.
@@ -919,12 +1004,12 @@ async fn process_deploy_session(
                     && profile_link_after_set.is_some()
                     && profile_link_before_set != profile_link_after_set;
                 if should_rollback {
-                    let _ =
-                        deactivate_session(&profile_path, previous_profile_target.as_deref()).await;
-                    return Err(SessionError::rolled_back(format!(
-                        "setting profile resulted in a bad exit code: {:?}",
-                        code
-                    )));
+                    return Err(rollback_after_failure(
+                        &profile_path,
+                        previous_profile_target.as_deref(),
+                        format!("setting profile resulted in a bad exit code: {:?}", code),
+                    )
+                    .await);
                 }
                 return Err(SessionError::failed(format!(
                     "setting profile resulted in a bad exit code: {:?}",
@@ -938,16 +1023,22 @@ async fn process_deploy_session(
                     && profile_link_after_set.is_some()
                     && profile_link_before_set != profile_link_after_set;
                 if should_rollback {
-                    let _ =
-                        deactivate_session(&profile_path, previous_profile_target.as_deref()).await;
-                    return Err(SessionError::rolled_back(err));
+                    return Err(rollback_after_failure(
+                        &profile_path,
+                        previous_profile_target.as_deref(),
+                        err,
+                    )
+                    .await);
                 }
                 return Err(SessionError::failed(err));
             }
         }
     }
 
-    debug!("Running activation script");
+    info!(
+        "Running {}activation script",
+        if request.dry_activate { "dry " } else { "" }
+    );
     let activation_location = if request.dry_activate {
         &request.closure
     } else {
@@ -971,38 +1062,55 @@ async fn process_deploy_session(
 
     match command_status_to_stderr(activate, activation_timeout).await {
         Ok(Some(0)) => (),
-        Ok(code) if request.dry_activate => {
-            warn!("dry activation script exited with status {:?}", code);
+        Ok(Some(code)) if request.dry_activate => {
+            return Err(SessionError::failed(format!(
+                "dry activation script exited with code {}",
+                code
+            )))
+        }
+        Ok(None) if request.dry_activate => {
+            return Err(SessionError::failed(
+                "dry activation script terminated by signal",
+            ));
         }
         Ok(code) => {
+            let reason = format!("activation script resulted in a bad exit code: {:?}", code);
             if request.auto_rollback {
-                let _ = deactivate_session(&profile_path, previous_profile_target.as_deref()).await;
-                return Err(SessionError::rolled_back(format!(
-                    "activation script resulted in a bad exit code: {:?}",
-                    code
-                )));
+                return Err(rollback_after_failure(
+                    &profile_path,
+                    previous_profile_target.as_deref(),
+                    reason,
+                )
+                .await);
             }
+            return Err(SessionError::failed(reason));
+        }
+        Err(err) if request.dry_activate => {
             return Err(SessionError::failed(format!(
-                "activation script resulted in a bad exit code: {:?}",
-                code
+                "dry activation failed: {}",
+                err
             )));
         }
-        Err(err) if request.dry_activate => warn!("dry activation failed: {}", err),
         Err(err) => {
             if request.auto_rollback {
-                let _ = deactivate_session(&profile_path, previous_profile_target.as_deref()).await;
-                return Err(SessionError::rolled_back(err));
+                return Err(rollback_after_failure(
+                    &profile_path,
+                    previous_profile_target.as_deref(),
+                    err,
+                )
+                .await);
             }
             return Err(SessionError::failed(err));
         }
     }
 
-    if !request.dry_activate {
-        info!("Activation succeeded!");
-    }
+    info!("Activation script completed");
 
     if request.magic_rollback && !request.boot && !request.dry_activate {
-        info!("Magic rollback is enabled, waiting for fresh SSH confirmation...");
+        info!(
+            "Waiting for fresh SSH confirmation (timeout: {}s)",
+            request.confirm_timeout
+        );
         let temp_path = PathBuf::from(&request.temp_path);
         let session_id = random_token().map_err(|err| {
             SessionError::failed(format!("failed to generate session id: {}", err))
@@ -1014,10 +1122,13 @@ async fn process_deploy_session(
             session_id: session_id.clone(),
             nonce: nonce.clone(),
         }) {
-            return Err(rollback_after_confirmation_failure(
+            return Err(rollback_after_failure(
                 &profile_path,
                 previous_profile_target.as_deref(),
-                format!("failed to send confirmation event: {}", err),
+                format!(
+                    "confirmation failed: failed to send confirmation event: {}",
+                    err
+                ),
             )
             .await);
         }
@@ -1026,10 +1137,10 @@ async fn process_deploy_session(
             wait_for_session_confirmation(&temp_path, &session_id, &nonce, request.confirm_timeout)
                 .await
         {
-            return Err(rollback_after_confirmation_failure(
+            return Err(rollback_after_failure(
                 &profile_path,
                 previous_profile_target.as_deref(),
-                err,
+                format!("confirmation failed: {}", err),
             )
             .await);
         }

@@ -343,21 +343,21 @@ in {
         work("deploy -s --no-build-tree --no-review-changes --dry-activate .#mode-aware -- --offline > /tmp/dry-activate.out 2>&1", timeout=600)
         server.succeed("grep -Fx dry /tmp/mode-select/result")
         server.succeed("test ! -e /home/deploy/.local/state/nix/profiles/mode-aware")
-        client_sh("grep -F 'Completed dry-activate!' /tmp/dry-activate.out")
+        client_sh("grep -F 'Dry activation completed for `mode-aware.app`' /tmp/dry-activate.out")
 
       with subtest("boot-selects-boot-script"):
         server.succeed("rm -rf /tmp/mode-select /home/deploy/.local/state/nix/profiles/mode-aware")
         work("deploy -s --no-build-tree --no-review-changes --boot .#mode-aware -- --offline > /tmp/boot.out 2>&1", timeout=600)
         server.succeed("grep -Fx boot /tmp/mode-select/result")
         server.succeed("test -L /home/deploy/.local/state/nix/profiles/mode-aware")
-        client_sh("grep -F 'Success activating for next boot, done!' /tmp/boot.out")
+        client_sh("grep -F 'Next-boot activation prepared for `mode-aware.app`' /tmp/boot.out")
 
       with subtest("test-selects-test-script"):
         server.succeed("rm -rf /tmp/mode-select /home/deploy/.local/state/nix/profiles/mode-aware")
         work("deploy -s --no-build-tree --no-review-changes --test .#mode-aware -- --offline > /tmp/test.out 2>&1", timeout=600)
         server.succeed("grep -Fx test /tmp/mode-select/result")
         server.succeed("test -L /home/deploy/.local/state/nix/profiles/mode-aware")
-        client_sh("grep -F 'Success activating, done!' /tmp/test.out")
+        client_sh("grep -F 'Test activation completed for `mode-aware.app`' /tmp/test.out")
 
       with subtest("system-manager-profile"):
         server.succeed("rm -rf /tmp/system-manager && mkdir -p /nix/var/nix/profiles/system-manager-profiles")
