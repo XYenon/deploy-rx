@@ -165,13 +165,17 @@ fn decode_remote_event_line(
     }
 }
 
-async fn forward_remote_output<R, W>(mut reader: R, mut writer: W) -> std::io::Result<()>
+async fn forward_remote_output<R, W>(
+    mut reader: R,
+    mut writer: W,
+    label: &str,
+) -> std::io::Result<()>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
     const BUFFER_SIZE: usize = 65536;
-    const PREFIX: &[u8] = "📠 ".as_bytes();
+    let prefix = format!("[{label}] ");
 
     let mut buffer = [0_u8; BUFFER_SIZE];
     let mut output = Vec::with_capacity(BUFFER_SIZE);
@@ -186,7 +190,7 @@ where
         output.clear();
         for &byte in &buffer[..bytes_read] {
             if previous_byte == b'\n' {
-                output.extend_from_slice(PREFIX);
+                output.extend_from_slice(prefix.as_bytes());
             }
             output.push(byte);
             previous_byte = byte;
@@ -203,9 +207,10 @@ where
 
 async fn forward_optional_remote_stderr(
     stderr: Option<tokio::process::ChildStderr>,
+    label: &str,
 ) -> std::io::Result<()> {
     match stderr {
-        Some(stderr) => forward_remote_output(stderr, tokio::io::stderr()).await,
+        Some(stderr) => forward_remote_output(stderr, tokio::io::stderr(), label).await,
         None => Ok(()),
     }
 }
@@ -313,8 +318,12 @@ async fn confirm_remote_session(data: RemoteConfirmData<'_>) -> Result<(), Remot
         .map_err(RemoteConfirmError::WriteRequest)?;
 
     let stderr = child.stderr.take();
+    let label = format!(
+        "{}.{} remote",
+        data.deploy_data.node_name, data.deploy_data.profile_name
+    );
     let (status, stderr_result) =
-        tokio::join!(child.wait(), forward_optional_remote_stderr(stderr),);
+        tokio::join!(child.wait(), forward_optional_remote_stderr(stderr, &label),);
     warn_remote_stderr_error(stderr_result);
     let status = status.map_err(RemoteConfirmError::Wait)?;
 
@@ -397,7 +406,12 @@ async fn run_remote_operation(
         .ok_or(RemoteSessionError::MissingStdout)?;
     let stderr = child.stderr.take();
 
-    let stderr_task = tokio::spawn(forward_optional_remote_stderr(stderr));
+    let label = format!(
+        "{}.{} remote",
+        deploy_data.node_name, deploy_data.profile_name
+    );
+    let stderr_task =
+        tokio::spawn(async move { forward_optional_remote_stderr(stderr, &label).await });
     let session_result = async {
         let mut lines = BufReader::new(stdout).lines();
         let mut finished: Option<(bool, String)> = None;
@@ -641,7 +655,7 @@ mod tests {
                 .unwrap();
             input_writer.shutdown().await.unwrap();
         };
-        let forward = forward_remote_output(input_reader, output_writer);
+        let forward = forward_remote_output(input_reader, output_writer, "node.system remote");
         let read_output = async move {
             let mut output = Vec::new();
             output_reader.read_to_end(&mut output).await.unwrap();
@@ -653,7 +667,7 @@ mod tests {
 
         assert_eq!(
             output,
-            "📠 first line\n📠 second line\n📠 unterminated".as_bytes()
+            "[node.system remote] first line\n[node.system remote] second line\n[node.system remote] unterminated".as_bytes()
         );
     }
 }

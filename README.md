@@ -39,6 +39,10 @@ First-class support for deploying [system-manager](https://github.com/numtide/sy
 - **Diff & Change Review**: Integrated, super-fast diffing (`dix`) of derivation changes before activation or switch. Enabled by default (bypass with `--no-review-changes`).
 - **Batched Nix Evaluation, Builds & Pushes**: Intelligently groups multiple deployment targets from the same flake into a single `nix eval`, batches local builds into one `nix build`, and batches compatible pushes to the same target into one `nix copy`, reducing Nix and SSH overhead for multi-profile deployments.
 
+### Logs
+
+Application messages use `[deploy LEVEL]`, `[activate LEVEL]`, or `[revoke LEVEL]` on each line. Non-interactive deployments show a short target summary; interactive deployments still show the full preview for confirmation. Remote stderr is labeled `[node.profile remote]` by default, so output from different deployment targets can be distinguished. Nix, `nom`, and diff output retain their native formatting. Use `--no-demarcate-output` to leave remote stderr unchanged, `--debug-logs` for debug messages on the terminal, and `--log-dir DIR` to save application logs (including remote activation logs) while keeping normal terminal output concise.
+
 ### Sudo Configuration
 
 `deploy-rx` supports passing `sudo` as a list of arguments for better security and flexibility.
