@@ -16,11 +16,19 @@ deploy:
 let
   patchProfile = p:
     if (p ? path) && (builtins.isAttrs p.path) && (p.path ? drvPath)
-    then p // {
-      path = p.path.outPath;
-      drvPath = p.path.drvPath;
-      outputName = p.path.outputName or "out";
-    }
+    then
+      let
+        drvPath = p.path.drvPath;
+        outputName = p.path.outputName or "out";
+      in p // {
+        # getContext resolves and flattens nested dynamic producer chains.
+        # Keep placeholders untouched; Rust builds the original drvPath
+        # attribute so Nix retains its recursive producer identity.
+        path = if builtins.match "/[0-9a-z]{52}" drvPath != null
+               then drvPath
+               else p.path.outPath;
+        inherit drvPath outputName;
+      }
     else p;
   patchNode = n: n // {
     profiles = builtins.mapAttrs (_: patchProfile) (n.profiles or { });

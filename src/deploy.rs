@@ -13,7 +13,7 @@ use tokio::process::Command;
 
 use crate::remote_protocol::{
     BootstrapRequest, ConfirmRequest, ProfileTarget, RemoteDeployRequest, RemoteEvent,
-    RemoteOperation, RemoteRevokeRequest, REMOTE_PROTOCOL_VERSION,
+    RemoteOperation, RemoteRevokeRequest, RollbackReceipt, REMOTE_PROTOCOL_VERSION,
 };
 use crate::{DeployDataDefsError, ProfileInfo};
 
@@ -59,32 +59,6 @@ fn remote_activate_rs_command(
         shell_quote(&format!("{}/activate-rs", closure)),
         subcommand
     ))
-}
-
-fn ssh_opts_without_control_master(ssh_opts: &[String]) -> Vec<String> {
-    let mut filtered = Vec::new();
-    let mut i = 0;
-
-    while i < ssh_opts.len() {
-        let ssh_opt = &ssh_opts[i];
-        if ssh_opt == "-o" && i + 1 < ssh_opts.len() {
-            let next = &ssh_opts[i + 1];
-            if next.contains("ControlPath") || next.contains("ControlMaster") {
-                i += 2;
-                continue;
-            }
-        }
-
-        if ssh_opt.contains("ControlPath") || ssh_opt.contains("ControlMaster") {
-            i += 1;
-            continue;
-        }
-
-        filtered.push(ssh_opt.clone());
-        i += 1;
-    }
-
-    filtered
 }
 
 #[derive(Error, Debug)]
@@ -241,6 +215,8 @@ pub enum RemoteConfirmError {
     Exit(Option<i32>),
     #[error("failed to wait for remote confirm: {0}")]
     Wait(std::io::Error),
+    #[error("remote confirmation timed out after {0} seconds")]
+    Timeout(u16),
 }
 
 struct RemoteConfirmData<'a> {
@@ -265,8 +241,8 @@ async fn confirm_remote_session(data: RemoteConfirmData<'_>) -> Result<(), Remot
         .unwrap_or(30);
     let confirm_request = ConfirmRequest {
         temp_path: data.temp_path.display().to_string(),
-        session_id: data.session_id,
-        nonce: data.nonce,
+        session_id: data.session_id.clone(),
+        nonce: data.nonce.clone(),
         sudo: data.deploy_defs.sudo.clone(),
         sudo_password: data.deploy_defs.sudo_password.clone(),
         interactive_sudo: data
@@ -280,62 +256,83 @@ async fn confirm_remote_session(data: RemoteConfirmData<'_>) -> Result<(), Remot
         serde_json::to_vec(&confirm_request).map_err(RemoteConfirmError::Serialize)?;
 
     let mut command = Command::new("ssh");
-    command.arg(&ssh_addr).stdin(Stdio::piped());
+    command
+        .arg(&ssh_addr)
+        .stdin(Stdio::piped())
+        .kill_on_drop(true);
     if data.demarcate_output {
         command.stderr(Stdio::piped());
     }
 
+    command.args(&data.deploy_data.merged_settings.ssh_opts);
     if data.rollback_fresh_connection {
-        for ssh_opt in ssh_opts_without_control_master(&data.deploy_data.merged_settings.ssh_opts) {
-            command.arg(ssh_opt);
-        }
-        command.arg("-o").arg("ControlPath=none");
+        // -S assigns ControlPath directly, overriding earlier -o options and -S
+        // arguments, including case-insensitive keywords and SSH config values.
+        command.arg("-S").arg("none");
         // Without an explicit ConnectTimeout, a failed connection attempt can block for minutes
         // on TCP timeouts (which makes `magicRollback` deployments appear hung).
         command
             .arg("-o")
             .arg(format!("ConnectTimeout={}", confirm_timeout));
         command.arg("-o").arg("ConnectionAttempts=1");
-    } else {
-        for ssh_opt in &data.deploy_data.merged_settings.ssh_opts {
-            command.arg(ssh_opt);
-        }
     }
 
+    #[cfg(unix)]
+    command.process_group(0);
     let mut child = command
         .arg(remote_command)
         .spawn()
         .map_err(RemoteConfirmError::Spawn)?;
 
-    let mut stdin = child.stdin.take().ok_or(RemoteConfirmError::MissingStdin)?;
-    stdin
-        .write_all(&confirm_request)
-        .await
-        .map_err(RemoteConfirmError::WriteRequest)?;
-    stdin
-        .write_all(b"\n")
-        .await
-        .map_err(RemoteConfirmError::WriteRequest)?;
-    stdin
-        .shutdown()
-        .await
-        .map_err(RemoteConfirmError::WriteRequest)?;
+    #[cfg(unix)]
+    let pid = child.id().expect("spawned child has an id");
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(confirm_timeout as u64),
+        async {
+            let mut stdin = child.stdin.take().ok_or(RemoteConfirmError::MissingStdin)?;
+            stdin
+                .write_all(&confirm_request)
+                .await
+                .map_err(RemoteConfirmError::WriteRequest)?;
+            stdin
+                .write_all(b"\n")
+                .await
+                .map_err(RemoteConfirmError::WriteRequest)?;
+            stdin
+                .shutdown()
+                .await
+                .map_err(RemoteConfirmError::WriteRequest)?;
 
-    let stderr = child.stderr.take();
-    let label = format!(
-        "{}.{} remote",
-        data.deploy_data.node_name, data.deploy_data.profile_name
-    );
-    let (status, stderr_result) =
-        tokio::join!(child.wait(), forward_optional_remote_stderr(stderr, &label),);
-    warn_remote_stderr_error(stderr_result);
-    let status = status.map_err(RemoteConfirmError::Wait)?;
+            let stderr = child.stderr.take();
+            let label = format!(
+                "{}.{} remote",
+                data.deploy_data.node_name, data.deploy_data.profile_name
+            );
+            let (status, stderr_result) =
+                tokio::join!(child.wait(), forward_optional_remote_stderr(stderr, &label),);
+            warn_remote_stderr_error(stderr_result);
+            let status = status.map_err(RemoteConfirmError::Wait)?;
 
-    if !status.success() {
-        return Err(RemoteConfirmError::Exit(status.code()));
+            if !status.success() {
+                return Err(RemoteConfirmError::Exit(status.code()));
+            }
+
+            Ok(())
+        },
+    )
+    .await;
+    match result {
+        Ok(result) => result,
+        Err(_) => {
+            #[cfg(unix)]
+            unsafe {
+                libc::kill(-(pid as i32), libc::SIGKILL);
+            }
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            Err(RemoteConfirmError::Timeout(confirm_timeout))
+        }
     }
-
-    Ok(())
 }
 
 async fn run_remote_operation(
@@ -344,7 +341,7 @@ async fn run_remote_operation(
     operation: RemoteOperation,
     rollback_fresh_connection: bool,
     demarcate_output: bool,
-) -> Result<(), RemoteSessionError> {
+) -> Result<Option<RollbackReceipt>, RemoteSessionError> {
     let hostname = match deploy_data.cmd_overrides.hostname {
         Some(ref x) => x,
         None => &deploy_data.node.node_settings.hostname,
@@ -419,6 +416,7 @@ async fn run_remote_operation(
     let session_result = async {
         let mut lines = BufReader::new(stdout).lines();
         let mut finished: Option<(bool, bool, String)> = None;
+        let mut rollback_receipt = None;
         let mut saw_protocol_event = false;
 
         while let Some(line) = lines
@@ -464,7 +462,9 @@ async fn run_remote_operation(
                     ok,
                     rolled_back,
                     message,
+                    rollback,
                 } => {
+                    rollback_receipt = rollback;
                     finished = Some((ok, rolled_back, message));
                     break;
                 }
@@ -474,7 +474,8 @@ async fn run_remote_operation(
         let status = child.wait().await.map_err(RemoteSessionError::Wait)?;
 
         // Prefer the descriptive error message from the `Finished` event when available.
-        interpret_remote_session_completion(finished, status.success(), status.code())
+        interpret_remote_session_completion(finished, status.success(), status.code())?;
+        Ok(rollback_receipt)
     }
     .await;
 
@@ -509,7 +510,7 @@ pub async fn deploy_profile(
     rollback_fresh_connection: bool,
     review_changes: bool,
     demarcate_output: bool,
-) -> Result<(), DeployProfileError> {
+) -> Result<Option<RollbackReceipt>, DeployProfileError> {
     let action = if dry_activate {
         "Dry-activating"
     } else if boot {
@@ -540,13 +541,18 @@ pub async fn deploy_profile(
         auto_rollback: deploy_data.merged_settings.auto_rollback.unwrap_or(true),
         magic_rollback: deploy_data.merged_settings.magic_rollback.unwrap_or(true),
         confirm_timeout: deploy_data.merged_settings.confirm_timeout.unwrap_or(30),
-        activation_timeout: deploy_data.merged_settings.activation_timeout,
+        activation_timeout: Some(
+            deploy_data
+                .merged_settings
+                .activation_timeout
+                .unwrap_or(240),
+        ),
         temp_path: temp_path.display().to_string(),
         debug_logs: deploy_data.debug_logs,
         log_dir: deploy_data.log_dir.map(|log_dir| log_dir.to_string()),
     };
 
-    run_remote_operation(
+    let rollback = run_remote_operation(
         deploy_data,
         deploy_defs,
         RemoteOperation::Deploy(request),
@@ -577,7 +583,7 @@ pub async fn deploy_profile(
         );
     }
 
-    Ok(())
+    Ok(rollback)
 }
 
 #[derive(Error, Debug)]
@@ -592,6 +598,7 @@ pub async fn revoke(
     deploy_data: &crate::DeployData<'_>,
     deploy_defs: &crate::DeployDefs,
     closure: &str,
+    rollback: &RollbackReceipt,
     demarcate_output: bool,
 ) -> Result<(), RevokeProfileError> {
     let temp_path: &Path = match &deploy_data.merged_settings.temp_path {
@@ -602,6 +609,7 @@ pub async fn revoke(
     let request = RemoteRevokeRequest {
         closure: closure.to_string(),
         profile: profile_target(deploy_data.get_profile_info()?),
+        rollback: rollback.clone(),
         profile_user: deploy_defs.profile_user.clone(),
         temp_path: temp_path.display().to_string(),
         debug_logs: deploy_data.debug_logs,
@@ -624,6 +632,66 @@ pub async fn revoke(
 mod tests {
     use super::*;
     use tokio::io::{duplex, AsyncReadExt};
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "requires OpenSSH"]
+    async fn confirmation_deadline_overrides_a_long_ssh_connect_timeout() {
+        let settings: crate::data::Data = serde_json::from_value(serde_json::json!({
+            "user": "root", "confirmTimeout": 1,
+            "sshOpts": ["-F", "/dev/null", "-o", "ConnectTimeout=60", "-o", "ProxyCommand=sleep 30", "-S", "/tmp/unused-control-socket", "-o", "controlpath=/tmp/other-unused-socket"],
+            "nodes": {"node": {"hostname": "unused.invalid", "profiles": {"app": {"path": "/nix/store/test"}}}}
+        })).unwrap();
+        let overrides = crate::CmdOverrides {
+            ssh_user: None,
+            profile_user: None,
+            ssh_opts: None,
+            fast_connection: None,
+            auto_rollback: None,
+            hostname: None,
+            magic_rollback: None,
+            temp_path: None,
+            confirm_timeout: None,
+            activation_timeout: None,
+            sudo: None,
+            interactive_sudo: None,
+            dry_activate: false,
+            remote_build: false,
+        };
+        let node = &settings.nodes["node"];
+        let data = crate::make_deploy_data(
+            &settings.generic_settings,
+            node,
+            "node",
+            &node.node_settings.profiles["app"],
+            "app",
+            &overrides,
+            false,
+            None,
+        );
+        let defs = data.defs().unwrap();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            confirm_remote_session(RemoteConfirmData {
+                deploy_data: &data,
+                deploy_defs: &defs,
+                hostname: "unused.invalid",
+                closure: "/nix/store/test",
+                temp_path: Path::new("/tmp"),
+                session_id: "session".into(),
+                nonce: "nonce".into(),
+                rollback_fresh_connection: true,
+                demarcate_output: true,
+            }),
+        )
+        .await
+        .expect("confirmation exceeded its deadline");
+        assert!(
+            matches!(result, Err(RemoteConfirmError::Timeout(1))),
+            "{:?}",
+            result
+        );
+    }
 
     #[test]
     fn quotes_remote_activate_rs_path() {

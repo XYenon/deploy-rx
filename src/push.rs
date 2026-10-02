@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
 use log::{debug, info, warn};
+use rnix::ast::{self, HasEntry};
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::io::Read;
@@ -56,14 +57,6 @@ impl command::HasCommandError for SignError {
 }
 
 #[derive(Error, Debug)]
-pub enum PathInfoError {}
-impl command::HasCommandError for PathInfoError {
-    fn title() -> String {
-        "Nix path-info".to_string()
-    }
-}
-
-#[derive(Error, Debug)]
 pub enum StoreLsError {}
 impl command::HasCommandError for StoreLsError {
     fn title() -> String {
@@ -73,6 +66,8 @@ impl command::HasCommandError for StoreLsError {
 
 #[derive(Error, Debug)]
 pub enum PushProfileError {
+    #[error("Failed to freeze the effective flake inputs: {0}")]
+    FlakeSnapshot(#[from] std::io::Error),
     #[error("{0}")]
     ShowDerivation(#[from] command::CommandError<ShowDerivationError>),
     #[error("{0}")]
@@ -97,8 +92,6 @@ pub enum PushProfileError {
         source: Box<command::CommandError<CopyError>>,
     },
 
-    #[error("{0}")]
-    PathInfo(#[from] command::CommandError<PathInfoError>),
     #[error("{0}")]
     StoreLs(#[from] command::CommandError<StoreLsError>),
     #[error("Failed to parse the JSON output of nix store ls: {0}")]
@@ -296,6 +289,12 @@ async fn run_build_command(
     Ok(output.stdout)
 }
 
+fn enable_nix_command(command: &mut Command) -> &mut Command {
+    command
+        .arg("--extra-experimental-features")
+        .arg("nix-command")
+}
+
 fn make_remote_derivation_copy_command(
     store_address: &str,
     ssh_opts: &str,
@@ -306,9 +305,7 @@ fn make_remote_derivation_copy_command(
     // avoids realising the intermediate derivation locally.
     let outer_derivation = derivation_name.split('^').next().unwrap_or(derivation_name);
     let mut copy_command = Command::new("nix");
-    copy_command
-        .arg("--experimental-features")
-        .arg("nix-command")
+    enable_nix_command(&mut copy_command)
         .arg("copy")
         .arg("-s") // fetch dependencies from substitutes, not localhost
         .arg("--to")
@@ -328,11 +325,18 @@ fn make_remote_build_command(
     extra_build_args: &[String],
 ) -> Command {
     let mut build_command = Command::new("nix");
+    enable_nix_command(&mut build_command).arg("build");
+    if derivation_name.starts_with('(') {
+        build_command.args([
+            "--extra-experimental-features",
+            "flakes",
+            "--expr",
+            derivation_name,
+        ]);
+    } else {
+        build_command.arg(derivation_name);
+    }
     build_command
-        .arg("--experimental-features")
-        .arg("nix-command")
-        .arg("build")
-        .arg(derivation_name)
         .arg("--eval-store")
         .arg("auto")
         .arg("--store")
@@ -371,15 +375,18 @@ pub async fn build_profile_remotely(
 
     let (store_address, ssh_opts_str) = remote_store(data)?;
 
-    // copy the derivation to remote host so it can be built there
-    command::Command::new(make_remote_derivation_copy_command(
-        &store_address,
-        &ssh_opts_str,
-        derivation_name,
-    ))
-    .status()
-    .await
-    .map_err(PushProfileError::Copy)?;
+    // Flake installables retain dynamic string context. With --eval-store,
+    // Nix transfers their derivations to the build host itself.
+    if !derivation_name.starts_with('(') {
+        command::Command::new(make_remote_derivation_copy_command(
+            &store_address,
+            &ssh_opts_str,
+            derivation_name,
+        ))
+        .status()
+        .await
+        .map_err(PushProfileError::Copy)?;
+    }
 
     let build_command = make_remote_build_command(
         &store_address,
@@ -395,9 +402,7 @@ pub async fn build_profile_remotely(
 
 fn make_remote_store_ls_command(store_address: &str, ssh_opts: &str, path: &str) -> Command {
     let mut command = Command::new("nix");
-    command
-        .arg("--experimental-features")
-        .arg("nix-command")
+    enable_nix_command(&mut command)
         .arg("store")
         .arg("ls")
         .arg("--json")
@@ -416,9 +421,7 @@ fn make_remote_sign_command(
     closure: &str,
 ) -> Command {
     let mut command = Command::new("nix");
-    command
-        .arg("--experimental-features")
-        .arg("nix-command")
+    enable_nix_command(&mut command)
         .arg("store")
         .arg("sign")
         .arg("--store")
@@ -479,6 +482,96 @@ async fn check_and_sign_remote_profile(
     Ok(())
 }
 
+// Make the effective lock graph a flake input declaration. getFlake locks again,
+// so merely copying flake.lock can discard temporary CLI input overrides.
+fn frozen_flake_inputs(locks: &serde_json::Value) -> Result<serde_json::Value, PushProfileError> {
+    fn inputs(
+        nodes: &serde_json::Value,
+        node: &str,
+        path: &str,
+        seen: &mut HashMap<String, String>,
+    ) -> Result<serde_json::Value, PushProfileError> {
+        let mut result = serde_json::Map::new();
+        if let Some(edges) = nodes[node]["inputs"].as_object() {
+            for (name, edge) in edges {
+                let value = if let Some(follows) = edge.as_array() {
+                    let follows = follows
+                        .iter()
+                        .map(|part| {
+                            part.as_str()
+                                .ok_or(PushProfileError::BuildStdoutInvalidDerivation)
+                        })
+                        .collect::<Result<Vec<_>, _>>()?
+                        .join("/");
+                    serde_json::json!({ "follows": follows })
+                } else {
+                    let id = edge
+                        .as_str()
+                        .ok_or(PushProfileError::BuildStdoutInvalidDerivation)?;
+                    if let Some(canonical) = seen.get(id) {
+                        serde_json::json!({ "follows": canonical })
+                    } else {
+                        let child_path = if path.is_empty() {
+                            name.clone()
+                        } else {
+                            format!("{path}/{name}")
+                        };
+                        seen.insert(id.to_owned(), child_path.clone());
+                        let mut reference = nodes[id]["locked"]
+                            .as_object()
+                            .ok_or(PushProfileError::BuildStdoutInvalidDerivation)?
+                            .clone();
+                        // A nested relative input belongs to its parent's
+                        // source tree. Leave its reference in that flake;
+                        // declaring it here would resolve it at the root.
+                        if nodes[id]["parent"]
+                            .as_array()
+                            .is_some_and(|parent| !parent.is_empty())
+                        {
+                            reference.clear();
+                        }
+                        if nodes[id]["flake"] == false {
+                            reference.insert("flake".into(), false.into());
+                        }
+                        reference.insert("inputs".into(), inputs(nodes, id, &child_path, seen)?);
+                        reference.into()
+                    }
+                };
+                result.insert(name.clone(), value);
+            }
+        }
+        Ok(result.into())
+    }
+    let root = locks["root"]
+        .as_str()
+        .ok_or(PushProfileError::BuildStdoutInvalidDerivation)?;
+    inputs(
+        &locks["nodes"],
+        root,
+        "",
+        &mut HashMap::from([(root.to_owned(), String::new())]),
+    )
+}
+
+fn nix_literal(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Object(attrs) => format!(
+            "{{ {} }}",
+            attrs
+                .iter()
+                .map(|(name, value)| format!(
+                    "{} = {};",
+                    nix_literal(&name.clone().into()),
+                    nix_literal(value)
+                ))
+                .collect::<Vec<_>>()
+                .join(" ")
+        ),
+        serde_json::Value::String(_) => value.to_string().replace("${", "\\${"),
+        _ => value.to_string(),
+    }
+}
+
 /// Resolve the derivation path for a profile, returning the derivation name suitable for building.
 pub async fn resolve_derivation(data: &PushProfileData<'_>) -> Result<String, PushProfileError> {
     let profile_settings = &data.deploy_data.profile.profile_settings;
@@ -497,6 +590,163 @@ pub async fn resolve_derivation(data: &PushProfileData<'_>) -> Result<String, Pu
     // the user wrote a literal store path string in their `deploy` attribute.
     if let Some(drv_path) = &profile_settings.drv_path {
         debug!("Using drvPath from flake: {}", drv_path);
+        if data.supports_flakes && !drv_path.contains('^') && !drv_path.ends_with(".drv") {
+            // JSON cannot carry recursive string context. Evaluate outputOf
+            // in the build command, whose string installable retains it.
+            // Pin the original flake source so this remains pure evaluation.
+            let mut metadata = Command::new("nix");
+            enable_nix_command(&mut metadata)
+                .args([
+                    "--extra-experimental-features",
+                    "flakes",
+                    "flake",
+                    "metadata",
+                    "--json",
+                    "--option",
+                    "lazy-trees",
+                    "false",
+                ])
+                .arg(data.repo)
+                .args(data.extra_build_args);
+            let output = command::Command::new(metadata).run::<BuildError>().await?;
+            let metadata: serde_json::Value = serde_json::from_slice(&output.stdout)
+                .map_err(PushProfileError::BuildStdoutParse)?;
+            let source = metadata
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+                .ok_or(PushProfileError::BuildStdoutInvalidDerivation)?;
+            let dir = metadata["locked"]["dir"].as_str().unwrap_or("");
+            let snapshot = tempfile::tempdir()?;
+            let tree = snapshot.path().join("source");
+            let mut copy = Command::new("cp");
+            copy.args(["-R", source]).arg(&tree);
+            command::Command::new(copy).status::<BuildError>().await?;
+            // Store trees are read-only; make the disposable copy writable for
+            // replacing its lock file and for TempDir's eventual cleanup.
+            let mut chmod = Command::new("chmod");
+            chmod.args(["-R", "u+w"]).arg(&tree);
+            command::Command::new(chmod).status::<BuildError>().await?;
+            let flake_dir = tree.join(dir);
+            let lock_path = flake_dir.join("flake.lock");
+            if lock_path.exists() {
+                std::fs::remove_file(&lock_path)?;
+            }
+            let locks = metadata
+                .get("locks")
+                .ok_or(PushProfileError::BuildStdoutInvalidDerivation)?;
+            std::fs::write(
+                lock_path,
+                serde_json::to_vec(locks).map_err(PushProfileError::BuildStdoutParse)?,
+            )?;
+            let inputs = frozen_flake_inputs(locks)?;
+            let flake_path = flake_dir.join("flake.nix");
+            let source = std::fs::read_to_string(&flake_path)?;
+            let parsed = rnix::Root::parse(&source);
+            let Some(ast::Expr::AttrSet(flake)) = parsed.tree().expr() else {
+                return Err(PushProfileError::BuildStdoutInvalidDerivation);
+            };
+            // Flake input declarations must be literal attributes. Keep the
+            // original outputs/configuration and replace only their inputs.
+            let dirty_metadata: serde_json::Map<String, serde_json::Value> =
+                ["dirtyRev", "dirtyShortRev"]
+                    .iter()
+                    .filter_map(|key| {
+                        metadata["locked"]
+                            .get(key)
+                            .map(|value| ((*key).into(), value.clone()))
+                    })
+                    .collect();
+            let dirty_metadata = serde_json::Value::Object(dirty_metadata);
+            let entries = flake
+                .entries()
+                .filter(|entry| {
+                    !matches!(entry, ast::Entry::AttrpathValue(binding)
+                        if binding.attrpath().and_then(|path| path.attrs().next())
+                            .is_some_and(|attr| matches!(attr.to_string().as_str(), "inputs" | "\"inputs\"")))
+                })
+                .map(|entry| {
+                    if let ast::Entry::AttrpathValue(binding) = &entry {
+                        if dirty_metadata.as_object().is_some_and(|attrs| !attrs.is_empty())
+                            && binding.attrpath().is_some_and(|path| matches!(path.to_string().as_str(), "outputs" | "\"outputs\""))
+                        {
+                            // The path fetcher cannot carry dirty Git metadata.
+                            // Supply it to the original outputs' self instead.
+                            let dirty = nix_literal(&dirty_metadata);
+                            return format!(
+                                "outputs = args: ({}) (args // {{ self = args.self // {dirty} // {{ sourceInfo = args.self.sourceInfo // {dirty}; }}; }});",
+                                binding.value().unwrap(),
+                            );
+                        }
+                    }
+                    entry.to_string()
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            std::fs::remove_file(&flake_path)?;
+            std::fs::write(
+                flake_path,
+                format!(
+                    "{} {{ inputs = {};\n{}\n}}",
+                    if flake.rec_token().is_some() {
+                        "rec"
+                    } else {
+                        ""
+                    },
+                    nix_literal(&inputs),
+                    entries,
+                ),
+            )?;
+            let mut hash = Command::new("nix");
+            enable_nix_command(&mut hash)
+                .args(["hash", "path", "--sri"])
+                .arg(&tree);
+            let output = command::Command::new(hash).run::<BuildError>().await?;
+            let nar_hash = std::str::from_utf8(&output.stdout)
+                .map_err(PushProfileError::BuildStdoutUtf8)?
+                .trim();
+            let mut add = Command::new("nix");
+            enable_nix_command(&mut add)
+                .args(["--extra-experimental-features", "flakes", "eval", "--impure", "--raw", "--expr"])
+                .arg(format!("builtins.path {{ path = builtins.toPath {}; sha256 = {}; name = \"source\"; }}", serde_json::to_string(&tree).unwrap(), serde_json::to_string(nar_hash).unwrap()))
+                .args(data.extra_build_args);
+            let output = command::Command::new(add).run::<BuildError>().await?;
+            let source = std::str::from_utf8(&output.stdout)
+                .map_err(PushProfileError::BuildStdoutUtf8)?
+                .trim();
+            let mut reference = format!("path:{source}?narHash={nar_hash}");
+            if !dir.is_empty() {
+                let encoded_dir = metadata["url"]
+                    .as_str()
+                    .and_then(|url| url.split_once('?'))
+                    .and_then(|(_, query)| {
+                        query
+                            .split('&')
+                            .find(|parameter| parameter.starts_with("dir="))
+                    })
+                    .ok_or(PushProfileError::BuildStdoutInvalidDerivation)?;
+                reference.push('&');
+                reference.push_str(encoded_dir);
+            }
+            for key in ["rev", "revCount", "lastModified"] {
+                if let Some(value) = metadata["locked"].get(key) {
+                    let value = value
+                        .as_str()
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| value.to_string());
+                    reference.push_str(&format!("&{key}={value}"));
+                }
+            }
+            let flake = serde_json::to_string(&reference).unwrap();
+            let attr = format!(
+                "deploy.nodes.{}.profiles.{}.path",
+                serde_json::to_string(data.deploy_data.node_name).unwrap(),
+                serde_json::to_string(data.deploy_data.profile_name).unwrap(),
+            );
+            return Ok(format!(
+                "(builtins.outputOf (builtins.getFlake {flake}).{attr}.drvPath {})",
+                serde_json::to_string(&profile_settings.output_name).unwrap()
+            ));
+        }
         return deriver_for_build(
             drv_path.clone(),
             &profile_settings.output_name,
@@ -512,9 +762,7 @@ pub async fn resolve_derivation(data: &PushProfileData<'_>) -> Result<String, Pu
 
     // `nix-store --query --deriver` doesn't work on invalid paths, so we parse output of show-derivation :(
     let mut show_derivation_command = Command::new("nix");
-    show_derivation_command
-        .arg("--experimental-features")
-        .arg("nix-command")
+    enable_nix_command(&mut show_derivation_command)
         .arg("show-derivation")
         .arg(&profile_settings.path);
 
@@ -563,13 +811,9 @@ pub async fn resolve_derivation(data: &PushProfileData<'_>) -> Result<String, Pu
     deriver_for_build(deriver, &profile_settings.output_name, supports_caret).await
 }
 
-/// Picks the `nix build` argument shape for a given deriver, accounting for the
-/// pre/post 2.15 split: on 2.15 and newer, `nix build <drv>` builds only the
-/// `.drv` itself and `^out` is needed to select outputs; on older Nix,
-/// `nix build <drv>` already builds outputs and `^out` is not understood. We
-/// detect which case applies by asking `nix path-info <drv>`; on 2.15 and newer
-/// it echoes the `.drv` back, while on older versions it resolves to the
-/// realised output or errors out if the output is not yet built.
+/// Picks the `nix build` argument shape for a given deriver. Flake-capable and
+/// remote builds use the Nix 2.15+ derivable-path syntax; legacy `nix-build`
+/// accepts only the default output and the bare derivation path.
 async fn deriver_for_build(
     deriver: String,
     output_name: &str,
@@ -584,26 +828,7 @@ async fn deriver_for_build(
         return Ok(deriver);
     }
 
-    let mut path_info_command = Command::new("nix");
-    path_info_command
-        .arg("--experimental-features")
-        .arg("nix-command")
-        .arg("path-info")
-        .arg(&deriver);
-    let path_info_output = command::Command::new(path_info_command)
-        .run()
-        .await
-        .map_err(PushProfileError::PathInfo)?;
-
-    if std::str::from_utf8(&path_info_output.stdout).map(|s| s.trim()) == Ok(deriver.as_str()) {
-        Ok(format!("{}^{}", deriver, output_name))
-    } else if output_name != "out" {
-        Err(PushProfileError::LegacyNonDefaultOutput(
-            output_name.to_string(),
-        ))
-    } else {
-        Ok(deriver)
-    }
+    Ok(format!("{}^{}", deriver, output_name))
 }
 
 /// Check that the built profile contains the expected activation scripts, and sign if needed.
@@ -626,7 +851,7 @@ pub async fn check_and_sign_profile(
         );
 
         let mut sign_command = Command::new("nix");
-        sign_command
+        enable_nix_command(&mut sign_command)
             .arg("sign-paths")
             .arg("-r")
             .arg("-k")
@@ -665,11 +890,22 @@ fn make_build_command(
         // avoiding any dependency on the order of `--print-out-paths` lines.
         // `nix-build` writes output paths to stdout by default, so the legacy
         // branch continues to use its plain-text output.
-        build_command.arg("build").arg("--json");
+        enable_nix_command(&mut build_command)
+            .arg("build")
+            .arg("--json");
     }
 
     for derivation in derivations {
-        build_command.arg(*derivation);
+        if derivation.starts_with('(') {
+            build_command.args([
+                "--extra-experimental-features",
+                "flakes",
+                "--expr",
+                *derivation,
+            ]);
+        } else {
+            build_command.arg(*derivation);
+        }
     }
 
     if !keep_result {
@@ -779,6 +1015,12 @@ fn parse_build_json(stdout: &[u8], derivations: &[&str]) -> Result<Vec<String>, 
         .map(|derivation| {
             let (drv_path, output_name) =
                 derivation.rsplit_once('^').unwrap_or((derivation, "out"));
+            // A single flake installable is evaluated by Nix at build time.
+            // Its recursive derivation identity is not available beforehand.
+            if derivations.len() == 1 && derivation.starts_with('(') && realised_outputs.len() == 1
+            {
+                return Ok(realised_outputs.values().next().unwrap().clone());
+            }
             realised_outputs
                 .get(&(drv_path.to_string(), output_name.to_string()))
                 .cloned()
@@ -855,35 +1097,56 @@ pub async fn build_profiles_locally(
             }
         })
         .collect();
-    let profiles: Vec<BuildCommandInfo> = items
-        .iter()
-        .map(|&(d, _)| BuildCommandInfo {
-            node_name: d.deploy_data.node_name,
-            profile_name: d.deploy_data.profile_name,
-        })
-        .collect();
-
-    let build_command = make_build_command(
-        data.supports_flakes,
-        data.keep_result,
-        data.result_path,
-        data.extra_build_args,
-        &derivations,
-        &profiles,
-    );
-
     if data.build_tree && !data.supports_flakes {
         warn!(
             "Build tree visualization currently requires flake-capable nix builds; continuing without tree output"
         );
     }
 
-    let stdout = run_build_command(build_command, data.build_tree && data.supports_flakes).await?;
-    let built_closures = if data.supports_flakes {
-        parse_build_json(&stdout, &derivations)?
+    // Dynamic flake installables have no textual derivation identity before
+    // building. Resolve them individually instead of guessing JSON order.
+    let groups = if derivations.iter().any(|drv| drv.starts_with('(')) {
+        derivations.iter().map(|drv| vec![*drv]).collect::<Vec<_>>()
     } else {
-        parse_build_out_paths(&stdout, derivations.len())?
+        vec![derivations]
     };
+    let split_builds = groups.len() > 1;
+    let mut built_closures = Vec::new();
+    for (group_index, group) in groups.into_iter().enumerate() {
+        let profiles: Vec<BuildCommandInfo> = items
+            .iter()
+            .filter(|(_, drv)| group.contains(drv))
+            .map(|(d, _)| BuildCommandInfo {
+                node_name: d.deploy_data.node_name,
+                profile_name: d.deploy_data.profile_name,
+            })
+            .collect();
+        // Separate directories also isolate Nix's output-name suffixes and
+        // identical node/profile names from different deployment flakes.
+        let group_result_path = split_builds.then(|| {
+            Path::new(data.result_path.unwrap_or("./.deploy-gc"))
+                .join("groups")
+                .join(group_index.to_string())
+        });
+        let build_command = make_build_command(
+            data.supports_flakes,
+            data.keep_result,
+            group_result_path
+                .as_ref()
+                .map(|path| path.to_str().unwrap())
+                .or(data.result_path),
+            data.extra_build_args,
+            &group,
+            if split_builds { &[] } else { &profiles },
+        );
+        let stdout =
+            run_build_command(build_command, data.build_tree && data.supports_flakes).await?;
+        built_closures.extend(if data.supports_flakes {
+            parse_build_json(&stdout, &group)?
+        } else {
+            parse_build_out_paths(&stdout, group.len())?
+        });
+    }
     let closures: Vec<String> = derivation_indexes
         .into_iter()
         .map(|index| built_closures[index].clone())
@@ -981,7 +1244,7 @@ fn copy_group_key(data: &PushProfileData<'_>) -> Result<CopyGroupKey, PushProfil
 
 fn make_copy_command(key: &CopyGroupKey, paths: &[&str]) -> Command {
     let mut copy_command = Command::new("nix");
-    copy_command.arg("copy");
+    enable_nix_command(&mut copy_command).arg("copy");
 
     if key.fast_connection != Some(true) {
         copy_command.arg("--substitute-on-destination");
@@ -1144,6 +1407,8 @@ mod tests {
             get_args(&cmd),
             vec![
                 "nix",
+                "--extra-experimental-features",
+                "nix-command",
                 "build",
                 "--json",
                 "/nix/store/abc.drv^out",
@@ -1166,6 +1431,8 @@ mod tests {
             get_args(&cmd),
             vec![
                 "nix",
+                "--extra-experimental-features",
+                "nix-command",
                 "build",
                 "--json",
                 "/nix/store/abc.drv^out",
@@ -1211,7 +1478,7 @@ mod tests {
             get_args(&copy),
             vec![
                 "nix",
-                "--experimental-features",
+                "--extra-experimental-features",
                 "nix-command",
                 "copy",
                 "-s",
@@ -1225,7 +1492,7 @@ mod tests {
             get_args(&build),
             vec![
                 "nix",
-                "--experimental-features",
+                "--extra-experimental-features",
                 "nix-command",
                 "build",
                 "/nix/store/outer.drv^out^out",
@@ -1251,7 +1518,7 @@ mod tests {
             get_args(&check),
             vec![
                 "nix",
-                "--experimental-features",
+                "--extra-experimental-features",
                 "nix-command",
                 "store",
                 "ls",
@@ -1265,7 +1532,7 @@ mod tests {
             get_args(&sign),
             vec![
                 "nix",
-                "--experimental-features",
+                "--extra-experimental-features",
                 "nix-command",
                 "store",
                 "sign",
@@ -1297,6 +1564,8 @@ mod tests {
             get_args(&cmd),
             vec![
                 "nix",
+                "--extra-experimental-features",
+                "nix-command",
                 "build",
                 "--json",
                 "/nix/store/abc.drv^out",
@@ -1330,6 +1599,8 @@ mod tests {
             get_args(&cmd),
             vec![
                 "nix",
+                "--extra-experimental-features",
+                "nix-command",
                 "build",
                 "--json",
                 "/nix/store/abc.drv^out",
@@ -1358,6 +1629,8 @@ mod tests {
             get_args(&cmd),
             vec![
                 "nix",
+                "--extra-experimental-features",
+                "nix-command",
                 "build",
                 "--json",
                 "/nix/store/abc.drv^out",
@@ -1375,6 +1648,8 @@ mod tests {
             get_args(&cmd),
             vec![
                 "nix",
+                "--extra-experimental-features",
+                "nix-command",
                 "build",
                 "--json",
                 "/nix/store/abc.drv^out",
@@ -1598,6 +1873,8 @@ mod tests {
             get_args(&cmd),
             vec![
                 "nix",
+                "--extra-experimental-features",
+                "nix-command",
                 "copy",
                 "--substitute-on-destination",
                 "--no-check-sigs",
@@ -1632,6 +1909,8 @@ mod tests {
             get_args(&cmd),
             vec![
                 "nix",
+                "--extra-experimental-features",
+                "nix-command",
                 "copy",
                 "--to",
                 "ssh://deploy@example.com",

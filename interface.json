@@ -28,15 +28,33 @@
                     "type": ["boolean", "null"]
                 },
                 "confirmTimeout": {
-                    "type": ["integer", "null"]
+                    "type": ["integer", "null"],
+                    "minimum": 0,
+                    "maximum": 65535
                 },
                 "activationTimeout": {
-                    "type": ["integer", "null"]
+                    "type": ["integer", "null"],
+                    "minimum": 0,
+                    "maximum": 65535
                 },
                 "tempPath": {
                     "type": ["string", "null"]
                 },
                 "interactiveSudo": {
+                    "type": ["boolean", "null"]
+                },
+                "sudo": {
+                    "oneOf": [
+                        { "type": "string" },
+                        {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "minItems": 1
+                        },
+                        { "type": "null" }
+                    ]
+                },
+                "remoteBuild": {
                     "type": ["boolean", "null"]
                 }
             }

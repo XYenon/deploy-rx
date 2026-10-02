@@ -28,6 +28,8 @@ jobs:
             cargo fmt --check
             cargo clippy --all-targets -- --deny warnings
             cargo test
+            cargo test --lib -- --ignored
+            cargo test --test remote_sessions -- --ignored
           '
 
   get-matrix:
