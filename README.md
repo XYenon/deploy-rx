@@ -9,6 +9,8 @@ SPDX-License-Identifier: MPL-2.0
 
 **deploy-rx** is an extended fork of the excellent [deploy-rs](https://github.com/serokell/deploy-rs) project. This fork aims to add new features and significantly optimize the user experience.
 
+The machine running the deploy-rx CLI requires **Nix 2.13 or newer**. The CLI checks this before evaluating or building deployment configurations, including in `--file` mode. Dynamic derivations additionally require Nix with the relevant experimental features enabled.
+
 ## Features & Enhancements
 
 `deploy-rx` introduces several functional improvements and capabilities over the original `deploy-rs`:
@@ -18,6 +20,14 @@ SPDX-License-Identifier: MPL-2.0
 Reuses SSH connections when deploying multiple profiles to the same node, significantly reducing connection overhead and speeding up deployments.
 
 - Added `--no-rollback-fresh-connection` flag to control rollback connection behavior.
+
+### Deployment Sessions and Rollback
+
+Deployments to the same profile are serialized, including activation and confirmation. Rollback restores the profile state captured before that deployment, rather than selecting the preceding generation. Multi-target rollback runs in reverse deployment order and refuses to overwrite a newer deployment.
+
+Activation defaults to a 240-second timeout. On timeout, the activation process group is terminated before rollback begins. Confirmation has its own deadline and uses a fresh SSH connection by default. Disconnected log streams do not interrupt rollback. `--boot` and `--test` keep their respective modes when restoring the previous configuration.
+
+The remote session protocol is version 3. The CLI and the `activate-rs` helper in deployed closures must be built from compatible deploy-rx versions; update the deploy-rx input in deployment flakes alongside the CLI.
 
 ### `system-manager` Support
 
@@ -39,9 +49,13 @@ First-class support for deploying [system-manager](https://github.com/numtide/sy
 - **Diff & Change Review**: Integrated, super-fast diffing (`dix`) of derivation changes before activation or switch. Enabled by default (bypass with `--no-review-changes`).
 - **Batched Nix Evaluation, Builds & Pushes**: Intelligently groups multiple deployment targets from the same flake into a single `nix eval`, batches local builds into one `nix build`, and batches compatible pushes to the same target into one `nix copy`, reducing Nix and SSH overhead for multi-profile deployments.
 
+For the NixOS system profile, `--test` changes the running system while preserving the system profile and boot default. If a later switch fails, rollback restores the previous boot configuration and the previous running system independently.
+
 ### Logs
 
 Application messages use `[deploy LEVEL]`, `[activate LEVEL]`, or `[revoke LEVEL]` on each line. Non-interactive deployments show a short target summary; interactive deployments still show the full preview for confirmation. Remote stderr is labeled `[node.profile remote]` by default, so output from different deployment targets can be distinguished. Nix, `nom`, and diff output retain their native formatting. Use `--no-demarcate-output` to leave remote stderr unchanged, `--debug-logs` for debug messages on the terminal, and `--log-dir DIR` to save application logs (including remote activation logs) while keeping normal terminal output concise.
+
+Remote terminal output uses a bounded buffer and may be dropped if the connection stops consuming stderr. This keeps activation deadlines and rollback independent of log delivery. Application logs saved with `--log-dir` are still written to their files.
 
 ### Sudo Configuration
 

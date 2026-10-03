@@ -433,8 +433,16 @@ in {
         work("PATH=/tmp/wrappers:$PATH deploy -s --no-build-tree --no-review-changes .#multiplex -- --offline > /tmp/ssh-multiplexing.out 2>&1", timeout=600)
         server.succeed("grep -Fx first /tmp/multiplex/first")
         server.succeed("grep -Fx second /tmp/multiplex/second")
-        client_sh("count=$(grep -c 'ControlMaster=yes' /tmp/deploy-rx-e2e/ssh.log || true); test \"$count\" = 1")
-        client_sh("count=$(grep -c 'deploy-rx-ssh-server' /tmp/deploy-rx-e2e/ssh.log || true); test \"$count\" -ge 3")
+        ssh_commands = [line.split() for line in client_sh("cat /tmp/deploy-rx-e2e/ssh.log").splitlines()]
+        masters = [args for args in ssh_commands if "ControlMaster=yes" in args]
+        assert len(masters) == 1, ssh_commands
+        socket = masters[0][masters[0].index("-S") + 1]
+        assert socket != "none", masters
+        sockets = [args[args.index("-S") + 1] for args in ssh_commands if "-S" in args]
+        shared_sockets = [path for path in sockets if path != "none"]
+        assert len(shared_sockets) >= 3, ssh_commands
+        assert set(shared_sockets) == {socket}, ssh_commands
+        assert any(f"ControlPath={socket}" in args and "-O" in args and "exit" in args for args in ssh_commands), ssh_commands
 
       with subtest("no-ssh-multiplexing"):
         reset_logs()
@@ -444,8 +452,10 @@ in {
         work("PATH=/tmp/wrappers:$PATH deploy -s --no-build-tree --no-review-changes --no-ssh-multiplexing .#multiplex -- --offline > /tmp/no-ssh-multiplexing.out 2>&1", timeout=600)
         server.succeed("grep -Fx first /tmp/multiplex/first")
         server.succeed("grep -Fx second /tmp/multiplex/second")
-        client_sh("count=$(grep -c 'ControlMaster=yes' /tmp/deploy-rx-e2e/ssh.log || true); test \"$count\" = 0")
-        client_sh("count=$(grep -c 'deploy-rx-ssh-server' /tmp/deploy-rx-e2e/ssh.log || true); test \"$count\" = 0")
+        ssh_commands = [line.split() for line in client_sh("cat /tmp/deploy-rx-e2e/ssh.log").splitlines()]
+        assert not any("ControlMaster=yes" in args for args in ssh_commands), ssh_commands
+        assert all(args[args.index("-S") + 1] == "none" for args in ssh_commands if "-S" in args), ssh_commands
+        assert not any(arg.startswith("ControlPath=") and arg != "ControlPath=none" for args in ssh_commands for arg in args), ssh_commands
     '';
   };
 

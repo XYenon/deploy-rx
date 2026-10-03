@@ -3,10 +3,24 @@
 // SPDX-License-Identifier: MPL-2.0
 
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 use crate::sudo::SudoCommand;
 
-pub const REMOTE_PROTOCOL_VERSION: u16 = 2;
+pub const REMOTE_PROTOCOL_VERSION: u16 = 3;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RollbackReceipt {
+    pub session_id: String,
+    pub previous_session: Option<String>,
+    pub previous_link: Option<PathBuf>,
+    pub previous_target: Option<PathBuf>,
+    pub previous_running_target: Option<PathBuf>,
+    pub expected_link: Option<PathBuf>,
+    pub created_generation: Option<String>,
+    pub boot: bool,
+    pub test: bool,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ProfileTarget {
@@ -41,6 +55,7 @@ pub struct RemoteDeployRequest {
 pub struct RemoteRevokeRequest {
     pub closure: String,
     pub profile: ProfileTarget,
+    pub rollback: RollbackReceipt,
     pub profile_user: String,
     pub temp_path: String,
     pub debug_logs: bool,
@@ -116,5 +131,6 @@ pub enum RemoteEvent {
         ok: bool,
         rolled_back: bool,
         message: String,
+        rollback: Option<RollbackReceipt>,
     },
 }

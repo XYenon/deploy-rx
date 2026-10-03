@@ -741,7 +741,8 @@ where
 {
     let mut revoked = 0;
     let mut failures = Vec::new();
-    for &index in targets {
+    // Undo in reverse activation order, including multiple targets sharing a profile.
+    for &index in targets.iter().rev() {
         match revoke(index).await {
             Ok(()) => revoked += 1,
             Err(error) => failures.push((index, error)),
@@ -1049,12 +1050,17 @@ async fn run_deploy(
             RunDeployError::PushProfile(node_names, e)
         })?;
 
-    let mut succeeded: Vec<(&deploy::DeployData, &deploy::DeployDefs, &str)> = vec![];
+    let mut succeeded: Vec<(
+        &deploy::DeployData,
+        &deploy::DeployDefs,
+        &str,
+        deploy::remote_protocol::RollbackReceipt,
+    )> = vec![];
 
     // Only revoke profiles activated earlier in this run. A dry activation
     // must not revoke profiles from earlier dry runs.
     for ((_, deploy_data, deploy_defs), closure) in parts.iter().zip(&closures) {
-        if let Err(e) = deploy::deploy::deploy_profile(
+        let rollback = match deploy::deploy::deploy_profile(
             deploy_data,
             deploy_defs,
             closure,
@@ -1067,51 +1073,62 @@ async fn run_deploy(
         )
         .await
         {
-            let to_revoke = rollback_targets(
-                dry_activate,
-                rollback_succeeded,
-                cmd_overrides.auto_rollback.unwrap_or(true),
-                succeeded
-                    .iter()
-                    .map(|(data, _, _)| data.merged_settings.auto_rollback),
-            );
-            if !to_revoke.is_empty() {
-                info!(
-                    "Revoking {} previously deployed profile(s)",
-                    to_revoke.len()
+            Ok(rollback) => rollback,
+            Err(e) => {
+                let to_revoke = rollback_targets(
+                    dry_activate,
+                    rollback_succeeded,
+                    cmd_overrides.auto_rollback.unwrap_or(true),
+                    succeeded
+                        .iter()
+                        .map(|(data, _, _, _)| data.merged_settings.auto_rollback),
                 );
-                let (revoked, failures) = revoke_all(&to_revoke, |index| {
-                    let (deploy_data, deploy_defs, closure) = succeeded[index];
-                    deploy::deploy::revoke(deploy_data, deploy_defs, closure, demarcate_output)
-                })
-                .await;
-                if !failures.is_empty() {
-                    let failures = failures
-                        .into_iter()
-                        .map(|(index, error)| {
-                            let (data, _, _) = succeeded[index];
-                            format!("{}.{}: {}", data.node_name, data.profile_name, error)
-                        })
-                        .collect::<Vec<_>>()
-                        .join("; ");
-                    return Err(RunDeployError::RollbackFailed {
-                        node: deploy_data.node_name.to_string(),
-                        deployment: e,
-                        revoked,
-                        failures,
-                    });
+                if !to_revoke.is_empty() {
+                    info!(
+                        "Revoking {} previously deployed profile(s)",
+                        to_revoke.len()
+                    );
+                    let (revoked, failures) = revoke_all(&to_revoke, |index| {
+                        let (deploy_data, deploy_defs, closure, rollback) = &succeeded[index];
+                        deploy::deploy::revoke(
+                            deploy_data,
+                            deploy_defs,
+                            closure,
+                            rollback,
+                            demarcate_output,
+                        )
+                    })
+                    .await;
+                    if !failures.is_empty() {
+                        let failures = failures
+                            .into_iter()
+                            .map(|(index, error)| {
+                                let (data, _, _, _) = &succeeded[index];
+                                format!("{}.{}: {}", data.node_name, data.profile_name, error)
+                            })
+                            .collect::<Vec<_>>()
+                            .join("; ");
+                        return Err(RunDeployError::RollbackFailed {
+                            node: deploy_data.node_name.to_string(),
+                            deployment: e,
+                            revoked,
+                            failures,
+                        });
+                    }
+                    return Err(RunDeployError::Rollback(
+                        deploy_data.node_name.to_string(),
+                        e,
+                    ));
                 }
-                return Err(RunDeployError::Rollback(
+                return Err(RunDeployError::DeployProfile(
                     deploy_data.node_name.to_string(),
                     e,
                 ));
             }
-            return Err(RunDeployError::DeployProfile(
-                deploy_data.node_name.to_string(),
-                e,
-            ));
+        };
+        if let Some(rollback) = rollback {
+            succeeded.push((deploy_data, deploy_defs, closure.as_str(), rollback));
         }
-        succeeded.push((deploy_data, deploy_defs, closure.as_str()))
     }
 
     if let Some(multiplexer) = ssh_multiplexer {
@@ -1168,13 +1185,13 @@ mod tests {
         })
         .await;
 
-        assert_eq!(attempted, vec![0, 1, 2, 3]);
+        assert_eq!(attempted, vec![3, 2, 1, 0]);
         assert_eq!(revoked, 2);
         assert_eq!(
             failures,
             vec![
-                (0, "failed to revoke profile 0".to_string()),
-                (2, "failed to revoke profile 2".to_string())
+                (2, "failed to revoke profile 2".to_string()),
+                (0, "failed to revoke profile 0".to_string())
             ]
         );
     }
@@ -1908,6 +1925,8 @@ pub enum RunError {
     PushProfile(#[from] deploy::push::PushProfileError),
     #[error("Failed to test for flake support: {0}")]
     FlakeTest(std::io::Error),
+    #[error("Nix 2.13 or newer is required. Version check failed: {0}")]
+    NixVersionCheck(command::CommandError<NixCheckError>),
     #[error("Failed to check deployment: {0}")]
     CheckDeployment(#[from] CheckDeploymentError),
     #[error("Failed to evaluate deployment data: {0}")]
@@ -1935,6 +1954,22 @@ pub async fn run(args: Option<&ArgMatches>) -> Result<(), RunError> {
         opts.log_dir.as_deref(),
         &deploy::LoggerType::Deploy,
     )?;
+
+    // Flake support predates store-derivation output selection (`.drv^out`).
+    // Use Nix's own comparison so prereleases and alternative distributions
+    // follow the same version ordering as Nix itself.
+    let mut version_check = Command::new("nix");
+    version_check.args([
+        "--extra-experimental-features",
+        "nix-command",
+        "eval",
+        "--expr",
+        "if builtins.compareVersions builtins.nixVersion \"2.13\" >= 0 then true else throw \"deploy-rx requires Nix 2.13 or newer (found ${builtins.nixVersion})\"",
+    ]);
+    command::Command::new(version_check)
+        .run::<NixCheckError>()
+        .await
+        .map_err(RunError::NixVersionCheck)?;
 
     let deploys = opts
         .clone()

@@ -22,6 +22,18 @@ let
     outputs = [ "out" "dev" ];
   } "touch $out $dev";
 
+  # A dynamic drvPath is an opaque placeholder; its string context identifies
+  # the outer derivation and output that produce the actual .drv file.
+  dynamicDrvPath = builtins.appendContext
+    "/0000000000000000000000000000000000000000000000000000"
+    { "${builtins.unsafeDiscardStringContext fakeProfile.drvPath}" = { outputs = [ "out" ]; }; };
+  dynamicProfile = {
+    type = "derivation";
+    drvPath = dynamicDrvPath;
+    outPath = throw "dynamic outPath must not be forced during deployment evaluation";
+    outputName = "dev";
+  };
+
   derivationDeploy = {
     sshUser = "deployer";
     nodes.demo = {
@@ -31,6 +43,7 @@ let
         sshUser = "root";
       };
       profiles.dev.path = multiOutputProfile.dev;
+      profiles.dynamic.path = dynamicProfile;
     };
   };
 
@@ -48,6 +61,7 @@ let
 
   drvProfile = drvOut.nodes.demo.profiles.system;
   devProfile = drvOut.nodes.demo.profiles.dev;
+  dynProfile = drvOut.nodes.demo.profiles.dynamic;
   strProfile = strOut.nodes.demo.profiles.system;
 in
 # A derivation-typed path is split into outPath, drvPath, and outputName.
@@ -57,6 +71,9 @@ assert drvProfile.outputName == "out";
 assert devProfile.path == multiOutputProfile.dev.outPath;
 assert devProfile.drvPath == multiOutputProfile.dev.drvPath;
 assert devProfile.outputName == "dev";
+assert dynProfile.drvPath == dynamicDrvPath;
+assert dynProfile.path == dynamicDrvPath;
+assert dynProfile.outputName == "dev";
 # Sibling attrs are preserved.
 assert drvProfile.sshUser == "root";
 assert drvOut.sshUser == "deployer";

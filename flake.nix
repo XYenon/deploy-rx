@@ -30,6 +30,7 @@
             "Cargo.toml"
             "src"
             "src/bin"
+            "tests"
             ".*.rs$"
             "nix"
             "nix/.*.nix$"
@@ -142,9 +143,9 @@
             profile = base: custom base ''
               export PATH="${final.lib.makeBinPath [ final.nix ]}:$PATH"
               nixFlags=(--extra-experimental-features "nix-command flakes")
-              # Best-effort removal of a previously-installed element of the same
-              # name (no-op on first deploy), then install the new closure.
-              nix "''${nixFlags[@]}" profile remove "${base.name}" 2>/dev/null || true
+              # This installs `base`, whose manifest name excludes its version
+              # (for example, `hello`, not `hello-2.12.3`).
+              nix "''${nixFlags[@]}" profile remove "${(builtins.parseDrvName base.name).name}" 2>/dev/null || true
               nix "''${nixFlags[@]}" profile install "${base}"
             '';
           };

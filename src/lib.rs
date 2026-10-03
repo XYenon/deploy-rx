@@ -15,6 +15,76 @@ use thiserror::Error;
 use flexi_logger::*;
 
 use std::path::PathBuf;
+use std::sync::{mpsc, OnceLock};
+
+enum RemoteLogMessage {
+    Output(Vec<u8>),
+    Flush(mpsc::SyncSender<()>),
+}
+
+fn remote_stderr() -> &'static mpsc::SyncSender<RemoteLogMessage> {
+    static OUTPUT: OnceLock<mpsc::SyncSender<RemoteLogMessage>> = OnceLock::new();
+    OUTPUT.get_or_init(|| {
+        let (sender, receiver) = mpsc::sync_channel(64);
+        std::thread::spawn(move || {
+            use std::io::Write;
+            let mut stderr = std::io::stderr();
+            while let Ok(message) = receiver.recv() {
+                match message {
+                    RemoteLogMessage::Output(bytes) => {
+                        if stderr.write_all(&bytes).is_err() {
+                            break;
+                        }
+                    }
+                    RemoteLogMessage::Flush(done) => {
+                        let _ = stderr.flush();
+                        let _ = done.try_send(());
+                    }
+                }
+            }
+        });
+        sender
+    })
+}
+
+/// Remote log backpressure must never delay activation or recovery.
+pub fn write_remote_stderr(bytes: &[u8]) {
+    for chunk in bytes.chunks(8192) {
+        let _ = remote_stderr().try_send(RemoteLogMessage::Output(chunk.to_vec()));
+    }
+}
+
+pub fn flush_remote_stderr() {
+    let (sender, receiver) = mpsc::sync_channel(1);
+    if remote_stderr()
+        .try_send(RemoteLogMessage::Flush(sender))
+        .is_ok()
+    {
+        let _ = receiver.recv_timeout(std::time::Duration::from_millis(100));
+    }
+}
+
+struct RemoteLogWriter {
+    formatter: FormatFunction,
+    level: log::Level,
+}
+
+impl writers::LogWriter for RemoteLogWriter {
+    fn write(&self, now: &mut DeferredNow, record: &Record) -> std::io::Result<()> {
+        if record.level() <= self.level {
+            let mut bytes = Vec::new();
+            (self.formatter)(&mut bytes, now, record)?;
+            bytes.push(b'\n');
+            write_remote_stderr(&bytes);
+        }
+        Ok(())
+    }
+
+    fn flush(&self) -> std::io::Result<()> {
+        flush_remote_stderr();
+        Ok(())
+    }
+}
 
 fn format_record(w: &mut dyn std::io::Write, source: &str, record: &Record) -> std::io::Result<()> {
     let prefix = format!("[{source} {}] ", record.level());
@@ -68,6 +138,17 @@ pub fn init_logger(
         LoggerType::Activate => logger_formatter_activate,
         LoggerType::Revoke => logger_formatter_revoke,
     };
+    let remote = matches!(logger_type, LoggerType::Activate | LoggerType::Revoke);
+    let remote_writer = || {
+        Box::new(RemoteLogWriter {
+            formatter: logger_formatter,
+            level: if debug_logs {
+                log::Level::Debug
+            } else {
+                log::Level::Info
+            },
+        })
+    };
 
     if let Some(log_dir) = log_dir {
         let mut file_spec = FileSpec::default().directory(log_dir);
@@ -78,24 +159,38 @@ pub fn init_logger(
             LoggerType::Deploy => (),
         }
 
-        let _logger_handle = Logger::try_with_env_or_str("debug")?
-            .log_to_file(file_spec)
-            .format_for_stderr(logger_formatter)
-            .format_for_files(logger_formatter)
-            .duplicate_to_stderr(match debug_logs {
-                true => Duplicate::Debug,
-                false => Duplicate::Info,
-            })
-            .print_message()
-            .start()?;
+        let logger = Logger::try_with_env_or_str("debug")?.panic_if_error_channel_is_broken(false);
+        let logger = if remote {
+            logger
+                .error_channel(ErrorChannel::DevNull)
+                .log_to_file_and_writer(file_spec, remote_writer())
+                .format_for_files(logger_formatter)
+        } else {
+            logger
+                .log_to_file(file_spec)
+                .format_for_stderr(logger_formatter)
+                .format_for_files(logger_formatter)
+                .duplicate_to_stderr(match debug_logs {
+                    true => Duplicate::Debug,
+                    false => Duplicate::Info,
+                })
+                .print_message()
+        };
+        let _logger_handle = logger.start()?;
     } else {
-        let _logger_handle = Logger::try_with_env_or_str(match debug_logs {
+        let logger = Logger::try_with_env_or_str(match debug_logs {
             true => "debug",
             false => "info",
         })?
-        .log_to_stderr()
-        .format(logger_formatter)
-        .start()?;
+        .panic_if_error_channel_is_broken(false);
+        let logger = if remote {
+            logger
+                .error_channel(ErrorChannel::DevNull)
+                .log_to_writer(remote_writer())
+        } else {
+            logger.log_to_stderr().format(logger_formatter)
+        };
+        let _logger_handle = logger.start()?;
     }
 
     Ok(())
@@ -190,10 +285,15 @@ fn parse_fragment(fragment: &str) -> Result<(Option<String>, Option<String>), Pa
         }
     }
 
-    let root = rnix::Root::parse(fragment).tree();
-    let Some(expr) = root.expr() else {
+    if fragment.is_empty() {
         return Ok((None, None));
-    };
+    }
+    let parsed = rnix::Root::parse(fragment);
+    if !parsed.errors().is_empty() {
+        return Err(ParseFlakeError::Unrecognized);
+    }
+    let root = parsed.tree();
+    let expr = root.expr().ok_or(ParseFlakeError::Unrecognized)?;
 
     match expr {
         ast::Expr::Select(select) => {
@@ -457,6 +557,9 @@ pub fn make_deploy_data<'a>(
     if let Some(magic_rollback) = cmd_overrides.magic_rollback {
         merged_settings.magic_rollback = Some(magic_rollback);
     }
+    if let Some(ref temp_path) = cmd_overrides.temp_path {
+        merged_settings.temp_path = Some(temp_path.clone());
+    }
     if let Some(confirm_timeout) = cmd_overrides.confirm_timeout {
         merged_settings.confirm_timeout = Some(confirm_timeout);
     }
@@ -524,6 +627,24 @@ mod deploy_data_tests {
     }
 
     #[test]
+    fn malformed_fragments_never_select_all_targets() {
+        for target in [
+            ".##prod",
+            ".# ",
+            ".#node.",
+            ".#node trailing",
+            ".#/* comment */",
+        ] {
+            assert!(parse_flake(target).is_err(), "accepted {}", target);
+        }
+        assert_eq!(parse_flake(".#").unwrap().node, None);
+        assert_eq!(
+            parse_flake(".#node.app").unwrap().profile.as_deref(),
+            Some("app")
+        );
+    }
+
+    #[test]
     fn test_empty_profile_path_falls_back_to_profile_user_and_name() {
         let top_settings = empty_settings();
         let node = data::Node {
@@ -547,7 +668,8 @@ mod deploy_data_tests {
                 ..empty_settings()
             },
         };
-        let cmd_overrides = empty_cmd_overrides();
+        let mut cmd_overrides = empty_cmd_overrides();
+        cmd_overrides.temp_path = Some(PathBuf::from("/custom-confirmation"));
 
         let deploy_data = make_deploy_data(
             &top_settings,
@@ -558,6 +680,10 @@ mod deploy_data_tests {
             &cmd_overrides,
             false,
             None,
+        );
+        assert_eq!(
+            deploy_data.merged_settings.temp_path,
+            cmd_overrides.temp_path
         );
 
         match deploy_data.get_profile_info().unwrap() {

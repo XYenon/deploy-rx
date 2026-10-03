@@ -10,7 +10,7 @@ use clap::Parser;
 use serde::de::DeserializeOwned;
 
 use tokio::fs;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use tokio::time::timeout;
 
@@ -20,7 +20,7 @@ use std::env;
 use std::fmt::Write as FmtWrite;
 use std::io::{Read as IoRead, Write as IoWrite};
 #[cfg(unix)]
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
@@ -30,7 +30,7 @@ use log::{debug, error, info, warn};
 
 use deploy::command;
 use deploy::remote_protocol::{
-    BootstrapRequest, ConfirmRequest, ProfileTarget, RemoteEvent, RemoteOperation,
+    BootstrapRequest, ConfirmRequest, ProfileTarget, RemoteEvent, RemoteOperation, RollbackReceipt,
     REMOTE_PROTOCOL_VERSION,
 };
 
@@ -477,6 +477,34 @@ mod tests {
         let mode = std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
     }
+
+    #[test]
+    fn concurrent_confirmations_publish_only_complete_nonces() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("confirm");
+        let nonce = "n".repeat(2 * 1024 * 1024);
+        std::thread::scope(|scope| {
+            let reader = scope.spawn(|| loop {
+                match std::fs::read_to_string(&path) {
+                    Ok(value) => {
+                        assert_eq!(value, format!("{}\n", nonce));
+                        break;
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                        std::thread::yield_now()
+                    }
+                    Err(err) => panic!("{}", err),
+                }
+            });
+            let writers: Vec<_> = (0..4)
+                .map(|_| scope.spawn(|| write_confirmation_file(&path, &nonce).unwrap()))
+                .collect();
+            for writer in writers {
+                writer.join().unwrap();
+            }
+            reader.join().unwrap();
+        });
+    }
 }
 
 #[derive(Error, Debug)]
@@ -627,20 +655,14 @@ fn write_confirmation_file(path: &Path, nonce: &str) -> Result<(), String> {
             .map_err(|err| format!("failed to create confirmation directory: {}", err))?;
     }
 
-    let mut open_options = std::fs::OpenOptions::new();
-    open_options.write(true).create_new(true);
-    #[cfg(unix)]
-    open_options.mode(0o600);
-
-    match open_options.open(path) {
-        Ok(mut file) => {
-            file.write_all(nonce.as_bytes())
-                .map_err(|err| format!("failed to write confirmation file: {}", err))?;
-            file.write_all(b"\n")
-                .map_err(|err| format!("failed to write confirmation file: {}", err))?;
-            file.flush()
-                .map_err(|err| format!("failed to flush confirmation file: {}", err))?;
-        }
+    let mut file = tempfile::NamedTempFile::new_in(path.parent().unwrap_or(Path::new(".")))
+        .map_err(|err| format!("failed to create confirmation file: {}", err))?;
+    file.write_all(format!("{}\n", nonce).as_bytes())
+        .map_err(|err| format!("failed to write confirmation file: {}", err))?;
+    // Publishing a complete file with no-clobber semantics also makes repeated
+    // confirmations safe; readers never observe an empty or partial nonce.
+    match file.persist_noclobber(path).map_err(|err| err.error) {
+        Ok(_) => (),
         Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
             let existing = std::fs::read_to_string(path)
                 .map_err(|err| format!("failed to read confirmation file: {}", err))?;
@@ -755,35 +777,54 @@ async fn command_status_to_stderr(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    #[cfg(unix)]
+    command.process_group(0);
 
-    let child = command
+    let mut child = command
         .spawn()
         .map_err(|err| format!("failed to spawn command: {}", err))?;
-
-    let output = match timeout_secs {
-        Some(timeout_secs) => match timeout(
-            Duration::from_secs(timeout_secs as u64),
-            child.wait_with_output(),
-        )
-        .await
-        {
-            Ok(output) => output.map_err(|err| format!("failed to wait for command: {}", err))?,
-            Err(_) => return Err(format!("command timed out after {} seconds", timeout_secs)),
-        },
-        None => child
-            .wait_with_output()
-            .await
-            .map_err(|err| format!("failed to wait for command: {}", err))?,
+    let pid = child.id().expect("spawned child has an id");
+    let stdout = child.stdout.take().expect("stdout is piped");
+    let stderr = child.stderr.take().expect("stderr is piped");
+    let execution = async {
+        let (status, (), ()) = tokio::join!(
+            child.wait(),
+            forward_command_output(stdout),
+            forward_command_output(stderr),
+        );
+        status.map_err(|err| format!("failed to wait for command: {}", err))
     };
+    let status = match timeout_secs {
+        Some(timeout_secs) => {
+            match timeout(Duration::from_secs(timeout_secs as u64), execution).await {
+                Ok(status) => status,
+                Err(_) => {
+                    #[cfg(unix)]
+                    // All normal descendants inherit this process group. Reap the
+                    // direct child before starting rollback. The timeout also
+                    // covers descendants retaining pipes after the shell exits.
+                    unsafe {
+                        libc::kill(-(pid as i32), libc::SIGKILL);
+                    }
+                    let _ = child.kill().await;
+                    let _ = child.wait().await;
+                    Err(format!("command timed out after {} seconds", timeout_secs))
+                }
+            }
+        }
+        None => execution.await,
+    };
+    status.map(|status| status.code())
+}
 
-    std::io::stderr()
-        .write_all(&output.stdout)
-        .map_err(|err| format!("failed to forward command stdout: {}", err))?;
-    std::io::stderr()
-        .write_all(&output.stderr)
-        .map_err(|err| format!("failed to forward command stderr: {}", err))?;
-
-    Ok(output.status.code())
+async fn forward_command_output(mut reader: impl AsyncRead + Unpin) {
+    let mut buffer = [0; 8192];
+    while let Ok(count) = reader.read(&mut buffer).await {
+        if count == 0 {
+            break;
+        }
+        deploy::write_remote_stderr(&buffer[..count]);
+    }
 }
 
 fn profile_generation_id_from_link_target(link_target: &Path) -> Option<String> {
@@ -795,11 +836,6 @@ fn profile_generation_id_from_link_target(link_target: &Path) -> Option<String> 
         .chars()
         .all(|ch| ch.is_ascii_digit())
         .then(|| generation_id.to_string())
-}
-
-fn current_profile_generation_id(profile_path: &str) -> Option<String> {
-    let link_target = std::fs::read_link(profile_path).ok()?;
-    profile_generation_id_from_link_target(&link_target)
 }
 
 fn current_profile_target(profile_path: &str) -> Option<PathBuf> {
@@ -836,6 +872,89 @@ fn resolve_previous_profile_target(profile_path: &str) -> Option<(PathBuf, bool)
     current_profile_target("/run/current-system").map(|target| (target, true))
 }
 
+fn profile_state_path(profile_path: &str, suffix: &str) -> PathBuf {
+    let path = Path::new(profile_path);
+    path.with_file_name(format!(
+        ".{}.deploy-rx-{}",
+        path.file_name().unwrap().to_string_lossy(),
+        suffix
+    ))
+}
+
+async fn lock_profile(profile_path: String) -> Result<(String, std::fs::File), String> {
+    tokio::task::spawn_blocking(move || {
+        let path = std::path::absolute(&profile_path).map_err(|err| err.to_string())?;
+        let parent = path.parent().ok_or("profile path has no parent")?;
+        std::fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+        let canonical = parent
+            .canonicalize()
+            .map_err(|err| err.to_string())?
+            .join(path.file_name().ok_or("profile path has no name")?);
+        let profile_path = canonical.to_string_lossy().into_owned();
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let lock = options
+            .open(profile_state_path(&profile_path, "lock"))
+            .map_err(|err| err.to_string())?;
+        lock.lock().map_err(|err| err.to_string())?;
+        Ok((profile_path, lock))
+    })
+    .await
+    .map_err(|err| err.to_string())?
+}
+
+fn write_profile_session(profile_path: &str, session_id: &str) -> Result<(), String> {
+    let path = profile_state_path(profile_path, "session");
+    let mut file =
+        tempfile::NamedTempFile::new_in(path.parent().unwrap()).map_err(|err| err.to_string())?;
+    file.write_all(session_id.as_bytes())
+        .map_err(|err| err.to_string())?;
+    file.persist(path).map_err(|err| err.to_string())?;
+    Ok(())
+}
+
+fn restore_profile_session(profile_path: &str, receipt: &RollbackReceipt) -> Result<(), String> {
+    if let Some(previous_session) = &receipt.previous_session {
+        write_profile_session(profile_path, previous_session)
+    } else {
+        std::fs::remove_file(profile_state_path(profile_path, "session"))
+            .map_err(|err| err.to_string())
+    }
+}
+
+fn capture_rollback(profile_path: &str, boot: bool, test: bool) -> Result<RollbackReceipt, String> {
+    let previous_target = resolve_previous_profile_target(profile_path).map(|(path, _)| path);
+    let system_profile = get_profile_path(None, Some("root".into()), Some("system".into()))
+        .map_err(|err| err.to_string())?;
+    let previous_running_target = if profile_path == system_profile {
+        current_profile_target("/run/current-system")
+    } else {
+        None
+    };
+    Ok(RollbackReceipt {
+        session_id: random_token().map_err(|err| err.to_string())?,
+        previous_session: std::fs::read_to_string(profile_state_path(profile_path, "session")).ok(),
+        previous_link: std::fs::read_link(profile_path).ok(),
+        previous_target,
+        previous_running_target,
+        expected_link: None,
+        created_generation: None,
+        boot,
+        test,
+    })
+}
+
+#[cfg(unix)]
+fn restore_profile_link(profile_path: &str, target: &Path) -> Result<(), String> {
+    let parent = Path::new(profile_path).parent().unwrap();
+    let temp = tempfile::tempdir_in(parent).map_err(|err| err.to_string())?;
+    let link = temp.path().join("profile");
+    std::os::unix::fs::symlink(target, &link).map_err(|err| err.to_string())?;
+    std::fs::rename(link, profile_path).map_err(|err| err.to_string())
+}
+
 async fn delete_profile_generation(profile_path: &str, generation_id: &str) -> Result<(), String> {
     warn!("Removing generation by ID {}", generation_id);
     let mut delete_generation = Command::new("nix-env");
@@ -854,7 +973,7 @@ async fn delete_profile_generation(profile_path: &str, generation_id: &str) -> R
     }
 }
 
-async fn reactivate_profile(profile_path: &str) -> Result<(), String> {
+async fn reactivate_profile(profile_path: &str, boot: bool, test: bool) -> Result<(), String> {
     info!("Attempting to re-activate the last generation");
     let deploy_rx_activate = Path::new(profile_path).join("deploy-rx-activate");
     let switch_to_configuration = Path::new(profile_path)
@@ -866,11 +985,22 @@ async fn reactivate_profile(profile_path: &str) -> Result<(), String> {
     // standard switch-to-configuration script in that case.
     let reactivate = if deploy_rx_activate.exists() {
         let mut cmd = Command::new(deploy_rx_activate);
-        cmd.env("PROFILE", profile_path).current_dir(profile_path);
+        cmd.env("PROFILE", profile_path)
+            .env("DRY_ACTIVATE", "0")
+            .env("BOOT", if boot { "1" } else { "0" })
+            .env("TEST", if test { "1" } else { "0" })
+            .current_dir(profile_path);
         cmd
     } else if switch_to_configuration.exists() {
         let mut cmd = Command::new(switch_to_configuration);
-        cmd.arg("switch").current_dir("/tmp");
+        cmd.arg(if boot {
+            "boot"
+        } else if test {
+            "test"
+        } else {
+            "switch"
+        })
+        .current_dir("/tmp");
         cmd
     } else {
         return Err("no activation script found after rollback".to_string());
@@ -885,27 +1015,29 @@ async fn reactivate_profile(profile_path: &str) -> Result<(), String> {
     }
 }
 
-async fn deactivate_session(
-    profile_path: &str,
-    previous_profile_target: Option<&Path>,
-) -> Result<(), String> {
+async fn deactivate_session(profile_path: &str, receipt: &RollbackReceipt) -> Result<(), String> {
     warn!("De-activating due to error");
-
-    let failed_generation_id = current_profile_generation_id(profile_path);
-
-    if let Some(previous_profile_target) = previous_profile_target {
-        info!(
-            "Restoring previous profile target {}",
-            previous_profile_target.display()
+    let session = std::fs::read_to_string(profile_state_path(profile_path, "session"))
+        .map_err(|err| format!("failed to read deployment identity: {}", err))?;
+    if session != receipt.session_id
+        || std::fs::read_link(profile_path).ok() != receipt.expected_link
+    {
+        return Err(
+            "profile has changed since this deployment; refusing to revoke a newer deployment"
+                .into(),
         );
-
+    }
+    if let Some(previous_link) = &receipt.previous_link {
+        restore_profile_link(profile_path, previous_link)?;
+    } else if let Some(previous_target) = &receipt.previous_target {
+        // NixOS may start without an initialized profile. Restore the known
+        // running system instead of guessing a generation with --rollback.
         let mut restore_profile = Command::new("nix-env");
         restore_profile
             .arg("-p")
             .arg(profile_path)
             .arg("--set")
-            .arg(previous_profile_target);
-
+            .arg(previous_target);
         match command_status_to_stderr(restore_profile, None).await? {
             Some(0) => (),
             code => {
@@ -916,23 +1048,45 @@ async fn deactivate_session(
             }
         }
     } else {
-        let mut rollback = Command::new("nix-env");
-        rollback.arg("-p").arg(profile_path).arg("--rollback");
-
-        match command_status_to_stderr(rollback, None).await? {
-            Some(0) => (),
-            code => return Err(format!("rollback resulted in a bad exit code: {:?}", code)),
+        match std::fs::remove_file(profile_path) {
+            Ok(()) => (),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => (),
+            Err(err) => return Err(err.to_string()),
         }
     }
-
-    let restored_generation_id = current_profile_generation_id(profile_path);
-    if let Some(failed_generation_id) = failed_generation_id {
-        if restored_generation_id.as_deref() != Some(failed_generation_id.as_str()) {
-            delete_profile_generation(profile_path, &failed_generation_id).await?;
+    // Always attempt reactivation even when generation cleanup fails.
+    let cleanup = match &receipt.created_generation {
+        Some(generation) => delete_profile_generation(profile_path, generation).await,
+        None => Ok(()),
+    };
+    let reactivation = async {
+        let previous = receipt
+            .previous_target
+            .as_ref()
+            .ok_or("no previous activation target is available")?;
+        if receipt.boot {
+            reactivate_profile(&previous.to_string_lossy(), true, false).await
+        } else if let Some(running) = &receipt.previous_running_target {
+            let boot = if receipt.test {
+                Ok(())
+            } else {
+                reactivate_profile(&previous.to_string_lossy(), true, false).await
+            };
+            let running = reactivate_profile(&running.to_string_lossy(), false, true).await;
+            match (boot, running) {
+                (Ok(()), result) | (result, Ok(())) => result,
+                (Err(boot), Err(running)) => Err(format!("{}; {}", boot, running)),
+            }
+        } else {
+            reactivate_profile(profile_path, false, receipt.test).await
         }
     }
-
-    reactivate_profile(profile_path).await
+    .await;
+    restore_profile_session(profile_path, receipt)?;
+    match (cleanup, reactivation) {
+        (Ok(()), result) | (result, Ok(())) => result,
+        (Err(cleanup), Err(activation)) => Err(format!("{}; {}", cleanup, activation)),
+    }
 }
 
 fn session_error_after_rollback(reason: String, rollback: Result<(), String>) -> SessionError {
@@ -944,37 +1098,40 @@ fn session_error_after_rollback(reason: String, rollback: Result<(), String>) ->
 
 async fn rollback_after_failure(
     profile_path: &str,
-    previous_profile_target: Option<&Path>,
+    receipt: &RollbackReceipt,
     reason: impl Into<String>,
 ) -> SessionError {
-    let rollback = deactivate_session(profile_path, previous_profile_target).await;
+    let rollback = deactivate_session(profile_path, receipt).await;
     session_error_after_rollback(reason.into(), rollback)
 }
 
 async fn process_deploy_session(
     request: deploy::remote_protocol::RemoteDeployRequest,
-) -> Result<String, SessionError> {
+) -> Result<Option<RollbackReceipt>, SessionError> {
     let profile_path = profile_path_from_target(request.profile.clone())
         .map_err(|err| SessionError::failed(format!("failed to resolve profile path: {}", err)))?;
-    let previous_profile_target = if request.dry_activate {
-        None
+    let (profile_path, _lock) = if request.dry_activate {
+        (profile_path, None)
     } else {
-        let previous_profile_target = resolve_previous_profile_target(&profile_path);
-        if let Some((_, true)) = &previous_profile_target {
-            info!(
-                "System profile is not initialized yet; using /run/current-system as the rollback target"
-            );
-        } else if previous_profile_target.is_none() {
-            warn!(
-                "Could not resolve current profile target before activation; rollback will fall back to nix-env --rollback"
-            );
-        }
-        previous_profile_target.map(|(target, _)| target)
+        let (path, lock) = lock_profile(profile_path)
+            .await
+            .map_err(SessionError::failed)?;
+        (path, Some(lock))
     };
+    let mut receipt = capture_rollback(&profile_path, request.boot, request.test)
+        .map_err(SessionError::failed)?;
+    let system_test = request.test
+        && !request.boot
+        && profile_path
+            == get_profile_path(None, Some("root".into()), Some("system".into()))
+                .map_err(|err| SessionError::failed(err.to_string()))?;
+    let nonce = random_token().map_err(|err| SessionError::failed(err.to_string()))?;
 
     if request.review_changes {
         match render_dry_diff(&profile_path, &request.closure) {
-            Ok(output) => eprint!("{}", output),
+            Ok(output) => {
+                deploy::write_remote_stderr(output.as_bytes());
+            }
             Err(err) => warn!(
                 "Failed to review derivation changes before activation: {}",
                 err
@@ -982,12 +1139,23 @@ async fn process_deploy_session(
         }
     }
 
-    if !request.dry_activate {
+    if !request.dry_activate && system_test {
+        // NixOS test changes the running system, not the boot default. Keep
+        // the system profile pointing at that default for subsequent rollback.
+        write_profile_session(&profile_path, &receipt.session_id).map_err(SessionError::failed)?;
+        receipt.expected_link = receipt.previous_link.clone();
+    } else if !request.dry_activate {
         info!("Setting profile generation");
         // Only attempt a destructive rollback if `nix-env --set` actually advanced the profile to a
         // new generation. If `--set` fails without creating a new generation, rolling back here
         // would revert a previously-good deployment.
-        let profile_link_before_set = std::fs::read_link(&profile_path).ok();
+        let generation_files: std::collections::HashSet<_> =
+            std::fs::read_dir(Path::new(&profile_path).parent().unwrap())
+                .map_err(|err| SessionError::failed(err.to_string()))?
+                .map(|entry| entry.map(|entry| entry.file_name()))
+                .collect::<Result<_, _>>()
+                .map_err(|err| SessionError::failed(err.to_string()))?;
+        write_profile_session(&profile_path, &receipt.session_id).map_err(SessionError::failed)?;
         let mut set_profile = Command::new("nix-env");
         set_profile
             .arg("-p")
@@ -995,18 +1163,28 @@ async fn process_deploy_session(
             .arg("--set")
             .arg(&request.closure);
 
-        match command_status_to_stderr(set_profile, None).await {
+        let set_result = command_status_to_stderr(set_profile, None).await;
+        receipt.expected_link = std::fs::read_link(&profile_path).ok();
+        if let Some(link) = &receipt.expected_link {
+            if link
+                .file_name()
+                .is_some_and(|name| !generation_files.contains(name))
+            {
+                receipt.created_generation = profile_generation_id_from_link_target(link);
+            }
+        }
+        if !matches!(set_result, Ok(Some(0))) && receipt.previous_link == receipt.expected_link {
+            restore_profile_session(&profile_path, &receipt).map_err(SessionError::failed)?;
+        }
+        match set_result {
             Ok(Some(0)) => (),
             Ok(code) => {
-                let profile_link_after_set = std::fs::read_link(&profile_path).ok();
-                let should_rollback = request.auto_rollback
-                    && profile_link_before_set.is_some()
-                    && profile_link_after_set.is_some()
-                    && profile_link_before_set != profile_link_after_set;
+                let should_rollback =
+                    request.auto_rollback && receipt.previous_link != receipt.expected_link;
                 if should_rollback {
                     return Err(rollback_after_failure(
                         &profile_path,
-                        previous_profile_target.as_deref(),
+                        &receipt,
                         format!("setting profile resulted in a bad exit code: {:?}", code),
                     )
                     .await);
@@ -1017,18 +1195,10 @@ async fn process_deploy_session(
                 )));
             }
             Err(err) => {
-                let profile_link_after_set = std::fs::read_link(&profile_path).ok();
-                let should_rollback = request.auto_rollback
-                    && profile_link_before_set.is_some()
-                    && profile_link_after_set.is_some()
-                    && profile_link_before_set != profile_link_after_set;
+                let should_rollback =
+                    request.auto_rollback && receipt.previous_link != receipt.expected_link;
                 if should_rollback {
-                    return Err(rollback_after_failure(
-                        &profile_path,
-                        previous_profile_target.as_deref(),
-                        err,
-                    )
-                    .await);
+                    return Err(rollback_after_failure(&profile_path, &receipt, err).await);
                 }
                 return Err(SessionError::failed(err));
             }
@@ -1039,12 +1209,12 @@ async fn process_deploy_session(
         "Running {}activation script",
         if request.dry_activate { "dry " } else { "" }
     );
-    let activation_location = if request.dry_activate {
+    let activation_location = if request.dry_activate || system_test {
         &request.closure
     } else {
         &profile_path
     };
-    let mut activate = Command::new(format!("{}/deploy-rx-activate", activation_location));
+    let mut activate = Command::new(format!("{}/deploy-rx-activate", request.closure));
     activate
         .env("PROFILE", activation_location)
         .env("DRY_ACTIVATE", if request.dry_activate { "1" } else { "0" })
@@ -1057,7 +1227,7 @@ async fn process_deploy_session(
     let activation_timeout = if request.dry_activate {
         None
     } else {
-        request.activation_timeout
+        Some(request.activation_timeout.unwrap_or(240))
     };
 
     match command_status_to_stderr(activate, activation_timeout).await {
@@ -1076,12 +1246,7 @@ async fn process_deploy_session(
         Ok(code) => {
             let reason = format!("activation script resulted in a bad exit code: {:?}", code);
             if request.auto_rollback {
-                return Err(rollback_after_failure(
-                    &profile_path,
-                    previous_profile_target.as_deref(),
-                    reason,
-                )
-                .await);
+                return Err(rollback_after_failure(&profile_path, &receipt, reason).await);
             }
             return Err(SessionError::failed(reason));
         }
@@ -1093,12 +1258,7 @@ async fn process_deploy_session(
         }
         Err(err) => {
             if request.auto_rollback {
-                return Err(rollback_after_failure(
-                    &profile_path,
-                    previous_profile_target.as_deref(),
-                    err,
-                )
-                .await);
+                return Err(rollback_after_failure(&profile_path, &receipt, err).await);
             }
             return Err(SessionError::failed(err));
         }
@@ -1112,11 +1272,7 @@ async fn process_deploy_session(
             request.confirm_timeout
         );
         let temp_path = PathBuf::from(&request.temp_path);
-        let session_id = random_token().map_err(|err| {
-            SessionError::failed(format!("failed to generate session id: {}", err))
-        })?;
-        let nonce = random_token()
-            .map_err(|err| SessionError::failed(format!("failed to generate nonce: {}", err)))?;
+        let session_id = &receipt.session_id;
 
         if let Err(err) = send_event(&RemoteEvent::AwaitingConfirm {
             session_id: session_id.clone(),
@@ -1124,7 +1280,7 @@ async fn process_deploy_session(
         }) {
             return Err(rollback_after_failure(
                 &profile_path,
-                previous_profile_target.as_deref(),
+                &receipt,
                 format!(
                     "confirmation failed: failed to send confirmation event: {}",
                     err
@@ -1134,19 +1290,19 @@ async fn process_deploy_session(
         }
 
         if let Err(err) =
-            wait_for_session_confirmation(&temp_path, &session_id, &nonce, request.confirm_timeout)
+            wait_for_session_confirmation(&temp_path, session_id, &nonce, request.confirm_timeout)
                 .await
         {
             return Err(rollback_after_failure(
                 &profile_path,
-                previous_profile_target.as_deref(),
+                &receipt,
                 format!("confirmation failed: {}", err),
             )
             .await);
         }
     }
 
-    Ok("deployment finished".to_string())
+    Ok((!request.dry_activate).then_some(receipt))
 }
 
 async fn process_revoke_session(
@@ -1154,7 +1310,10 @@ async fn process_revoke_session(
 ) -> Result<String, SessionError> {
     let profile_path = profile_path_from_target(request.profile)
         .map_err(|err| SessionError::failed(format!("failed to resolve profile path: {}", err)))?;
-    deactivate_session(&profile_path, None)
+    let (profile_path, _lock) = lock_profile(profile_path)
+        .await
+        .map_err(SessionError::failed)?;
+    deactivate_session(&profile_path, &request.rollback)
         .await
         .map_err(SessionError::failed)?;
     Ok("revoke finished".to_string())
@@ -1171,19 +1330,21 @@ async fn privileged_session(opts: PrivilegedSessionOpts) -> Result<(), Box<dyn s
 
     let result = match operation {
         RemoteOperation::Deploy(request) => process_deploy_session(request).await,
-        RemoteOperation::Revoke(request) => process_revoke_session(request).await,
+        RemoteOperation::Revoke(request) => process_revoke_session(request).await.map(|_| None),
     };
 
     match result {
-        Ok(message) => send_event(&RemoteEvent::Finished {
+        Ok(rollback) => send_event(&RemoteEvent::Finished {
             ok: true,
             rolled_back: false,
-            message,
+            message: "remote operation finished".into(),
+            rollback,
         })?,
         Err(err) => send_event(&RemoteEvent::Finished {
             ok: false,
             rolled_back: err.did_rollback(),
             message: err.to_string(),
+            rollback: None,
         })?,
     }
 
@@ -1215,6 +1376,8 @@ async fn bootstrap_session() -> Result<(), Box<dyn std::error::Error>> {
         .create(&session_dir)?;
     #[cfg(not(unix))]
     std::fs::create_dir_all(&session_dir)?;
+    #[cfg(unix)]
+    std::fs::set_permissions(&session_dir, std::fs::Permissions::from_mode(0o711))?;
 
     let request_path = session_dir.join("request.json");
     let request_json = serde_json::to_vec(&request.operation)?;
@@ -1228,6 +1391,8 @@ async fn bootstrap_session() -> Result<(), Box<dyn std::error::Error>> {
     let mut request_file = open_options.open(&request_path)?;
     request_file.write_all(&request_json)?;
     request_file.flush()?;
+    #[cfg(unix)]
+    request_file.set_permissions(std::fs::Permissions::from_mode(0o644))?;
     drop(request_file);
 
     let current_exe = env::current_exe()?;
@@ -1364,9 +1529,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok(()) => (),
         Err(err) => {
             error!("{}", err);
+            deploy::flush_remote_stderr();
             std::process::exit(1)
         }
     }
 
+    deploy::flush_remote_stderr();
     Ok(())
 }

@@ -216,6 +216,7 @@ dependencies = [
  "flexi_logger",
  "fork",
  "futures-util",
+ "libc",
  "log",
  "merge",
  "rnix",

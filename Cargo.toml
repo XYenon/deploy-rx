@@ -16,6 +16,7 @@ dirs = "7"
 flexi_logger = "0.31"
 fork = "0.10"
 futures-util = "0.3.31"
+libc = "0.2"
 log = "0.4"
 merge = "0.2.0"
 rnix = "0.14"
@@ -31,8 +32,6 @@ yn = "0.1"
 rpassword = "7.5.0"
 unescape = "0.1.0"
 dix = "2.2.0"
-
-[dev-dependencies]
 tempfile = "3"
 
 [lib]
