@@ -169,7 +169,7 @@ pub struct Opts {
 }
 
 /// Returns if the available Nix installation supports flakes
-async fn test_flake_support() -> Result<bool, std::io::Error> {
+async fn test_flake_support(extra_build_args: &[String]) -> Result<bool, std::io::Error> {
     debug!("Checking for flake support");
 
     let mut cmd = Command::new("nix");
@@ -178,6 +178,7 @@ async fn test_flake_support() -> Result<bool, std::io::Error> {
         .arg("eval")
         .arg("--expr")
         .arg("builtins.getFlake")
+        .args(extra_build_args)
         // This will error on some machines "intentionally", and we don't really need that printing
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -2011,7 +2012,9 @@ pub async fn run(args: Option<&ArgMatches>) -> Result<(), RunError> {
         interactive_sudo: opts.interactive_sudo,
     };
 
-    let supports_flakes = test_flake_support().await.map_err(RunError::FlakeTest)?;
+    let supports_flakes = test_flake_support(&opts.extra_build_args)
+        .await
+        .map_err(RunError::FlakeTest)?;
     let do_not_want_flakes = opts.file.is_some();
 
     if !supports_flakes {
