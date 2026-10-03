@@ -17,6 +17,77 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 #[test]
+fn flake_probe_preserves_extra_nix_arguments() {
+    let root = tempfile::tempdir().unwrap();
+    let log = root.path().join("nix-args");
+    let wrapper = root.path().join("nix");
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\n\
+             printf '%s\\n' BEGIN \"$@\" END >> {}\n\
+             for arg do\n\
+               case \"$arg\" in\n\
+                 *builtins.compareVersions*|builtins.getFlake) exit 0 ;;\n\
+               esac\n\
+             done\n\
+             exit 1\n",
+            shlex::try_quote(log.to_str().unwrap()).unwrap(),
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let extra_args = [
+        "--extra-experimental-features",
+        "flakes ca-derivations",
+        "--option",
+        "substituters",
+        "https://cache.example.org https://other.example.org",
+        "--offline",
+    ];
+    let output = Command::new(env!("CARGO_BIN_EXE_deploy"))
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                root.path().display(),
+                std::env::var("PATH").unwrap()
+            ),
+        )
+        .args(["--skip-checks", "--no-build-tree", "--no-review-changes"])
+        .arg(root.path().join("missing-deployment"))
+        .arg("--")
+        .args(extra_args)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    // Stop at configuration evaluation; this test never builds or deploys.
+    assert!(!output.status.success());
+    let log = std::fs::read_to_string(log).unwrap();
+    let commands: Vec<Vec<&str>> = log
+        .split("BEGIN\n")
+        .skip(1)
+        .map(|command| command.strip_suffix("END\n").unwrap().lines().collect())
+        .collect();
+    assert_eq!(commands.len(), 3, "{log}");
+    let mut expected = vec![
+        "--extra-experimental-features",
+        "nix-command",
+        "--extra-experimental-features",
+        "flakes",
+        "eval",
+        "--expr",
+        "builtins.getFlake",
+    ];
+    expected.extend(extra_args);
+    assert_eq!(commands[1], expected);
+    assert!(commands[2].ends_with(&extra_args), "{}", log);
+    assert!(commands
+        .iter()
+        .all(|args| !args.contains(&"--experimental-features")));
+}
+
+#[test]
 #[ignore = "requires Nix to evaluate the CLI's version check"]
 fn minimum_nix_version_is_checked_before_deployment_evaluation() {
     let nix = Command::new("sh")
