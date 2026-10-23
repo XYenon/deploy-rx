@@ -12,6 +12,7 @@
 use deploy::push::{build_and_push_profiles, PushProfileData};
 use serde_json::json;
 use std::io::{self, Read, Write};
+use std::num::NonZeroU16;
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::symlink;
 use std::os::unix::process::CommandExt;
@@ -140,7 +141,11 @@ fn real_nom_in_pty(scenario: &str) {
         .unwrap();
     drop(command);
     let deadline = Instant::now() + Duration::from_secs(30);
-    let mut terminal = vt100::Parser::new(50, 120, 0);
+    let mut terminal = vt100::Parser::new(
+        NonZeroU16::new(50).unwrap(),
+        NonZeroU16::new(120).unwrap(),
+        0,
+    );
     let mut transcript = Vec::new();
     let mut saw_three_trees = false;
     let mut resized = false;
@@ -228,7 +233,10 @@ fn resize_terminal(master: &std::fs::File, parser: &mut vt100::Parser, rows: u16
         unsafe { libc::ioctl(master.as_raw_fd(), libc::TIOCSWINSZ, &size) },
         0
     );
-    parser.screen_mut().set_size(rows, cols);
+    parser.screen_mut().set_size(
+        NonZeroU16::new(rows).unwrap(),
+        NonZeroU16::new(cols).unwrap(),
+    );
 }
 
 fn nom_fixture() -> io::Result<i32> {

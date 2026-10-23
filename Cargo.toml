@@ -41,7 +41,7 @@ exclude = [
 clap = { version = "4", features = [ "wrap_help", "derive" ] }
 dirs = "7"
 flexi_logger = "0.31"
-fork = "0.10"
+fork = "0.11"
 futures-util = "0.3.31"
 libc = "0.2"
 log = "0.4"
@@ -60,7 +60,7 @@ rpassword = "7.5.0"
 unescape = "0.1.0"
 dix = "2.2.0"
 tempfile = "3"
-vt100 = "0.16"
+vt100 = "0.18"
 
 [lib]
 name = "deploy"

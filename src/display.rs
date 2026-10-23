@@ -8,6 +8,7 @@
 use std::fs::File;
 use std::future::Future;
 use std::io::{self, IsTerminal, Write};
+use std::num::NonZeroU16;
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
@@ -113,12 +114,16 @@ impl Display {
                 unsafe {
                     libc::ioctl(terminal.get_ref().as_raw_fd(), libc::TIOCSWINSZ, &size);
                 }
-                panel.screen.screen_mut().set_size(size.ws_row, cols);
+                panel.screen.screen_mut().set_size(
+                    NonZeroU16::new(size.ws_row).unwrap(),
+                    NonZeroU16::new(cols).unwrap(),
+                );
             }
             let title = format!("[{}] {}", panel.state, panel.label);
             // Render text cells only. ANSI/OSC from builders cannot move the
             // compositor's cursor, change its title, or inject terminal modes.
-            let mut title_screen = vt100::Parser::new(1, cols, 0);
+            let mut title_screen =
+                vt100::Parser::new(NonZeroU16::MIN, NonZeroU16::new(cols).unwrap(), 0);
             for character in title.chars() {
                 if title_screen.screen().cursor_position().1 >= cols - 2 {
                     break;
@@ -285,7 +290,11 @@ pub(crate) fn panel(label: String) -> usize {
     display.panels.push(Panel {
         label: label.clone(),
         state: "running".into(),
-        screen: vt100::Parser::new(rows, cols.saturating_sub(1), 0),
+        screen: vt100::Parser::new(
+            NonZeroU16::new(rows).unwrap(),
+            NonZeroU16::new(cols.saturating_sub(1)).unwrap(),
+            0,
+        ),
         terminal: None,
     });
     if !display.interactive {
@@ -378,7 +387,7 @@ pub(crate) async fn read_nom(id: usize, terminal: Arc<AsyncFd<File>>) -> io::Res
 
 pub(crate) async fn stream(label: &str, mut input: impl AsyncRead + Unpin) -> io::Result<()> {
     let mut buffer = [0; 8192];
-    let mut parser = vt100::Parser::new(1, 4096, 0);
+    let mut parser = vt100::Parser::new(NonZeroU16::MIN, NonZeroU16::new(4096).unwrap(), 0);
     loop {
         let count = input.read(&mut buffer).await?;
         if count == 0 {
@@ -392,11 +401,11 @@ pub(crate) async fn stream(label: &str, mut input: impl AsyncRead + Unpin) -> io
         for byte in &buffer[..count] {
             if parser.screen().cursor_position().1 >= 4094 {
                 let _ = log(format!("[{label}] {}\n", parser.screen().contents()).as_bytes());
-                parser = vt100::Parser::new(1, 4096, 0);
+                parser = vt100::Parser::new(NonZeroU16::MIN, NonZeroU16::new(4096).unwrap(), 0);
             }
             if *byte == b'\n' {
                 let _ = log(format!("[{label}] {}\n", parser.screen().contents()).as_bytes());
-                parser = vt100::Parser::new(1, 4096, 0);
+                parser = vt100::Parser::new(NonZeroU16::MIN, NonZeroU16::new(4096).unwrap(), 0);
             } else {
                 parser.process(&[*byte]);
             }
