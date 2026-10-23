@@ -122,6 +122,7 @@
       # VM tests run on a fast local link, so direct SSH copies are both quicker and
       # more deterministic than letting the destination try remote substitutes.
       fastConnection = true;
+      tags = [ "test-fleet" ];
 
       nodes = {
       server = {
@@ -177,6 +178,7 @@
         sshUser = user;
         sshOpts = commonSshOpts;
         magicRollback = false;
+        tags = [ "edge" "test-fleet" ];
         profilesOrder = [ "metrics" "logs" "traces" "api" ];
         profiles.metrics = {
           path = writeMarkerProfile {
@@ -185,7 +187,7 @@
             append = true;
           };
           profilePath = "/home/${user}/.local/state/nix/profiles/tagged-metrics";
-          tags = [ "observability" "prod" ];
+          tags = [ "observability" "prod" "edge" ];
         };
         profiles.logs = {
           path = writeMarkerProfile {

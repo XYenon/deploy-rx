@@ -7,6 +7,33 @@ name = "deploy-rx"
 version = "0.1.0"
 authors = ["notgne2 <gen2@gen2.space>", "Serokell <hi@serokell.io>", "XYenon <i@xyenon.bid>"]
 edition = "2018"
+resolver = "3"
+rust-version = "1.95"
+description = "An extended multi-profile Nix-flake deployment tool."
+license = "MPL-2.0"
+repository = "https://github.com/XYenon/deploy-rx"
+readme = "README.md"
+keywords = ["nix", "flake", "deployment", "ssh", "operations"]
+categories = ["command-line-utilities", "development-tools"]
+# Keep nix/transform-deploy.nix, which src/cli.rs embeds at compile time.
+exclude = [
+    ".agents/",
+    ".envrc",
+    ".github/",
+    ".gitignore",
+    ".reuse/",
+    "default.nix",
+    "docs/",
+    "examples/",
+    "flake.lock",
+    "flake.nix",
+    "interface.json",
+    "nix/tests/",
+    "renovate.json",
+    "shell.nix",
+    # These integration tests require the repository's flake and Nix fixtures.
+    "tests/",
+]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -25,7 +52,7 @@ serde_json = "1.0.140"
 shlex = "2.0"
 signal-hook = "0.4"
 thiserror = "2.0"
-tokio = { version = "1.44.2", features = [ "process", "macros", "sync", "rt-multi-thread", "fs", "time", "io-util", "io-std" ] }
+tokio = { version = "1.44.2", features = [ "process", "macros", "sync", "rt-multi-thread", "fs", "time", "io-util", "io-std", "net" ] }
 toml = "1.0"
 whoami = "2.0"
 yn = "0.1"
@@ -33,10 +60,18 @@ rpassword = "7.5.0"
 unescape = "0.1.0"
 dix = "2.2.0"
 tempfile = "3"
+vt100 = "0.16"
 
 [lib]
 name = "deploy"
 path = "src/lib.rs"
+
+# This test executable also runs the Nix/SSH subprocess fixtures by argv[0].
+# It is excluded from the published package along with the rest of tests/.
+[[test]]
+name = "concurrent_preparation"
+path = "tests/concurrent_preparation.rs"
+harness = false
 
 [profile.release]
 lto = true

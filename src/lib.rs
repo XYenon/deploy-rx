@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
 pub mod command;
+mod display;
 
 use rnix::ast::{self, AstToken, InterpolPart};
 
@@ -86,6 +87,26 @@ impl writers::LogWriter for RemoteLogWriter {
     }
 }
 
+struct DeployLogWriter {
+    level: log::Level,
+}
+
+impl writers::LogWriter for DeployLogWriter {
+    fn write(&self, now: &mut DeferredNow, record: &Record) -> std::io::Result<()> {
+        if record.level() <= self.level {
+            let mut bytes = Vec::new();
+            logger_formatter_deploy(&mut bytes, now, record)?;
+            bytes.push(b'\n');
+            display::log(&bytes)?;
+        }
+        Ok(())
+    }
+
+    fn flush(&self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 fn format_record(w: &mut dyn std::io::Write, source: &str, record: &Record) -> std::io::Result<()> {
     let prefix = format!("[{source} {}] ", record.level());
     let message = record.args().to_string();
@@ -149,6 +170,17 @@ pub fn init_logger(
             },
         })
     };
+    let deploy_writer = || {
+        Box::new(DeployLogWriter {
+            level: if log_dir.is_none() {
+                log::Level::Trace
+            } else if debug_logs {
+                log::Level::Debug
+            } else {
+                log::Level::Info
+            },
+        })
+    };
 
     if let Some(log_dir) = log_dir {
         let mut file_spec = FileSpec::default().directory(log_dir);
@@ -167,13 +199,8 @@ pub fn init_logger(
                 .format_for_files(logger_formatter)
         } else {
             logger
-                .log_to_file(file_spec)
-                .format_for_stderr(logger_formatter)
+                .log_to_file_and_writer(file_spec, deploy_writer())
                 .format_for_files(logger_formatter)
-                .duplicate_to_stderr(match debug_logs {
-                    true => Duplicate::Debug,
-                    false => Duplicate::Info,
-                })
                 .print_message()
         };
         let _logger_handle = logger.start()?;
@@ -188,7 +215,7 @@ pub fn init_logger(
                 .error_channel(ErrorChannel::DevNull)
                 .log_to_writer(remote_writer())
         } else {
-            logger.log_to_stderr().format(logger_formatter)
+            logger.log_to_writer(deploy_writer())
         };
         let _logger_handle = logger.start()?;
     }
@@ -592,6 +619,7 @@ mod deploy_data_tests {
 
     fn empty_settings() -> data::GenericSettings {
         data::GenericSettings {
+            tags: vec![],
             ssh_user: None,
             user: None,
             ssh_opts: vec![],
@@ -659,7 +687,6 @@ mod deploy_data_tests {
             profile_settings: data::ProfileSettings {
                 path: "/nix/store/new-profile".to_string(),
                 profile_path: Some("".to_string()),
-                tags: vec![],
                 drv_path: None,
                 output_name: "out".to_string(),
             },

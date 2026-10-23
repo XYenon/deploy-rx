@@ -23,7 +23,7 @@
 
         deploy-rx = final.rustPlatform.buildRustPackage {
           pname = "deploy-rx";
-          version = "0.1.0";
+          version = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).package.version;
 
           src = final.lib.sourceByRegex ./. [
             "Cargo.lock"
@@ -39,6 +39,18 @@
           cargoLock.lockFile = ./Cargo.lock;
 
           nativeBuildInputs = [ final.makeWrapper ];
+          nativeCheckInputs = [ final.nix-output-monitor ];
+
+          env = {
+            DEPLOY_RX_TEST_NOM = "${final.nix-output-monitor}/bin/nom";
+            DEPLOY_RX_TEST_DRV = (final.runCommand "display-shared-workload" { } "touch $out").drvPath;
+            DEPLOY_RX_TEST_PROFILE = final.runCommand "preparation-test-profiles" { } ''
+              for profile in local-profile dev-profile shared-profile; do
+                mkdir -p "$out/$profile"
+                touch "$out/$profile/deploy-rx-activate" "$out/$profile/activate-rs"
+              done
+            '';
+          };
 
           postFixup = ''
             wrapProgram "$out/bin/deploy" \

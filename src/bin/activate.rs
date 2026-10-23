@@ -36,7 +36,7 @@ use deploy::remote_protocol::{
 
 /// Remote activation utility for deploy-rx
 #[derive(Parser, Debug)]
-#[command(version = "1.0", author = "Serokell <https://serokell.io/>")]
+#[command(version, author = "Serokell <https://serokell.io/>")]
 struct Opts {
     /// Print debug logs to output
     #[arg(short, long)]

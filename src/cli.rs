@@ -16,7 +16,7 @@ use log::{debug, info, warn};
 use serde::Serialize;
 use std::ffi::OsStr;
 use std::path::PathBuf;
-use std::process::{Command as StdCommand, Stdio};
+use std::process::Stdio;
 use thiserror::Error;
 use tokio::process::Command;
 
@@ -48,7 +48,7 @@ fn unique_repos<'a>(deploy_flakes: &[DeployFlake<'a>]) -> Vec<&'a str> {
 
 /// Simple Rust rewrite of a simple Nix Flake deployment tool
 #[derive(Parser, Debug, Clone)]
-#[command(version = "1.0", author = "Serokell <https://serokell.io/>")]
+#[command(version, author = "Serokell <https://serokell.io/>")]
 pub struct Opts {
     /// The flake to deploy
     #[arg(group = "deploy")]
@@ -212,6 +212,7 @@ async fn command_exists(command: &str, path: Option<&OsStr>) -> std::io::Result<
         .arg("--version")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
+        .kill_on_drop(true)
         .status()
         .await
     {
@@ -225,7 +226,7 @@ async fn command_exists(command: &str, path: Option<&OsStr>) -> std::io::Result<
 }
 
 async fn run_check_command(
-    mut check_command: Command,
+    check_command: Command,
     build_tree: bool,
 ) -> Result<(), CheckDeploymentError> {
     debug!("check command: {:?}", check_command);
@@ -245,72 +246,10 @@ async fn run_check_command(
                 "Build tree visualization requested for checks but `nom` is not available in PATH; falling back to regular check logs"
             );
         } else {
-            check_command
-                .arg("--log-format")
-                .arg("internal-json")
-                .arg("--verbose")
-                .stdout(Stdio::null())
-                .stderr(Stdio::piped());
-
-            let (nix_status, nom_status) =
-                tokio::task::spawn_blocking(move || -> Result<_, CheckDeploymentError> {
-                    let mut nix_child = check_command.into_std().spawn().map_err(|err| {
-                        CheckDeploymentError::NixCheck(command::CommandError::RunError(err))
-                    })?;
-
-                    let nix_stderr = nix_child.stderr.take().ok_or_else(|| {
-                        CheckDeploymentError::NixCheck(command::CommandError::RunError(
-                            std::io::Error::other("failed to capture nix check stderr for nom"),
-                        ))
-                    })?;
-
-                    let mut nom_command = StdCommand::new("nom");
-                    if let Some(path) = path {
-                        nom_command.env("PATH", path);
-                    }
-
-                    let nom_status = nom_command
-                        .arg("--json")
-                        .stdin(Stdio::from(nix_stderr))
-                        .stdout(Stdio::inherit())
-                        .stderr(Stdio::inherit())
-                        .status()
-                        .map_err(|err| {
-                            CheckDeploymentError::NixCheck(command::CommandError::RunError(err))
-                        })?;
-
-                    let nix_status = nix_child.wait().map_err(|err| {
-                        CheckDeploymentError::NixCheck(command::CommandError::RunError(err))
-                    })?;
-
-                    Ok((nix_status, nom_status))
-                })
-                .await
-                .map_err(|err| {
-                    CheckDeploymentError::NixCheck(command::CommandError::RunError(
-                        std::io::Error::other(format!(
-                            "failed waiting for check build tree process: {}",
-                            err
-                        )),
-                    ))
-                })??;
-
-            if nom_status.code() != Some(0) {
-                warn!(
-                    "`nom` exited with status {:?}; continuing based on Nix check result",
-                    nom_status.code()
-                );
-            }
-
-            return match nix_status.code() {
-                Some(0) => Ok(()),
-                a => Err(CheckDeploymentError::NixCheck(
-                    command::CommandError::RunError(std::io::Error::other(format!(
-                        "nix check piped to nom resulted in a bad exit code: {:?}",
-                        a
-                    ))),
-                )),
-            };
+            command::Command::new(check_command)
+                .run_with_tree::<NixCheckError>("Check", Stdio::null())
+                .await?;
+            return Ok(());
         }
     }
 
@@ -594,7 +533,7 @@ fn print_deployment(
                     ssh_user: &defs.ssh_user,
                     path: displayed_path,
                     hostname: &data.node.node_settings.hostname,
-                    tags: &data.profile.profile_settings.tags,
+                    tags: &data.merged_settings.tags,
                     ssh_opts: &data.merged_settings.ssh_opts,
                 },
             );
@@ -783,13 +722,26 @@ fn make_push_profile_datas<'a>(
         .collect()
 }
 
-fn profile_matches_tags(profile: &deploy::data::Profile, tags: &HashSet<&str>) -> bool {
-    tags.iter()
-        .all(|tag| profile.profile_settings.tags.iter().any(|t| t == *tag))
+fn profile_matches_tags(
+    profile: &deploy::data::Profile,
+    node: &deploy::data::Node,
+    top_settings: &deploy::data::GenericSettings,
+    tags: &HashSet<&str>,
+) -> bool {
+    tags.iter().all(|tag| {
+        profile
+            .generic_settings
+            .tags
+            .iter()
+            .chain(&node.generic_settings.tags)
+            .chain(&top_settings.tags)
+            .any(|t| t == *tag)
+    })
 }
 
 fn ordered_profiles_for_node<'a>(
     node: &'a deploy::data::Node,
+    top_settings: &deploy::data::GenericSettings,
     tags: &HashSet<&str>,
 ) -> Result<Vec<(&'a str, &'a deploy::data::Profile)>, RunDeployError> {
     let mut profiles_list = Vec::new();
@@ -809,7 +761,7 @@ fn ordered_profiles_for_node<'a>(
                 .get(profile_name)
                 .ok_or_else(|| RunDeployError::ProfileNotFound(profile_name.to_string()))?;
 
-            if profile_matches_tags(profile, tags) {
+            if profile_matches_tags(profile, node, top_settings, tags) {
                 profiles_list.push((profile_name, profile));
             }
         }
@@ -840,7 +792,8 @@ fn collect_to_deploy<'a>(
                         None => return Err(RunDeployError::ProfileNotFound(profile_name.clone())),
                     };
 
-                    if profile_matches_tags(profile, &requested_tags) {
+                    if profile_matches_tags(profile, node, &data.generic_settings, &requested_tags)
+                    {
                         vec![(
                             deploy_flake,
                             data,
@@ -857,7 +810,7 @@ fn collect_to_deploy<'a>(
                         None => return Err(RunDeployError::NodeNotFound(node_name.clone())),
                     };
 
-                    ordered_profiles_for_node(node, &requested_tags)?
+                    ordered_profiles_for_node(node, &data.generic_settings, &requested_tags)?
                         .into_iter()
                         .map(|x| (deploy_flake, data, (node_name.as_str(), node), x))
                         .collect()
@@ -866,10 +819,14 @@ fn collect_to_deploy<'a>(
                     let mut l = Vec::new();
 
                     for (node_name, node) in &data.nodes {
-                        let ll: ToDeploy = ordered_profiles_for_node(node, &requested_tags)?
-                            .into_iter()
-                            .map(|x| (deploy_flake, data, (node_name.as_str(), node), x))
-                            .collect();
+                        let ll: ToDeploy = ordered_profiles_for_node(
+                            node,
+                            &data.generic_settings,
+                            &requested_tags,
+                        )?
+                        .into_iter()
+                        .map(|x| (deploy_flake, data, (node_name.as_str(), node), x))
+                        .collect();
 
                         l.extend(ll);
                     }
@@ -995,19 +952,6 @@ async fn run_deploy(
         build_tree,
     };
 
-    let push_profile_datas = make_push_profile_datas(&parts, &push_profile_data_options);
-
-    // Resolve derivations, then build all profiles (remote individually, local batched)
-    let closures = deploy::push::build_profiles(&push_profile_datas)
-        .await
-        .map_err(|e| {
-            let node_names: Vec<_> = push_profile_datas
-                .iter()
-                .map(|d| d.deploy_data.node_name.to_string())
-                .collect();
-            RunDeployError::BuildProfile(node_names.join(", "), e)
-        })?;
-
     let ssh_multiplexer = if ssh_multiplexing {
         let multiplexer = deploy::ssh::SshMultiplexer::new();
 
@@ -1038,9 +982,15 @@ async fn run_deploy(
 
     let push_profile_datas = make_push_profile_datas(&parts, &push_profile_data_options);
 
-    deploy::push::push_profiles(&push_profile_datas, &closures)
-        .await
-        .map_err(|e| {
+    // Activation is a barrier: no profile starts until every build, validation,
+    // signature and copy has succeeded and all concurrent work has settled.
+    let prepared = deploy::push::build_and_push_profiles(&push_profile_datas).await;
+    let closures = match prepared {
+        Ok(closures) => closures,
+        Err(e) => {
+            if let Some(multiplexer) = &ssh_multiplexer {
+                multiplexer.close_all().await;
+            }
             let node_names = e.node_context().map(str::to_string).unwrap_or_else(|| {
                 push_profile_datas
                     .iter()
@@ -1048,95 +998,105 @@ async fn run_deploy(
                     .collect::<Vec<_>>()
                     .join(", ")
             });
-            RunDeployError::PushProfile(node_names, e)
-        })?;
+            return Err(match e {
+                deploy::push::PushProfileError::CopyGroup { .. } => {
+                    RunDeployError::PushProfile(node_names, e)
+                }
+                _ => RunDeployError::BuildProfile(node_names, e),
+            });
+        }
+    };
 
-    let mut succeeded: Vec<(
-        &deploy::DeployData,
-        &deploy::DeployDefs,
-        &str,
-        deploy::remote_protocol::RollbackReceipt,
-    )> = vec![];
+    let activation = async {
+        let mut succeeded: Vec<(
+            &deploy::DeployData,
+            &deploy::DeployDefs,
+            &str,
+            deploy::remote_protocol::RollbackReceipt,
+        )> = vec![];
 
-    // Only revoke profiles activated earlier in this run. A dry activation
-    // must not revoke profiles from earlier dry runs.
-    for ((_, deploy_data, deploy_defs), closure) in parts.iter().zip(&closures) {
-        let rollback = match deploy::deploy::deploy_profile(
-            deploy_data,
-            deploy_defs,
-            closure,
-            dry_activate,
-            boot,
-            test,
-            rollback_fresh_connection,
-            review_changes,
-            demarcate_output,
-        )
-        .await
-        {
-            Ok(rollback) => rollback,
-            Err(e) => {
-                let to_revoke = rollback_targets(
-                    dry_activate,
-                    rollback_succeeded,
-                    cmd_overrides.auto_rollback.unwrap_or(true),
-                    succeeded
-                        .iter()
-                        .map(|(data, _, _, _)| data.merged_settings.auto_rollback),
-                );
-                if !to_revoke.is_empty() {
-                    info!(
-                        "Revoking {} previously deployed profile(s)",
-                        to_revoke.len()
+        // Only revoke profiles activated earlier in this run. A dry activation
+        // must not revoke profiles from earlier dry runs.
+        for ((_, deploy_data, deploy_defs), closure) in parts.iter().zip(&closures) {
+            let rollback = match deploy::deploy::deploy_profile(
+                deploy_data,
+                deploy_defs,
+                closure,
+                dry_activate,
+                boot,
+                test,
+                rollback_fresh_connection,
+                review_changes,
+                demarcate_output,
+            )
+            .await
+            {
+                Ok(rollback) => rollback,
+                Err(e) => {
+                    let to_revoke = rollback_targets(
+                        dry_activate,
+                        rollback_succeeded,
+                        cmd_overrides.auto_rollback.unwrap_or(true),
+                        succeeded
+                            .iter()
+                            .map(|(data, _, _, _)| data.merged_settings.auto_rollback),
                     );
-                    let (revoked, failures) = revoke_all(&to_revoke, |index| {
-                        let (deploy_data, deploy_defs, closure, rollback) = &succeeded[index];
-                        deploy::deploy::revoke(
-                            deploy_data,
-                            deploy_defs,
-                            closure,
-                            rollback,
-                            demarcate_output,
-                        )
-                    })
-                    .await;
-                    if !failures.is_empty() {
-                        let failures = failures
-                            .into_iter()
-                            .map(|(index, error)| {
-                                let (data, _, _, _) = &succeeded[index];
-                                format!("{}.{}: {}", data.node_name, data.profile_name, error)
-                            })
-                            .collect::<Vec<_>>()
-                            .join("; ");
-                        return Err(RunDeployError::RollbackFailed {
-                            node: deploy_data.node_name.to_string(),
-                            deployment: e,
-                            revoked,
-                            failures,
-                        });
+                    if !to_revoke.is_empty() {
+                        info!(
+                            "Revoking {} previously deployed profile(s)",
+                            to_revoke.len()
+                        );
+                        let (revoked, failures) = revoke_all(&to_revoke, |index| {
+                            let (deploy_data, deploy_defs, closure, rollback) = &succeeded[index];
+                            deploy::deploy::revoke(
+                                deploy_data,
+                                deploy_defs,
+                                closure,
+                                rollback,
+                                demarcate_output,
+                            )
+                        })
+                        .await;
+                        if !failures.is_empty() {
+                            let failures = failures
+                                .into_iter()
+                                .map(|(index, error)| {
+                                    let (data, _, _, _) = &succeeded[index];
+                                    format!("{}.{}: {}", data.node_name, data.profile_name, error)
+                                })
+                                .collect::<Vec<_>>()
+                                .join("; ");
+                            return Err(RunDeployError::RollbackFailed {
+                                node: deploy_data.node_name.to_string(),
+                                deployment: e,
+                                revoked,
+                                failures,
+                            });
+                        }
+                        return Err(RunDeployError::Rollback(
+                            deploy_data.node_name.to_string(),
+                            e,
+                        ));
                     }
-                    return Err(RunDeployError::Rollback(
+                    return Err(RunDeployError::DeployProfile(
                         deploy_data.node_name.to_string(),
                         e,
                     ));
                 }
-                return Err(RunDeployError::DeployProfile(
-                    deploy_data.node_name.to_string(),
-                    e,
-                ));
+            };
+            if let Some(rollback) = rollback {
+                succeeded.push((deploy_data, deploy_defs, closure.as_str(), rollback));
             }
-        };
-        if let Some(rollback) = rollback {
-            succeeded.push((deploy_data, deploy_defs, closure.as_str(), rollback));
         }
+        Ok(())
     }
+    .await;
 
     if let Some(multiplexer) = ssh_multiplexer {
         multiplexer.close_all().await;
     }
 
-    Ok(())
+    activation
 }
 
 #[cfg(test)]
@@ -1300,6 +1260,7 @@ mod tests {
 
     fn empty_generic_settings() -> crate::data::GenericSettings {
         crate::data::GenericSettings {
+            tags: vec![],
             ssh_user: None,
             user: None,
             ssh_opts: vec![],
@@ -1320,11 +1281,13 @@ mod tests {
             profile_settings: crate::data::ProfileSettings {
                 path: "/nix/store/test-profile".to_string(),
                 profile_path: None,
-                tags: tags.iter().map(|tag| tag.to_string()).collect(),
                 drv_path: None,
                 output_name: "out".to_string(),
             },
-            generic_settings: empty_generic_settings(),
+            generic_settings: crate::data::GenericSettings {
+                tags: tags.iter().map(|tag| tag.to_string()).collect(),
+                ..empty_generic_settings()
+            },
         }
     }
 
@@ -1498,7 +1461,7 @@ mod tests {
         let node = node_with_profiles();
         let tags = HashSet::from(["observability"]);
 
-        let profiles = ordered_profiles_for_node(&node, &tags).unwrap();
+        let profiles = ordered_profiles_for_node(&node, &empty_generic_settings(), &tags).unwrap();
         let names: Vec<_> = profiles.into_iter().map(|(name, _)| name).collect();
 
         assert_eq!(names, vec!["logs", "metrics"]);
@@ -1508,7 +1471,8 @@ mod tests {
     fn test_ordered_profiles_for_node_without_tags_returns_all_profiles_once() {
         let node = node_with_profiles();
 
-        let profiles = ordered_profiles_for_node(&node, &HashSet::new()).unwrap();
+        let profiles =
+            ordered_profiles_for_node(&node, &empty_generic_settings(), &HashSet::new()).unwrap();
         let names: Vec<_> = profiles.into_iter().map(|(name, _)| name).collect();
 
         assert_eq!(names, vec!["logs", "system", "metrics"]);
@@ -1517,18 +1481,39 @@ mod tests {
     #[test]
     fn test_profile_matches_tags_supports_empty_matching_all_matching_and_non_matching_sets() {
         let profile = profile_with_tags(&["prod", "blue"]);
+        let node = node_with_profiles();
+        let top_settings = empty_generic_settings();
 
-        assert!(profile_matches_tags(&profile, &HashSet::new()));
-        assert!(profile_matches_tags(&profile, &HashSet::from(["prod"])));
         assert!(profile_matches_tags(
             &profile,
+            &node,
+            &top_settings,
+            &HashSet::new()
+        ));
+        assert!(profile_matches_tags(
+            &profile,
+            &node,
+            &top_settings,
+            &HashSet::from(["prod"])
+        ));
+        assert!(profile_matches_tags(
+            &profile,
+            &node,
+            &top_settings,
             &HashSet::from(["blue", "prod"])
         ));
         assert!(!profile_matches_tags(
             &profile,
+            &node,
+            &top_settings,
             &HashSet::from(["missing", "blue"])
         ));
-        assert!(!profile_matches_tags(&profile, &HashSet::from(["missing"])));
+        assert!(!profile_matches_tags(
+            &profile,
+            &node,
+            &top_settings,
+            &HashSet::from(["missing"])
+        ));
     }
 
     #[test]
@@ -1538,7 +1523,7 @@ mod tests {
             .profiles_order
             .push("missing".to_string());
 
-        let result = ordered_profiles_for_node(&node, &HashSet::new());
+        let result = ordered_profiles_for_node(&node, &empty_generic_settings(), &HashSet::new());
 
         assert!(matches!(
             result,
@@ -1662,6 +1647,40 @@ mod tests {
     }
 
     #[test]
+    fn test_collect_to_deploy_inherits_tags_for_all_target_scopes() {
+        let mut deployment = data_with_nodes();
+        deployment.generic_settings.tags = vec!["fleet".into(), "prod".into()];
+        deployment
+            .nodes
+            .get_mut("node1")
+            .unwrap()
+            .generic_settings
+            .tags = vec!["primary".into(), "fleet".into()];
+        let data = vec![deployment];
+
+        for (node, profile, expected) in [
+            (None, None, vec!["logs", "metrics"]),
+            (Some("node1"), None, vec!["logs", "metrics"]),
+            (Some("node1"), Some("logs"), vec!["logs"]),
+            (Some("node1"), Some("system"), vec![]),
+            (Some("node2"), None, vec![]),
+        ] {
+            let flakes = vec![DeployFlake {
+                repo: "repo1",
+                node: node.map(str::to_string),
+                profile: profile.map(str::to_string),
+            }];
+            let tags = ["fleet", "primary", "observability", "prod", "fleet"].map(str::to_string);
+            let selected = collect_to_deploy(&flakes, &data, &tags).unwrap();
+            let names: Vec<_> = selected
+                .iter()
+                .map(|(_, _, (_, _), (name, _))| *name)
+                .collect();
+            assert_eq!(names, expected, "target {:?}.{:?}", node, profile);
+        }
+    }
+
+    #[test]
     fn test_collect_to_deploy_rejects_profile_without_node() {
         let deploy_flakes = vec![DeployFlake {
             repo: "repo1",
@@ -1682,8 +1701,10 @@ mod tests {
             node: Some("node1".to_string()),
             profile: Some("system".to_string()),
         }];
-        let data = vec![data_with_nodes()];
-        let tags = vec!["staging".to_string()];
+        let mut deployment = data_with_nodes();
+        deployment.generic_settings.tags = vec!["fleet".into()];
+        let data = vec![deployment];
+        let tags = vec!["fleet".to_string(), "staging".to_string()];
         let log_dir = None;
 
         let result = run_deploy(
@@ -1713,7 +1734,7 @@ mod tests {
 
         assert!(matches!(
             result,
-            Err(RunDeployError::NoProfilesMatchedTags(requested)) if requested == "staging"
+            Err(RunDeployError::NoProfilesMatchedTags(requested)) if requested == "fleet, staging"
         ));
     }
 
@@ -1812,9 +1833,12 @@ mod tests {
 {
   outputs = { self }: {
     deploy = {
+      tags = [ "fleet" ];
       nodes = {
         node1 = {
           hostname = "node1-host";
+          tags = [ "edge" "fleet" ];
+          profilesOrder = [ "p2" "p1" ];
           profiles = {
             p1 = { path = "/nix/store/p1"; tags = [ "web" ]; };
             p2 = { path = "/nix/store/p2"; tags = [ "db" "prod" ]; };
@@ -1848,10 +1872,36 @@ mod tests {
         assert!(data[0].nodes.contains_key("node2"));
         assert_eq!(
             data[0].nodes["node1"].node_settings.profiles["p1"]
-                .profile_settings
+                .generic_settings
                 .tags,
             vec!["web".to_string()]
         );
+        assert_eq!(data[0].generic_settings.tags, vec!["fleet"]);
+        assert_eq!(
+            data[0].nodes["node1"].generic_settings.tags,
+            vec!["edge", "fleet"]
+        );
+        let requested = ["fleet", "edge", "web"].map(str::to_string);
+        let selected = collect_to_deploy(&flakes, &data, &requested).unwrap();
+        let names: Vec<_> = selected
+            .iter()
+            .map(|(_, _, (node, _), (profile, _))| (*node, *profile))
+            .collect();
+        assert_eq!(names, vec![("node1", "p1")]);
+
+        let overrides = empty_cmd_overrides();
+        let (_, deployment, (node_name, node), (profile_name, profile)) = selected[0];
+        let merged = deploy::make_deploy_data(
+            &deployment.generic_settings,
+            node,
+            node_name,
+            profile,
+            profile_name,
+            &overrides,
+            false,
+            None,
+        );
+        assert_eq!(merged.merged_settings.tags, vec!["web", "edge", "fleet"]);
 
         // Branch 2: req.all_nodes = false
         // Branch 2a: node1 in req.nodes
@@ -1866,6 +1916,12 @@ mod tests {
         assert_eq!(data[0].nodes.len(), 1);
         assert!(data[0].nodes.contains_key("node1"));
         assert_eq!(data[0].nodes["node1"].node_settings.profiles.len(), 2);
+        let selected = collect_to_deploy(&flakes, &data, &["fleet".into(), "edge".into()]).unwrap();
+        let names: Vec<_> = selected
+            .iter()
+            .map(|(_, _, (_, _), (name, _))| *name)
+            .collect();
+        assert_eq!(names, vec!["p2", "p1"]);
 
         // Branch 2a-ii: node1.all_profiles = false (node1 only has p1)
         let flakes = vec![DeployFlake {
@@ -1885,6 +1941,10 @@ mod tests {
             .node_settings
             .profiles
             .contains_key("p2"));
+        assert_eq!(
+            collect_to_deploy(&flakes, &data, &requested).unwrap().len(),
+            1
+        );
 
         // Branch 2b: Multiple repos and mixed targets (implicitly tests filtering out node2 when only node1 is requested)
         // Branch 2b: Multiple repos and mixed targets

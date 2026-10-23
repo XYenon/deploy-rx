@@ -365,6 +365,21 @@ in {
         server.succeed("grep -Fx activated /tmp/system-manager/state")
         server.succeed("test -L /nix/var/nix/profiles/system-manager-profiles/system-manager")
         server.succeed("test -x /nix/var/nix/profiles/system-manager-profiles/system-manager/bin/activate")
+
+      with subtest("inherited-tags-and-profile-order"):
+        server.succeed("rm -rf /tmp/tag-select")
+        work("deploy -s --no-build-tree --no-review-changes --tag test-fleet --tag edge --tag observability --tag prod --tag edge . -- --offline", timeout=600)
+        assert server.succeed("cat /tmp/tag-select/order.log").splitlines() == ["metrics", "logs"]
+        server.succeed("test ! -e /tmp/tag-select/traces && test ! -e /tmp/tag-select/api")
+
+      with subtest("inherited-tags-explicit-profile"):
+        work("deploy -s --no-build-tree --no-review-changes --tag test-fleet --tag edge --tag prod .#tagged.metrics -- --offline", timeout=600)
+        assert server.succeed("cat /tmp/tag-select/order.log").splitlines() == ["metrics", "logs", "metrics"]
+
+      with subtest("inherited-tags-zero-matches-is-an-error"):
+        work_fail("deploy -s --no-build-tree --no-review-changes --tag test-fleet --tag edge --tag prod .#tagged.traces -- --offline > /tmp/tag-no-match.out 2>&1", timeout=600)
+        client_sh("grep -F 'No profiles matched the requested tags' /tmp/tag-no-match.out")
+        server.succeed("test ! -e /tmp/tag-select/traces")
     '';
   };
 
