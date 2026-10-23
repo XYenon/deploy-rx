@@ -68,10 +68,12 @@ fn main() {
         return;
     }
     runtime.block_on(concurrent_preparation_preserves_mapping_and_drains_failures(false));
-    println!("concurrent_preparation_preserves_mapping_and_drains_failures: ok (6 scenarios)");
+    cli_activation_and_connection_identity(false);
+    println!("concurrent_preparation: ok (8 preparation scenarios, signed CLI activation and connection isolation)");
     if std::env::var_os("DEPLOY_RX_TEST_NOM").is_some() {
         runtime.block_on(concurrent_preparation_preserves_mapping_and_drains_failures(true));
-        println!("real_nom_preparation: ok (6 scenarios)");
+        cli_activation_and_connection_identity(true);
+        println!("real_nom_preparation: ok (8 preparation scenarios, signed CLI activation and connection isolation)");
         for scenario in ["none", "remote"] {
             real_nom_in_pty(scenario);
         }
@@ -80,6 +82,7 @@ fn main() {
             runtime.block_on(concurrent_preparation_preserves_mapping_and_drains_failures(true));
             println!("nom_{mode}: ok (Nix result preserved, all children reaped)");
         }
+        std::env::remove_var("NOM_FAILURE");
     }
 }
 
@@ -169,6 +172,18 @@ fn real_nom_in_pty(scenario: &str) {
 }
 
 fn nom_fixture() -> io::Result<i32> {
+    if std::env::args().any(|arg| arg == "--version")
+        && std::env::var("NOM_FAILURE").as_deref() == Ok("spawn")
+    {
+        // Availability probing succeeds, but the subsequent spawn must fail.
+        // argv[0] is just "nom"; remove the fixture from its actual PATH entry.
+        let bin = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+            .next()
+            .unwrap();
+        std::fs::remove_file(bin.join("nom"))?;
+        event("nom.probe.succeeded")?;
+        return Ok(0);
+    }
     if std::env::args().any(|arg| arg == "--json") {
         record_pid(&format!("nom.{}", std::process::id()))?;
         match std::env::var("NOM_FAILURE").as_deref() {
@@ -266,6 +281,25 @@ fn nix_fixture() -> io::Result<i32> {
             "{}",
             json!({"entries": {"deploy-rx-activate": {}, "activate-rs": {}}})
         );
+    } else if has("sign-paths") || (has("store") && has("sign")) {
+        let closure = args.last().unwrap();
+        let name = Path::new(closure).file_name().unwrap().to_str().unwrap();
+        let key_flag = if has("sign-paths") {
+            "-k"
+        } else {
+            "--key-file"
+        };
+        let key = args.windows(2).find(|pair| pair[0] == key_flag).unwrap();
+        assert_eq!(std::fs::read_to_string(&key[1])?, "fixture signing key");
+        record_pid(&format!("sign.{name}"))?;
+        event(&format!("sign.{name}.start"))?;
+        if (failure == "sign-local" && has("sign-paths"))
+            || (failure == "sign-remote" && name == "remote-a1-profile")
+        {
+            event(&format!("sign.{name}.failed"))?;
+            return Ok(46);
+        }
+        event(&format!("sign.{name}.end"))?;
     } else if has("build") {
         let name = if has("/nix/store/remote-a1.drv^out") {
             "a1"
@@ -273,9 +307,20 @@ fn nix_fixture() -> io::Result<i32> {
             "a2"
         } else if has("/nix/store/remote-b.drv^out") {
             "b"
+        } else if has("/nix/store/remote-c.drv^out") {
+            "c"
         } else {
             "local"
         };
+        let address = args.windows(2).find(|pair| pair[0] == "--store");
+        if let Some(address) = address {
+            let options = shlex::split(&std::env::var("NIX_SSHOPTS").unwrap()).unwrap();
+            check_master(&options)?;
+            std::fs::write(
+                format!("connection.{name}.json"),
+                json!({"address": address[1], "options": options}).to_string(),
+            )?;
+        }
         record_pid(&format!("build.{name}"))?;
         std::fs::write(format!("build.{name}.args"), args.join("\n"))?;
         event(&format!("build.{name}.start"))?;
@@ -297,13 +342,23 @@ fn nix_fixture() -> io::Result<i32> {
             }
         }
         if failure == "none" {
-            match name {
-                "a1" => {
-                    wait_for("build.b.start")?;
-                    wait_for("build.local.start")?;
+            if std::env::var_os("CONNECTION_CASE").is_some() {
+                // A hostname-only, user-only, or options-only connection key
+                // serializes one of these independent chains and times out.
+                if name != "a2" {
+                    for peer in ["a1", "b", "c"] {
+                        wait_for(&format!("build.{peer}.start"))?;
+                    }
                 }
-                "b" => wait_for("copy.local.start")?,
-                _ => (),
+            } else {
+                match name {
+                    "a1" => {
+                        wait_for("build.b.start")?;
+                        wait_for("build.local.start")?;
+                    }
+                    "b" => wait_for("copy.local.start")?,
+                    _ => (),
+                }
             }
         }
         let scale = if std::env::var_os("DISPLAY_DEMO").is_some() {
@@ -372,11 +427,41 @@ fn nix_fixture() -> io::Result<i32> {
 }
 
 fn ssh_fixture() -> io::Result<i32> {
-    let args: Vec<_> = std::env::args().skip(1).collect();
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.iter().any(|arg| arg == "ControlMaster=yes") {
+        let path = &args.windows(2).find(|pair| pair[0] == "-S").unwrap()[1];
+        let name = Path::new(path).file_name().unwrap().to_str().unwrap();
+        record_pid(&format!("master.start.{name}"))?;
+        std::fs::write(path, "active")?;
+        append_line("masters", &json!({"path":path, "args":args}).to_string())?;
+        event(&format!("master.start.{name}"))?;
+        return Ok(0);
+    }
+    if args.iter().any(|arg| arg == "-O") {
+        let path = args
+            .iter()
+            .find_map(|arg| arg.strip_prefix("ControlPath="))
+            .unwrap();
+        let name = Path::new(path).file_name().unwrap().to_str().unwrap();
+        record_pid(&format!("master.stop.{name}"))?;
+        std::fs::remove_file(path)?;
+        event(&format!("master.stop.{name}"))?;
+        return Ok(0);
+    }
+    check_master(&args)?;
     append_line("events", &format!("activate:{}", args.join(" ")))?;
     let mut request = String::new();
     io::stdin().read_line(&mut request)?;
+    let request_json: serde_json::Value = serde_json::from_str(&request)?;
+    let closure = request_json["operation"]["Deploy"]["closure"]
+        .as_str()
+        .unwrap();
+    let name = Path::new(closure).file_name().unwrap().to_str().unwrap();
+    record_pid(&format!("activate.{name}"))?;
+    event(&format!("activate.{name}.start"))?;
     append_line("activations", request.trim_end())?;
+    std::thread::sleep(Duration::from_millis(20));
+    event(&format!("activate.{name}.end"))?;
     println!(
         "{}",
         json!({"Finished": {
@@ -386,11 +471,203 @@ fn ssh_fixture() -> io::Result<i32> {
     Ok(0)
 }
 
+fn check_master(options: &[String]) -> io::Result<()> {
+    if let Some(pair) = options.windows(2).find(|pair| pair[0] == "-S") {
+        assert_eq!(std::fs::read_to_string(&pair[1])?, "active");
+    }
+    Ok(())
+}
+
+fn assert_masters_closed(fixture: &Path, expected: usize) {
+    let masters = std::fs::read_to_string(fixture.join("masters")).unwrap();
+    assert_eq!(masters.lines().count(), expected);
+    let events = std::fs::read_to_string(fixture.join("events")).unwrap();
+    for line in masters.lines() {
+        let master: serde_json::Value = serde_json::from_str(line).unwrap();
+        let path = Path::new(master["path"].as_str().unwrap());
+        assert!(!path.exists(), "master {} was not closed", path.display());
+        assert!(
+            !path.parent().unwrap().exists(),
+            "control directory was not removed"
+        );
+        let name = path.file_name().unwrap().to_str().unwrap();
+        assert_eq!(
+            events
+                .lines()
+                .filter(|event| *event == format!("master.stop.{name}"))
+                .count(),
+            1
+        );
+    }
+}
+
 fn before(events: &str, first: &str, second: &str) {
     let lines: Vec<_> = events.lines().collect();
     let a = lines.iter().position(|&line| line == first).unwrap();
     let b = lines.iter().position(|&line| line == second).unwrap();
     assert!(a < b, "expected {} before {}:\n{}", first, second, events);
+}
+
+fn cli_activation_and_connection_identity(build_tree: bool) {
+    // Remote-only profiles permit successful CLI activation without writing
+    // /nix/store, including inside Nix's read-only build sandbox.
+    for (multiplex, spawn_failure) in [(false, false), (true, false), (true, true)] {
+        if spawn_failure && !build_tree {
+            continue;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let bin = root.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        for name in ["nix", "ssh", "nom"] {
+            symlink(std::env::current_exe().unwrap(), bin.join(name)).unwrap();
+        }
+        let path = std::env::join_paths(
+            std::iter::once(bin).chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+        )
+        .unwrap();
+        let options_a = ["-o", "ProxyCommand=ssh jump host -W %h:%p"];
+        let options_b = ["-o", "ProxyCommand=ssh other jump -W %h:%p"];
+        // Each independent connection differs from root/options_a in one field.
+        // Explicit target order deliberately differs from build completion order.
+        let profiles = [
+            ("r2", "b", "deploy", options_a),
+            ("r1", "a1", "root", options_a),
+            ("r4", "c", "root", options_b),
+            ("r3", "a2", "root", options_a),
+        ];
+        let mut nodes = serde_json::Map::new();
+        for (node, name, user, options) in profiles {
+            nodes.insert(
+                node.into(),
+                json!({
+                    "hostname": "remote-a", "sshUser": user, "sshOpts": options,
+                    "tags": ["edge"], "remoteBuild": true,
+                    "profiles": {"system": {
+                        "path": "/nix/store/placeholder", "tags": ["service"],
+                        "drvPath": format!("/nix/store/remote-{name}.drv")
+                    }}
+                }),
+            );
+            std::fs::write(
+                root.path().join(format!("result.{name}.json")),
+                json!([{
+                    "drvPath": format!("/nix/store/remote-{name}.drv"),
+                    "outputs": {"out": format!("/nix/store/remote-{name}-profile")}
+                }])
+                .to_string(),
+            )
+            .unwrap();
+        }
+        std::fs::write(
+            root.path().join("deployment.json"),
+            json!({
+                "tags": ["fleet"], "user": "root", "nodes": nodes
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let key = root.path().join("test.key");
+        std::fs::write(&key, "fixture signing key").unwrap();
+        let mut command = Command::new(env!("CARGO_BIN_EXE_deploy"));
+        command
+            .env("PATH", &path)
+            .env("FIXTURE", root.path())
+            .env("FAIL", if spawn_failure { "nom-spawn" } else { "none" })
+            .env("LOCAL_KEY", &key)
+            .env("RUST_LOG", "info")
+            .env("CONNECTION_CASE", "1")
+            .env_remove("NOM_FAILURE")
+            .args([
+                "--skip-checks",
+                "--no-review-changes",
+                "--tag",
+                "fleet",
+                "--tag",
+                "edge",
+                "--tag",
+                "service",
+            ]);
+        if !build_tree {
+            command.arg("--no-build-tree");
+        }
+        if !multiplex {
+            command.arg("--no-ssh-multiplexing");
+        }
+        command.arg("--targets");
+        if spawn_failure {
+            // A single build avoids racing the destructive availability probe.
+            // Isolate PATH so unlinking the fixture cannot find another nom.
+            command
+                .env("NOM_FAILURE", "spawn")
+                .env("PATH", root.path().join("bin"))
+                .arg(".#r1.system");
+        } else {
+            command.args(profiles.iter().map(|(node, ..)| format!(".#{node}.system")));
+        }
+        let output = command.stdin(Stdio::null()).output().unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.success(), !spawn_failure, "{stderr}");
+        assert!(!stderr.contains("barrier timed out"), "{}", stderr);
+        let events = std::fs::read_to_string(root.path().join("events")).unwrap();
+        if spawn_failure {
+            assert!(events.contains("nom.probe.succeeded"));
+            assert!(stderr.contains("No such file or directory"), "{}", stderr);
+            assert!(!events.contains("activate:"), "{}", events);
+        } else {
+            let requests = std::fs::read_to_string(root.path().join("activations")).unwrap();
+            let closures: Vec<String> = requests
+                .lines()
+                .map(|line| {
+                    let request: deploy::remote_protocol::BootstrapRequest =
+                        serde_json::from_str(line).unwrap();
+                    match request.operation {
+                        deploy::remote_protocol::RemoteOperation::Deploy(request) => {
+                            request.closure
+                        }
+                        _ => panic!("unexpected revoke"),
+                    }
+                })
+                .collect();
+            assert_eq!(
+                closures,
+                profiles.map(|(_, name, ..)| format!("/nix/store/remote-{name}-profile"))
+            );
+            for (index, (_, name, user, options)) in profiles.iter().enumerate() {
+                before(
+                    &events,
+                    &format!("build.{name}.end"),
+                    &format!("sign.remote-{name}-profile.start"),
+                );
+                // Every chain must finish signing before the first activation.
+                before(
+                    &events,
+                    &format!("sign.remote-{name}-profile.end"),
+                    "activate.remote-b-profile.start",
+                );
+                if index > 0 {
+                    before(
+                        &events,
+                        &format!("activate.remote-{}-profile.end", profiles[index - 1].1),
+                        &format!("activate.remote-{name}-profile.start"),
+                    );
+                }
+                let connection: serde_json::Value = serde_json::from_slice(
+                    &std::fs::read(root.path().join(format!("connection.{name}.json"))).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(connection["address"], format!("ssh-ng://{user}@remote-a"));
+                let actual: Vec<String> =
+                    serde_json::from_value(connection["options"].clone()).unwrap();
+                assert_eq!(&actual[..2], options);
+                assert_eq!(actual.len(), if multiplex { 4 } else { 2 });
+            }
+            before(&events, "sign.remote-a1-profile.end", "build.a2.start");
+        }
+        if multiplex {
+            assert_masters_closed(root.path(), if spawn_failure { 1 } else { 3 });
+        }
+        assert_reaped(root.path());
+    }
 }
 
 async fn concurrent_preparation_preserves_mapping_and_drains_failures(build_tree: bool) {
@@ -410,28 +687,52 @@ async fn concurrent_preparation_preserves_mapping_and_drains_failures(build_tree
     )
     .unwrap();
     std::env::set_var("PATH", &path);
-    std::env::remove_var("LOCAL_KEY");
-
-    for failure in ["none", "resolve", "remote", "local", "check", "copy"] {
-        if let Ok(scenario) = std::env::var("DISPLAY_DEMO") {
-            if failure != scenario {
+    for scenario in [
+        "none",
+        "cli-success",
+        "resolve",
+        "remote",
+        "local",
+        "check",
+        "copy",
+        "sign-local",
+        "sign-remote",
+    ] {
+        if let Ok(demo) = std::env::var("DISPLAY_DEMO") {
+            if scenario != demo {
                 continue;
             }
         }
-        if std::env::var_os("NOM_FAILURE").is_some() && failure != "none" {
+        if std::env::var_os("NOM_FAILURE").is_some() && scenario != "none" {
             continue;
         }
-        let fixture = root.path().join(failure);
+        let cli_success = scenario == "cli-success";
+        let store_profiles = std::env::var_os("DEPLOY_RX_TEST_PROFILE");
+        if cli_success && store_profiles.is_none() {
+            continue;
+        }
+        let failure = if cli_success { "none" } else { scenario };
+        let fixture = root.path().join(scenario);
         std::fs::create_dir(&fixture).unwrap();
         std::env::set_var("FIXTURE", &fixture);
         std::env::set_var("FAIL", failure);
-        let local = fixture.join("local-profile");
-        let dev = fixture.join("dev-profile");
-        let shared = fixture.join("shared-profile");
-        for closure in [&local, &dev, &shared] {
-            std::fs::create_dir(closure).unwrap();
-            std::fs::write(closure.join("deploy-rx-activate"), "").unwrap();
-            std::fs::write(closure.join("activate-rs"), "").unwrap();
+        let key = fixture.join("test.key");
+        std::fs::write(&key, "fixture signing key").unwrap();
+        std::env::set_var("LOCAL_KEY", &key);
+        let profile_root = if cli_success {
+            Path::new(store_profiles.as_ref().unwrap())
+        } else {
+            fixture.as_path()
+        };
+        let local = profile_root.join("local-profile");
+        let dev = profile_root.join("dev-profile");
+        let shared = profile_root.join("shared-profile");
+        if !cli_success {
+            for closure in [&local, &dev, &shared] {
+                std::fs::create_dir(closure).unwrap();
+                std::fs::write(closure.join("deploy-rx-activate"), "").unwrap();
+                std::fs::write(closure.join("activate-rs"), "").unwrap();
+            }
         }
         let targets = [
             ("r1", "remote-a", "/nix/store/remote-a1.drv", "out", true),
@@ -562,7 +863,7 @@ async fn concurrent_preparation_preserves_mapping_and_drains_failures(build_tree
             local.display().to_string(),
             shared.display().to_string(),
         ];
-        if failure == "none" || std::env::var_os("DISPLAY_DEMO").is_some() {
+        if (!cli_success && failure == "none") || std::env::var_os("DISPLAY_DEMO").is_some() {
             let result = build_and_push_profiles(&datas).await;
             if failure != "none" {
                 assert!(result.is_err());
@@ -577,8 +878,14 @@ async fn concurrent_preparation_preserves_mapping_and_drains_failures(build_tree
             before(&events, "build.local.start", "build.a1.end");
             before(&events, "copy.local.start", "build.b.end");
             before(&events, "copy.other.start", "copy.local.end");
-            before(&events, "check.a1", "build.a2.start");
-            before(&events, "check.a2", "copy.a.start");
+            before(&events, "check.a1", "sign.remote-a1-profile.start");
+            before(&events, "sign.remote-a1-profile.end", "build.a2.start");
+            before(&events, "check.a2", "sign.remote-a2-profile.start");
+            before(&events, "sign.remote-a2-profile.end", "copy.a.start");
+            for name in ["local-profile", "dev-profile", "shared-profile"] {
+                before(&events, "build.local.end", &format!("sign.{name}.start"));
+                before(&events, &format!("sign.{name}.end"), "copy.local.start");
+            }
             assert_eq!(
                 events.lines().filter(|&s| s == "build.local.start").count(),
                 1
@@ -618,7 +925,6 @@ async fn concurrent_preparation_preserves_mapping_and_drains_failures(build_tree
                 .args([
                     "--skip-checks",
                     "--no-review-changes",
-                    "--no-ssh-multiplexing",
                     "--tag",
                     "fleet",
                     "--tag",
@@ -635,6 +941,52 @@ async fn concurrent_preparation_preserves_mapping_and_drains_failures(build_tree
             let stderr = String::from_utf8_lossy(&output.stderr);
             assert!(!stderr.contains("barrier timed out"), "{}", stderr);
             let events = std::fs::read_to_string(fixture.join("events")).unwrap();
+            if cli_success {
+                assert!(output.status.success(), "{}", stderr);
+                let requests = std::fs::read_to_string(fixture.join("activations")).unwrap();
+                let closures: Vec<String> = requests
+                    .lines()
+                    .map(|line| {
+                        let request: deploy::remote_protocol::BootstrapRequest =
+                            serde_json::from_str(line).unwrap();
+                        match request.operation {
+                            deploy::remote_protocol::RemoteOperation::Deploy(request) => {
+                                request.closure
+                            }
+                            _ => panic!("unexpected revoke"),
+                        }
+                    })
+                    .collect();
+                assert_eq!(closures, expected_closures);
+                let first = "activate.remote-a1-profile.start";
+                for event in events
+                    .lines()
+                    .filter(|event| event.starts_with("sign.") || event.starts_with("copy."))
+                {
+                    before(&events, event, first);
+                }
+                for name in ["local", "other", "a"] {
+                    before(&events, &format!("copy.{name}.end"), first);
+                }
+                // Include the SSH destination because l1/l3 intentionally share
+                // the same closure. This catches swaps hidden by equal paths.
+                let destinations: Vec<_> = events
+                    .lines()
+                    .filter_map(|event| {
+                        event
+                            .strip_prefix("activate:")
+                            .and_then(|args| args.split_whitespace().next())
+                    })
+                    .collect();
+                assert_eq!(
+                    destinations,
+                    targets.map(|(_, host, ..)| format!("root@{host}"))
+                );
+                assert_masters_closed(&fixture, 4);
+                assert_reaped(&fixture);
+                println!("mixed_cli_activation: ok (7 ordered activations after all signatures and copies)");
+                continue;
+            }
             assert!(!output.status.success());
             assert!(
                 stderr.contains("bad exit status"),
@@ -652,9 +1004,21 @@ async fn concurrent_preparation_preserves_mapping_and_drains_failures(build_tree
                 assert!(stderr.contains("streamed build"), "{}", stderr);
                 assert!(events.contains("build.b.end"), "{}", events);
             }
-            if failure == "remote" || failure == "check" {
+            if matches!(failure, "remote" | "check" | "sign-remote") {
                 assert!(!events.contains("build.a2.start"), "{}", events);
             }
+            if failure == "sign-local" {
+                assert!(events.contains("sign.local-profile.failed"), "{}", events);
+                assert!(!events.contains("copy.local.start"), "{}", events);
+            }
+            if failure == "sign-remote" {
+                assert!(
+                    events.contains("sign.remote-a1-profile.failed"),
+                    "{}",
+                    events
+                );
+            }
+            assert_masters_closed(&fixture, 4);
             if build_tree {
                 assert!(
                     !output.stderr.contains(&0x1b),
@@ -671,6 +1035,7 @@ async fn concurrent_preparation_preserves_mapping_and_drains_failures(build_tree
         assert_reaped(&fixture);
     }
     std::env::set_var("PATH", original_path);
+    std::env::remove_var("LOCAL_KEY");
 }
 
 fn assert_reaped(fixture: &Path) {

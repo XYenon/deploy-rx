@@ -42,6 +42,12 @@
           nativeCheckInputs = [ final.nix-output-monitor ];
           DEPLOY_RX_TEST_NOM = "${final.nix-output-monitor}/bin/nom";
           DEPLOY_RX_TEST_DRV = (final.runCommand "display-shared-workload" { } "touch $out").drvPath;
+          DEPLOY_RX_TEST_PROFILE = final.runCommand "preparation-test-profiles" { } ''
+            for profile in local-profile dev-profile shared-profile; do
+              mkdir -p "$out/$profile"
+              touch "$out/$profile/deploy-rx-activate" "$out/$profile/activate-rs"
+            done
+          '';
 
           postFixup = ''
             wrapProgram "$out/bin/deploy" \
