@@ -65,11 +65,7 @@ impl Display {
             .enumerate()
             .filter_map(|(id, p)| (p.state == "running").then_some(id))
             .collect();
-        let capacity = (height as usize)
-            .saturating_sub(4)
-            .checked_div(9)
-            .unwrap()
-            .max(1);
+        let capacity = ((height as usize).saturating_sub(4) / 9).max(1);
         let page_count = running.len().div_ceil(capacity).max(1);
         let page = (self.started.elapsed().as_secs() as usize / 3) % page_count;
         let mut visible: Vec<_> = running
@@ -171,21 +167,22 @@ pub(crate) async fn run<T>(enabled: bool, future: impl Future<Output = T>) -> T 
     }
     let owns_display = {
         let mut terminal = TERMINAL.lock().unwrap();
-        if terminal.is_none() {
-            *terminal = Some(Display {
-                users: 1,
-                started: std::time::Instant::now(),
-                interactive: io::stderr().is_terminal(),
-                drawn: 0,
-                panels: Vec::new(),
-                connections: Vec::new(),
-            });
-            true
-        } else {
-            if let Some(display) = terminal.as_mut() {
+        match terminal.as_mut() {
+            Some(display) => {
                 display.users += 1;
+                false
             }
-            false
+            None => {
+                *terminal = Some(Display {
+                    users: 1,
+                    started: std::time::Instant::now(),
+                    interactive: io::stderr().is_terminal(),
+                    drawn: 0,
+                    panels: Vec::new(),
+                    connections: Vec::new(),
+                });
+                true
+            }
         }
     };
     struct Restore;
@@ -445,19 +442,18 @@ pub(crate) async fn feed_nom(
             continue;
         }
         if let Some(writer) = &mut output {
-            match tokio::time::timeout(std::time::Duration::from_secs(1), writer.write_all(&line))
-                .await
-            {
-                Ok(Ok(())) => (),
-                result => {
-                    error = Some(match result {
-                        Ok(Err(error)) => error,
-                        _ => {
-                            io::Error::new(io::ErrorKind::TimedOut, "nom stopped reading its input")
-                        }
+            let result =
+                tokio::time::timeout(std::time::Duration::from_secs(1), writer.write_all(&line))
+                    .await
+                    .unwrap_or_else(|_| {
+                        Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "nom stopped reading its input",
+                        ))
                     });
-                    output = None;
-                }
+            if let Err(failure) = result {
+                error = Some(failure);
+                output = None;
             }
         }
     }

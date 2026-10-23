@@ -15,7 +15,7 @@ use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::symlink;
 use std::os::unix::process::CommandExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -645,6 +645,16 @@ fn flood_monitor() -> io::Result<()> {
     Ok(())
 }
 
+fn fixture_bin(root: &Path, names: &[&str]) -> PathBuf {
+    let bin = root.join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let executable = std::env::current_exe().unwrap();
+    for name in names {
+        symlink(&executable, bin.join(name)).unwrap();
+    }
+    bin
+}
+
 fn cli_checks_monitor_lifecycle() {
     for (mode, fail_check) in [
         ("consume", false),
@@ -656,11 +666,7 @@ fn cli_checks_monitor_lifecycle() {
         ("spawn", false),
     ] {
         let root = tempfile::tempdir().unwrap();
-        let bin = root.path().join("bin");
-        std::fs::create_dir(&bin).unwrap();
-        for name in ["nix", "nom"] {
-            symlink(std::env::current_exe().unwrap(), bin.join(name)).unwrap();
-        }
+        let bin = fixture_bin(root.path(), &["nix", "nom"]);
         std::fs::write(root.path().join("deployment.json"), r#"{"nodes":{}}"#).unwrap();
         let mut command = Command::new(env!("CARGO_BIN_EXE_deploy"));
         command
@@ -705,11 +711,7 @@ fn cli_checks_monitor_lifecycle() {
 
 fn cli_many_monitored_profiles() {
     let root = tempfile::tempdir().unwrap();
-    let bin = root.path().join("bin");
-    std::fs::create_dir(&bin).unwrap();
-    for name in ["nix", "nom", "ssh"] {
-        symlink(std::env::current_exe().unwrap(), bin.join(name)).unwrap();
-    }
+    let bin = fixture_bin(root.path(), &["nix", "nom", "ssh"]);
     let profiles: serde_json::Map<String, serde_json::Value> = (0..96)
         .map(|index| {
             (
@@ -787,11 +789,7 @@ fn cli_activation_and_connection_identity(build_tree: bool) {
             continue;
         }
         let root = tempfile::tempdir().unwrap();
-        let bin = root.path().join("bin");
-        std::fs::create_dir(&bin).unwrap();
-        for name in ["nix", "ssh", "nom"] {
-            symlink(std::env::current_exe().unwrap(), bin.join(name)).unwrap();
-        }
+        let bin = fixture_bin(root.path(), &["nix", "ssh", "nom"]);
         let path = std::env::join_paths(
             std::iter::once(bin).chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
         )
@@ -891,17 +889,17 @@ fn cli_activation_and_connection_identity(build_tree: bool) {
             assert!(!events.contains("activate:"), "{}", events);
         } else {
             let requests = std::fs::read_to_string(root.path().join("activations")).unwrap();
-            let closures: Vec<String> = requests
+            let requests: Vec<deploy::remote_protocol::BootstrapRequest> = requests
                 .lines()
-                .filter_map(|line| {
-                    let request: deploy::remote_protocol::BootstrapRequest =
-                        serde_json::from_str(line).unwrap();
-                    match request.operation {
-                        deploy::remote_protocol::RemoteOperation::Deploy(request) => {
-                            Some(request.closure)
-                        }
-                        _ => None,
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            let closures: Vec<_> = requests
+                .iter()
+                .filter_map(|request| match &request.operation {
+                    deploy::remote_protocol::RemoteOperation::Deploy(request) => {
+                        Some(request.closure.as_str())
                     }
+                    _ => None,
                 })
                 .collect();
             assert_eq!(
@@ -944,16 +942,12 @@ fn cli_activation_and_connection_identity(build_tree: bool) {
             before(&events, "sign.remote-a1-profile.end", "build.a2.start");
             if rollback != "none" {
                 let revoked: Vec<_> = requests
-                    .lines()
-                    .filter_map(|line| {
-                        let request: deploy::remote_protocol::BootstrapRequest =
-                            serde_json::from_str(line).unwrap();
-                        match request.operation {
-                            deploy::remote_protocol::RemoteOperation::Revoke(request) => {
-                                Some(request.closure)
-                            }
-                            _ => None,
+                    .iter()
+                    .filter_map(|request| match &request.operation {
+                        deploy::remote_protocol::RemoteOperation::Revoke(request) => {
+                            Some(request.closure.as_str())
                         }
+                        _ => None,
                     })
                     .collect();
                 assert_eq!(
@@ -994,14 +988,14 @@ fn cli_activation_and_connection_identity(build_tree: bool) {
 async fn concurrent_preparation_preserves_mapping_and_drains_failures(build_tree: bool) {
     // One test owns this process's PATH; child CLI runs get isolated environments.
     let root = tempfile::tempdir().unwrap();
-    let bin = root.path().join("bin");
-    std::fs::create_dir(&bin).unwrap();
-    let executable = std::env::current_exe().unwrap();
-    symlink(&executable, bin.join("nix")).unwrap();
-    symlink(&executable, bin.join("ssh")).unwrap();
-    if build_tree {
-        symlink(&executable, bin.join("nom")).unwrap();
-    }
+    let bin = fixture_bin(
+        root.path(),
+        if build_tree {
+            &["nix", "ssh", "nom"]
+        } else {
+            &["nix", "ssh"]
+        },
+    );
     let original_path = std::env::var_os("PATH").unwrap();
     let path = std::env::join_paths(
         std::iter::once(bin.clone()).chain(std::env::split_paths(&original_path)),

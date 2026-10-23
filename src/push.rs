@@ -1441,9 +1441,9 @@ async fn push_profiles_with_connections(
                     .status()
                     .await
                     .map_err(|source| PushProfileError::CopyGroup {
-                        nodes: nodes_str.clone(),
-                        target: target.clone(),
-                        profiles: profiles_str.clone(),
+                        nodes: nodes_str,
+                        target,
+                        profiles: profiles_str,
                         source: Box::new(source),
                     });
                 *failed = result.is_err();

@@ -19,11 +19,11 @@ Building deploy-rx requires **Rust 1.95 or newer**. Install from this repository
 cargo install --git https://github.com/XYenon/deploy-rx --locked deploy-rx
 ```
 
-From a local checkout, use `cargo install --path . --locked`. Once deploy-rx is published on crates.io, registry installation will also be available with `cargo install --locked deploy-rx`.
+Install a local checkout with `cargo install --path . --locked`. After deploy-rx is published on crates.io, you can also use `cargo install --locked deploy-rx`.
 
-Cargo installs the `deploy` CLI and the internal `activate` helper into Cargo's binary directory (normally `~/.cargo/bin`); ensure it is on your `PATH`. Nix and SSH must also be available for deployment. For the default build-tree visualization, install [`nix-output-monitor`](https://github.com/maralorn/nix-output-monitor) (`nom`), or use `--no-build-tree`.
+Cargo installs `deploy` and the internal `activate` helper in its binary directory, usually `~/.cargo/bin`. Add that directory to your `PATH`. Deployment also requires Nix and SSH. The default build display uses [`nix-output-monitor`](https://github.com/maralorn/nix-output-monitor) (`nom`). Install it or disable the display with `--no-build-tree`.
 
-Resolver v3 prefers dependencies compatible with the declared minimum Rust version. The Cargo package includes the Nix transformation embedded in the CLI; Nix integration tests and their repository-only resources are excluded. Run those tests from a checkout using the Nix development shell.
+The Cargo package includes the Nix transformation embedded in the CLI. It excludes integration tests and their fixtures, which you can run from a checkout using the Nix development shell.
 
 ## Features & Enhancements
 
@@ -63,15 +63,17 @@ First-class support for deploying [system-manager](https://github.com/numtide/sy
 - **Diff & Change Review**: Integrated, super-fast diffing (`dix`) of derivation changes before activation or switch. Enabled by default (bypass with `--no-review-changes`).
 - **Batched Nix Evaluation, Builds & Pushes**: Intelligently groups multiple deployment targets from the same flake into a single `nix eval`, batches local builds into one `nix build`, and batches compatible pushes to the same target into one `nix copy`, reducing Nix and SSH overhead for multi-profile deployments.
 
-Builds on different SSH connections run concurrently with the local batch. Copies can overlap builds on other connections, while work on the same connection runs in order. Profiles activate in deployment order after all builds, checks, signing, and copies succeed. If preparation fails, other started work finishes before the command returns an error.
+Builds on different SSH connections run concurrently with the local batch. Copies can overlap builds on other connections, while work on the same connection runs in order. Profiles activate in deployment order after all builds, checks, signing, and copies succeed. If preparation fails, the command waits for other started work to finish before returning an error.
 
-With build-tree visualization enabled, each build has an independent `nom` tree. A shared display labels local builds and remote connections, and shows completion or failure for each task. The display cycles through pages when the terminal cannot show all running tasks. Ordinary build and copy logs appear above the trees with their source labels. Redirected output contains plain text logs and the final trees without terminal control sequences.
+With the build display enabled, each build has its own `nom` tree, labeled with the local batch or remote connection and its status. The display cycles through pages when the terminal cannot show all running tasks. Build and copy logs appear above the trees with source labels. Redirected output contains plain text logs and final trees without terminal control sequences.
 
 For the NixOS system profile, `--test` changes the running system while preserving the system profile and boot default. If a later switch fails, rollback restores the previous boot configuration and the previous running system independently.
 
 ### Logs
 
-Application messages use `[deploy LEVEL]`, `[activate LEVEL]`, or `[revoke LEVEL]` on each line. Non-interactive deployments show a short target summary; interactive deployments still show the full preview for confirmation. Remote stderr is labeled `[node.profile remote]` by default, so output from different deployment targets can be distinguished. During build-tree visualization, Nix logs and `nom` trees use the shared display described above. Diff output retains its native formatting. Use `--no-demarcate-output` to leave remote stderr unchanged, `--debug-logs` for debug messages on the terminal, and `--log-dir DIR` to save application logs (including remote activation logs) while keeping normal terminal output concise.
+Application messages use `[deploy LEVEL]`, `[activate LEVEL]`, or `[revoke LEVEL]` on each line. Interactive deployments show the full preview for confirmation. Non-interactive deployments show a short target summary. Remote stderr has a `[node.profile remote]` label by default to identify the target. Nix logs and `nom` trees use the shared build display described above. Diff output keeps its native formatting.
+
+Use `--no-demarcate-output` to leave remote stderr unchanged or `--debug-logs` to show debug messages on the terminal. Use `--log-dir DIR` to save application logs, including remote activation logs, while keeping terminal output concise.
 
 Remote terminal output uses a bounded buffer and may be dropped if the connection stops consuming stderr. This keeps activation deadlines and rollback independent of log delivery. Application logs saved with `--log-dir` are still written to their files.
 
@@ -85,7 +87,7 @@ Remote terminal output uses a bounded buffer and may be dropped if the connectio
 
 ### Tag-Based Profile Selection
 
-Declare `tags` as lists of strings at the deploy, node, or profile level. Each profile inherits all tags from its node and from deploy. Tags accumulate rather than replace parent tags, so an empty list does not clear inherited tags. The deployment preview lists each tag once, keeping the first occurrence in profile, node, then deploy order.
+Declare `tags` as lists of strings at the deploy, node, or profile level. Each profile combines its own tags with those from its node and deploy. Empty lists keep inherited tags. The preview lists each tag once in order of first occurrence, starting with profile tags, then node tags, then deploy tags.
 
 - Use `deploy --tag <tag> <flake>` to deploy all profiles carrying that tag.
 - Pass `--tag` multiple times to match only profiles carrying **all** of the requested tags.
