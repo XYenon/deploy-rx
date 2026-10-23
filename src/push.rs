@@ -5,11 +5,12 @@
 use log::{debug, info, warn};
 use rnix::ast::{self, HasEntry};
 use std::collections::HashMap;
+use std::convert::TryInto;
 use std::ffi::OsStr;
-use std::io::Read;
 use std::path::Path;
-use std::process::{Command as StdCommand, Stdio};
+use std::process::Stdio;
 use thiserror::Error;
+use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
 use crate::command;
@@ -91,6 +92,12 @@ pub enum PushProfileError {
         profiles: String,
         source: Box<command::CommandError<CopyError>>,
     },
+    #[error("Failed to prepare profile `{node}.{profile}`: {source}")]
+    Profile {
+        node: String,
+        profile: String,
+        source: Box<PushProfileError>,
+    },
 
     #[error("{0}")]
     StoreLs(#[from] command::CommandError<StoreLsError>),
@@ -122,11 +129,13 @@ impl PushProfileError {
     pub fn node_context(&self) -> Option<&str> {
         match self {
             PushProfileError::CopyGroup { nodes, .. } => Some(nodes.as_str()),
+            PushProfileError::Profile { node, .. } => Some(node.as_str()),
             _ => None,
         }
     }
 }
 
+#[derive(Clone)]
 pub struct PushProfileData<'a> {
     pub supports_flakes: bool,
     pub check_sigs: bool,
@@ -149,6 +158,7 @@ async fn command_exists(command: &str, path: Option<&OsStr>) -> std::io::Result<
         .arg("--version")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
+        .kill_on_drop(true)
         .status()
         .await
     {
@@ -189,64 +199,50 @@ async fn run_build_command(
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
 
-            let (nix_status, nom_status, stdout) =
-                tokio::task::spawn_blocking(move || -> Result<_, PushProfileError> {
-                    let mut nix_child = build_command.into_std().spawn().map_err(|err| {
-                        PushProfileError::Build(command::CommandError::RunError(err))
-                    })?;
-
-                    let mut nix_stdout = nix_child.stdout.take().ok_or_else(|| {
-                        PushProfileError::Build(command::CommandError::RunError(
-                            std::io::Error::other("failed to capture nix build stdout"),
-                        ))
-                    })?;
-                    let stdout_task = std::thread::spawn(move || {
-                        let mut stdout = Vec::new();
-                        nix_stdout.read_to_end(&mut stdout).map(|_| stdout)
-                    });
-                    let nix_stderr = nix_child.stderr.take().ok_or_else(|| {
-                        PushProfileError::Build(command::CommandError::RunError(
-                            std::io::Error::other("failed to capture nix build stderr for nom"),
-                        ))
-                    })?;
-
-                    let mut nom_command = StdCommand::new("nom");
-                    if let Some(path) = path {
-                        nom_command.env("PATH", path);
-                    }
-
-                    let nom_status = nom_command
-                        .arg("--json")
-                        .stdin(Stdio::from(nix_stderr))
-                        .stdout(Stdio::inherit())
-                        .stderr(Stdio::inherit())
-                        .status()
-                        .map_err(|err| {
-                            PushProfileError::Build(command::CommandError::RunError(err))
-                        })?;
-
-                    let nix_status = nix_child.wait().map_err(|err| {
-                        PushProfileError::Build(command::CommandError::RunError(err))
-                    })?;
-                    let stdout = stdout_task
-                        .join()
-                        .map_err(|_| {
-                            PushProfileError::Build(command::CommandError::RunError(
-                                std::io::Error::other("failed joining nix build stdout reader"),
-                            ))
-                        })?
-                        .map_err(|err| {
-                            PushProfileError::Build(command::CommandError::RunError(err))
-                        })?;
-
-                    Ok((nix_status, nom_status, stdout))
-                })
-                .await
-                .map_err(|err| {
-                    PushProfileError::Build(command::CommandError::RunError(std::io::Error::other(
-                        format!("failed waiting for build tree process: {}", err),
-                    )))
-                })??;
+            let mut nix_child = build_command
+                .kill_on_drop(true)
+                .spawn()
+                .map_err(|err| PushProfileError::Build(command::CommandError::RunError(err)))?;
+            let mut nix_stdout = nix_child.stdout.take().unwrap();
+            let nix_stderr = nix_child.stderr.take().unwrap();
+            let mut nom_command = Command::new("nom");
+            if let Some(path) = path {
+                nom_command.env("PATH", path);
+            }
+            // Connect the pipe directly: no detached blocking task or reader
+            // thread can outlive this future, including when nom fails to spawn.
+            let start_nom = (|| -> std::io::Result<_> {
+                let stdin: Stdio = nix_stderr.try_into()?;
+                nom_command
+                    .arg("--json")
+                    .stdin(stdin)
+                    .stdout(Stdio::inherit())
+                    .stderr(Stdio::inherit())
+                    .kill_on_drop(true)
+                    .spawn()
+            })();
+            let mut nom_child = match start_nom {
+                Ok(child) => child,
+                Err(err) => {
+                    let _ = nix_child.kill().await;
+                    return Err(PushProfileError::Build(command::CommandError::RunError(
+                        err,
+                    )));
+                }
+            };
+            let mut stdout = Vec::new();
+            let (nix_status, nom_status, read_result) = tokio::join!(
+                nix_child.wait(),
+                nom_child.wait(),
+                nix_stdout.read_to_end(&mut stdout),
+            );
+            // All children and pipe reads have settled before propagating errors.
+            let nix_status = nix_status
+                .map_err(|err| PushProfileError::Build(command::CommandError::RunError(err)))?;
+            let nom_status = nom_status
+                .map_err(|err| PushProfileError::Build(command::CommandError::RunError(err)))?;
+            read_result
+                .map_err(|err| PushProfileError::Build(command::CommandError::RunError(err)))?;
 
             if nom_status.code() != Some(0) {
                 warn!(
@@ -272,6 +268,7 @@ async fn run_build_command(
         .stderr(Stdio::inherit());
     let command_debug = format!("{:?}", build_command);
     let child = build_command
+        .kill_on_drop(true)
         .spawn()
         .map_err(|err| PushProfileError::Build(command::CommandError::RunError(err)))?;
     let output = child
@@ -291,6 +288,7 @@ async fn run_build_command(
 
 fn enable_nix_command(command: &mut Command) -> &mut Command {
     command
+        .kill_on_drop(true)
         .arg("--extra-experimental-features")
         .arg("nix-command")
 }
@@ -1161,42 +1159,111 @@ pub async fn build_profiles_locally(
 
 /// Resolve derivations, then build all profiles (dispatching remote vs local).
 ///
-/// Remote profiles are built individually; local profiles are batched into a
-/// single `nix build` invocation for efficiency.
+/// Remote connections run concurrently with the local batch. Profiles sharing
+/// a connection retain input order.
 pub async fn build_profiles(
     datas: &[PushProfileData<'_>],
 ) -> Result<Vec<String>, PushProfileError> {
-    // Resolve derivations for every profile concurrently
-    let derivations: Vec<String> =
-        futures_util::future::try_join_all(datas.iter().map(resolve_derivation)).await?;
+    build_profiles_inner(datas, false).await
+}
 
-    // Separate remote vs local, building remote ones immediately
-    let mut closures = vec![None; datas.len()];
+/// Build and copy everything before returning closures in deployment order.
+/// Local copies can overlap builds on other remote connections. A build/copy
+/// error stops subsequent builds/copies in that chain; independent work is
+/// awaited before returning an error. Callers must not activate until success.
+pub async fn build_and_push_profiles(
+    datas: &[PushProfileData<'_>],
+) -> Result<Vec<String>, PushProfileError> {
+    build_profiles_inner(datas, true).await
+}
+
+type Connections = HashMap<(String, String), tokio::sync::Mutex<()>>;
+
+async fn build_profiles_inner(
+    datas: &[PushProfileData<'_>],
+    push: bool,
+) -> Result<Vec<String>, PushProfileError> {
+    // Unlike try_join_all, join_all never drops running resolution subprocesses
+    // just because a different profile failed.
+    let derivations = futures_util::future::join_all(datas.iter().map(resolve_derivation))
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let mut connections = Connections::new();
+    let mut remote_groups: HashMap<_, Vec<usize>> = HashMap::new();
+    let mut local_datas = Vec::new();
     let mut local_builds: Vec<(&PushProfileData<'_>, &str)> = Vec::new();
     let mut local_indexes = Vec::new();
     for (index, (data, deriver)) in datas.iter().zip(derivations.iter()).enumerate() {
-        if data
+        let remote = data
             .deploy_data
             .merged_settings
             .remote_build
-            .unwrap_or(false)
-        {
+            .unwrap_or(false);
+        if remote || push {
+            let connection = remote_store(data)?;
+            connections.entry(connection.clone()).or_default();
+            if remote {
+                remote_groups.entry(connection).or_default().push(index);
+            }
+        }
+        if remote {
             if !data.supports_flakes {
                 warn!("remote builds using non-flake nix are experimental");
             }
-            let closure = build_profile_remotely(data, deriver).await?;
-            check_and_sign_remote_profile(data, &closure).await?;
-            closures[index] = Some(closure);
         } else {
+            local_datas.push(data.clone());
             local_builds.push((data, deriver.as_str()));
             local_indexes.push(index);
         }
     }
 
-    // Build all local profiles in a single nix build invocation
-    if !local_builds.is_empty() {
+    let remote_builds =
+        futures_util::future::join_all(remote_groups.iter().map(|(connection, indexes)| {
+            let connections = &connections;
+            let derivations = &derivations;
+            async move {
+                let _connection = connections[connection].lock().await;
+                let mut built = Vec::new();
+                for &index in indexes {
+                    let data = &datas[index];
+                    let closure = async {
+                        let closure = build_profile_remotely(data, &derivations[index]).await?;
+                        check_and_sign_remote_profile(data, &closure).await?;
+                        Ok(closure)
+                    }
+                    .await
+                    .map_err(|source| PushProfileError::Profile {
+                        node: data.deploy_data.node_name.to_owned(),
+                        profile: data.deploy_data.profile_name.to_owned(),
+                        source: Box::new(source),
+                    })?;
+                    built.push((index, closure));
+                }
+                Ok::<_, PushProfileError>(built)
+            }
+        }));
+    let local_build = async {
         let local_closures = build_profiles_locally(&local_builds).await?;
-        for (index, closure) in local_indexes.into_iter().zip(local_closures) {
+        if push {
+            push_profiles_with_connections(&local_datas, &local_closures, &connections).await?;
+        }
+        Ok::<_, PushProfileError>(
+            local_indexes
+                .into_iter()
+                .zip(local_closures)
+                .collect::<Vec<_>>(),
+        )
+    };
+    let (remote_results, local_result) = tokio::join!(remote_builds, local_build);
+
+    let mut closures = vec![None; datas.len()];
+    for result in remote_results
+        .into_iter()
+        .chain(std::iter::once(local_result))
+    {
+        for (index, closure) in result? {
             closures[index] = Some(closure);
         }
     }
@@ -1280,6 +1347,18 @@ pub async fn push_profiles(
     datas: &[PushProfileData<'_>],
     closures: &[String],
 ) -> Result<(), PushProfileError> {
+    let mut connections = Connections::new();
+    for data in datas {
+        connections.entry(remote_store(data)?).or_default();
+    }
+    push_profiles_with_connections(datas, closures, &connections).await
+}
+
+async fn push_profiles_with_connections(
+    datas: &[PushProfileData<'_>],
+    closures: &[String],
+    connections: &Connections,
+) -> Result<(), PushProfileError> {
     debug_assert_eq!(datas.len(), closures.len());
     let mut copy_groups: Vec<CopyGroup> = Vec::new();
 
@@ -1306,51 +1385,67 @@ pub async fn push_profiles(
         }
     }
 
+    // Keep incompatible copy groups on the same connection in input order as
+    // well. Holding this lock also excludes remote builds on that connection.
+    let mut by_connection: HashMap<_, Vec<CopyGroup>> = HashMap::new();
     for group in copy_groups {
-        let profiles_str = group
-            .indexes
-            .iter()
-            .map(|&index| {
-                let data = &datas[index];
-                format!(
-                    "`{}.{}`",
-                    data.deploy_data.node_name, data.deploy_data.profile_name
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
-        let nodes_str = copy_group_nodes(datas, &group);
-        let target = format!("ssh://{}@{}", group.key.ssh_user, group.key.hostname);
-        info!(
-            "Copying {} {} to node `{}`: {}",
-            group.indexes.len(),
-            if group.indexes.len() > 1 {
-                "profiles"
-            } else {
-                "profile"
-            },
-            group.key.hostname,
-            profiles_str
-        );
-
-        let paths: Vec<&str> = group
-            .indexes
-            .iter()
-            .map(|&index| closures[index].as_str())
-            .collect();
-
-        command::Command::new(make_copy_command(&group.key, &paths))
-            .status()
-            .await
-            .map_err(|source| PushProfileError::CopyGroup {
-                nodes: nodes_str.clone(),
-                target: target.clone(),
-                profiles: profiles_str.clone(),
-                source: Box::new(source),
-            })?;
+        by_connection
+            .entry(remote_store(&datas[group.indexes[0]])?)
+            .or_default()
+            .push(group);
     }
+    let results = futures_util::future::join_all(by_connection.into_iter().map(
+        |(connection, groups)| async move {
+            let _connection = connections[&connection].lock().await;
+            for group in groups {
+                let profiles_str = group
+                    .indexes
+                    .iter()
+                    .map(|&index| {
+                        let data = &datas[index];
+                        format!(
+                            "`{}.{}`",
+                            data.deploy_data.node_name, data.deploy_data.profile_name
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let nodes_str = copy_group_nodes(datas, &group);
+                let target = format!("ssh://{}@{}", group.key.ssh_user, group.key.hostname);
+                info!(
+                    "Copying {} {} to node `{}`: {}",
+                    group.indexes.len(),
+                    if group.indexes.len() > 1 {
+                        "profiles"
+                    } else {
+                        "profile"
+                    },
+                    group.key.hostname,
+                    profiles_str
+                );
 
-    Ok(())
+                let paths: Vec<&str> = group
+                    .indexes
+                    .iter()
+                    .map(|&index| closures[index].as_str())
+                    .collect();
+
+                command::Command::new(make_copy_command(&group.key, &paths))
+                    .status()
+                    .await
+                    .map_err(|source| PushProfileError::CopyGroup {
+                        nodes: nodes_str.clone(),
+                        target: target.clone(),
+                        profiles: profiles_str.clone(),
+                        source: Box::new(source),
+                    })?;
+            }
+            Ok::<_, PushProfileError>(())
+        },
+    ))
+    .await;
+
+    results.into_iter().collect()
 }
 
 pub async fn push_profile(
@@ -1921,6 +2016,7 @@ mod tests {
 
     fn empty_settings() -> crate::data::GenericSettings {
         crate::data::GenericSettings {
+            tags: vec![],
             ssh_user: None,
             user: None,
             ssh_opts: vec![],
@@ -1983,7 +2079,6 @@ mod tests {
             profile_settings: crate::data::ProfileSettings {
                 path: "/nonexistent/path".to_string(),
                 profile_path: None,
-                tags: vec![],
                 drv_path: None,
                 output_name: "out".to_string(),
             },
@@ -2032,7 +2127,6 @@ mod tests {
             profile_settings: crate::data::ProfileSettings {
                 path: dir.path().to_string_lossy().into_owned(),
                 profile_path: None,
-                tags: vec![],
                 drv_path: None,
                 output_name: "out".to_string(),
             },
@@ -2085,7 +2179,6 @@ mod tests {
             profile_settings: crate::data::ProfileSettings {
                 path: dir.path().to_string_lossy().into_owned(),
                 profile_path: None,
-                tags: vec![],
                 drv_path: None,
                 output_name: "out".to_string(),
             },

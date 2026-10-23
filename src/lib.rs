@@ -592,6 +592,7 @@ mod deploy_data_tests {
 
     fn empty_settings() -> data::GenericSettings {
         data::GenericSettings {
+            tags: vec![],
             ssh_user: None,
             user: None,
             ssh_opts: vec![],
@@ -659,7 +660,6 @@ mod deploy_data_tests {
             profile_settings: data::ProfileSettings {
                 path: "/nix/store/new-profile".to_string(),
                 profile_path: Some("".to_string()),
-                tags: vec![],
                 drv_path: None,
                 output_name: "out".to_string(),
             },

@@ -4,7 +4,7 @@
 
 use merge::Merge;
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use crate::sudo::SudoCommand;
@@ -13,9 +13,18 @@ fn default_output_name() -> String {
     "out".to_string()
 }
 
+fn merge_tags(tags: &mut Vec<String>, inherited: Vec<String>) {
+    tags.extend(inherited);
+    let mut seen = HashSet::new();
+    tags.retain(|tag| seen.insert(tag.clone()));
+}
+
 #[derive(Deserialize, Debug, Clone, Merge)]
 #[merge(strategy = merge::option::overwrite_none)]
 pub struct GenericSettings {
+    #[serde(default)]
+    #[merge(strategy = merge_tags)]
+    pub tags: Vec<String>,
     #[serde(rename(deserialize = "sshUser"))]
     pub ssh_user: Option<String>,
     pub user: Option<String>,
@@ -63,8 +72,6 @@ pub struct ProfileSettings {
     pub path: String,
     #[serde(rename(deserialize = "profilePath"))]
     pub profile_path: Option<String>,
-    #[serde(default)]
-    pub tags: Vec<String>,
     /// `.drv` path of the derivation that produces `path`. Populated by the
     /// internal eval transformation in `nix/transform-deploy.nix` so the binary
     /// knows which derivation to build when `path` is only a placeholder, as
@@ -104,7 +111,7 @@ pub struct Data {
 
 #[cfg(test)]
 mod tests {
-    use super::{GenericSettings, ProfileSettings};
+    use super::{Data, GenericSettings, ProfileSettings};
     use merge::Merge;
 
     #[test]
@@ -127,21 +134,52 @@ mod tests {
     }
 
     #[test]
-    fn test_profile_settings_tags_default_to_empty() {
-        let profile: ProfileSettings =
-            serde_json::from_str(r#"{"path":"/nix/store/profile"}"#).unwrap();
+    fn test_tags_deserialize_and_merge_across_all_levels() {
+        let data: Data = serde_json::from_str(
+            r#"{
+                "tags": ["prod", "shared"],
+                "nodes": {
+                    "tagged": {
+                        "hostname": "example.com",
+                        "tags": ["edge", "shared"],
+                        "profiles": {
+                            "app": {"path": "/nix/store/app", "tags": ["web", "shared", "web"]},
+                            "untagged": {"path": "/nix/store/untagged", "tags": []}
+                        }
+                    },
+                    "untagged": {
+                        "hostname": "example.net",
+                        "profiles": {"app": {"path": "/nix/store/app"}}
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
 
-        assert!(profile.tags.is_empty());
-        assert_eq!(profile.output_name, "out");
+        let node = &data.nodes["tagged"];
+        for (name, expected) in [
+            ("app", vec!["web", "shared", "edge", "prod"]),
+            ("untagged", vec!["edge", "shared", "prod"]),
+        ] {
+            let mut settings = node.node_settings.profiles[name].generic_settings.clone();
+            settings.merge(node.generic_settings.clone());
+            settings.merge(data.generic_settings.clone());
+            assert_eq!(settings.tags, expected);
+        }
+
+        assert!(data.nodes["untagged"].generic_settings.tags.is_empty());
+        assert!(data.nodes["untagged"].node_settings.profiles["app"]
+            .generic_settings
+            .tags
+            .is_empty());
     }
 
     #[test]
-    fn test_profile_settings_tags_deserialize() {
+    fn test_profile_settings_output_name_defaults_to_out() {
         let profile: ProfileSettings =
-            serde_json::from_str(r#"{"path":"/nix/store/profile","tags":["prod","system"]}"#)
-                .unwrap();
+            serde_json::from_str(r#"{"path":"/nix/store/profile"}"#).unwrap();
 
-        assert_eq!(profile.tags, vec!["prod", "system"]);
+        assert_eq!(profile.output_name, "out");
     }
 
     #[test]

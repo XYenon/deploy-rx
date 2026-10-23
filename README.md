@@ -11,6 +11,20 @@ SPDX-License-Identifier: MPL-2.0
 
 The machine running the deploy-rx CLI requires **Nix 2.13 or newer**. The CLI checks this before evaluating or building deployment configurations, including in `--file` mode. Dynamic derivations additionally require Nix with the relevant experimental features enabled.
 
+## Installation with Cargo
+
+Building deploy-rx requires **Rust 1.95 or newer**. Install from this repository with:
+
+```sh
+cargo install --git https://github.com/XYenon/deploy-rx --locked deploy-rx
+```
+
+From a local checkout, use `cargo install --path . --locked`. Once deploy-rx is published on crates.io, registry installation will also be available with `cargo install --locked deploy-rx`.
+
+Cargo installs the `deploy` CLI and the internal `activate` helper into Cargo's binary directory (normally `~/.cargo/bin`); ensure it is on your `PATH`. Nix and SSH must also be available for deployment. For the default build-tree visualization, install [`nix-output-monitor`](https://github.com/maralorn/nix-output-monitor) (`nom`), or use `--no-build-tree`.
+
+Resolver v3 prefers dependencies compatible with the declared minimum Rust version. The Cargo package includes the Nix transformation embedded in the CLI; Nix integration tests and their repository-only resources are excluded. Run those tests from a checkout using the Nix development shell.
+
 ## Features & Enhancements
 
 `deploy-rx` introduces several functional improvements and capabilities over the original `deploy-rs`:
@@ -49,6 +63,8 @@ First-class support for deploying [system-manager](https://github.com/numtide/sy
 - **Diff & Change Review**: Integrated, super-fast diffing (`dix`) of derivation changes before activation or switch. Enabled by default (bypass with `--no-review-changes`).
 - **Batched Nix Evaluation, Builds & Pushes**: Intelligently groups multiple deployment targets from the same flake into a single `nix eval`, batches local builds into one `nix build`, and batches compatible pushes to the same target into one `nix copy`, reducing Nix and SSH overhead for multi-profile deployments.
 
+Builds on different SSH connections run concurrently with the local batch. Copies can overlap builds on other connections, while work on the same connection runs in order. Profiles activate in deployment order after all builds, checks, signing, and copies succeed. If preparation fails, other started work finishes before the command returns an error.
+
 For the NixOS system profile, `--test` changes the running system while preserving the system profile and boot default. If a later switch fails, rollback restores the previous boot configuration and the previous running system independently.
 
 ### Logs
@@ -67,17 +83,28 @@ Remote terminal output uses a bounded buffer and may be dropped if the connectio
 
 ### Tag-Based Profile Selection
 
-Profiles can now declare `tags`, and the CLI can deploy every matching profile across all nodes in one command.
+Declare `tags` as lists of strings at the deploy, node, or profile level. Each profile inherits all tags from its node and from deploy. Tags accumulate rather than replace parent tags, so an empty list does not clear inherited tags. The deployment preview lists each tag once, keeping the first occurrence in profile, node, then deploy order.
 
 - Use `deploy --tag <tag> <flake>` to deploy all profiles carrying that tag.
 - Pass `--tag` multiple times to match only profiles carrying **all** of the requested tags.
+- Tag matching is case-sensitive. Repeating a requested tag has no effect, and no matching profiles is an error.
+- Tag filtering also applies to explicit node and profile targets. Selected profiles follow `profilesOrder`, with unlisted profiles deployed afterward.
 
 ```nix
-profiles.system = {
-  path = deploy-rx.lib.x86_64-linux.activate.nixos self.nixosConfigurations.some-random-system;
-  tags = [ "production" "system" ];
+deploy = {
+  tags = [ "production" ];
+  nodes.some-random-system = {
+    hostname = "some-random-system.example.org";
+    tags = [ "web" ];
+    profiles.system = {
+      path = deploy-rx.lib.x86_64-linux.activate.nixos self.nixosConfigurations.some-random-system;
+      tags = [ "system" ];
+    };
+  };
 };
 ```
+
+The `system` profile above has the tags `system`, `web`, and `production`. Select it with `deploy --tag production --tag web --tag system <flake>`.
 
 ---
 

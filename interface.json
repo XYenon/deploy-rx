@@ -6,6 +6,13 @@
         "generic_settings": {
             "type": "object",
             "properties": {
+                "tags": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    },
+                    "uniqueItems": true
+                },
                 "sshUser": {
                     "type": ["string", "null"]
                 },
@@ -101,13 +108,6 @@
                 },
                 "profilePath": {
                     "type": ["string", "null"]
-                },
-                "tags": {
-                    "type": "array",
-                    "items": {
-                        "type": "string"
-                    },
-                    "uniqueItems": true
                 }
             },
             "required": [

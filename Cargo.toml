@@ -7,6 +7,33 @@ name = "deploy-rx"
 version = "0.1.0"
 authors = ["notgne2 <gen2@gen2.space>", "Serokell <hi@serokell.io>", "XYenon <i@xyenon.bid>"]
 edition = "2018"
+resolver = "3"
+rust-version = "1.95"
+description = "An extended multi-profile Nix-flake deployment tool."
+license = "MPL-2.0"
+repository = "https://github.com/XYenon/deploy-rx"
+readme = "README.md"
+keywords = ["nix", "flake", "deployment", "ssh", "operations"]
+categories = ["command-line-utilities", "development-tools"]
+# Keep nix/transform-deploy.nix, which src/cli.rs embeds at compile time.
+exclude = [
+    ".agents/",
+    ".envrc",
+    ".github/",
+    ".gitignore",
+    ".reuse/",
+    "default.nix",
+    "docs/",
+    "examples/",
+    "flake.lock",
+    "flake.nix",
+    "interface.json",
+    "nix/tests/",
+    "renovate.json",
+    "shell.nix",
+    # These integration tests require the repository's flake and Nix fixtures.
+    "tests/",
+]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
