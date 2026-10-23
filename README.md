@@ -21,9 +21,13 @@ cargo install --git https://github.com/XYenon/deploy-rx --locked deploy-rx
 
 Install a local checkout with `cargo install --path . --locked`. After deploy-rx is published on crates.io, you can also use `cargo install --locked deploy-rx`.
 
-Cargo installs `deploy` and the internal `activate` helper in its binary directory, usually `~/.cargo/bin`. Add that directory to your `PATH`. Deployment also requires Nix and SSH. The default build display uses [`nix-output-monitor`](https://github.com/maralorn/nix-output-monitor) (`nom`). Install it or disable the display with `--no-build-tree`.
+Cargo installs `deploy` and the internal `activate` helper in its binary directory, usually `~/.cargo/bin`. Add that directory to your `PATH`. Deployment also requires Nix and SSH. The default build display uses [`nix-output-monitor`](https://github.com/maralorn/nix-output-monitor) (`nom`). Install it or disable the display with `--build-tree false`.
 
 The Cargo package includes the Nix transformation embedded in the CLI. It excludes integration tests and their fixtures, which you can run from a checkout using the Nix development shell.
+
+## Shell completion
+
+Nix packages automatically install Bash, Zsh, and Fish completion scripts for option names, boolean values, and paths.
 
 ## Features & Enhancements
 
@@ -33,7 +37,7 @@ The Cargo package includes the Nix transformation embedded in the CLI. It exclud
 
 Reuses SSH connections when deploying multiple profiles to the same node, significantly reducing connection overhead and speeding up deployments.
 
-- Added `--no-rollback-fresh-connection` flag to control rollback connection behavior.
+Connection reuse is enabled by default. Use `--ssh-multiplexing false` to disable it. Deployment confirmation uses a fresh SSH connection by default. Use `--rollback-fresh-connection false` to allow confirmation to reuse an existing connection.
 
 ### Deployment Sessions and Rollback
 
@@ -59,9 +63,11 @@ First-class support for deploying [system-manager](https://github.com/numtide/sy
 
 ### Modern Deployment UX
 
-- **Build-tree Visualization**: Streams Nix checks and builds visually using `nix-output-monitor` (`nom`). Enabled by default (bypass with `--no-build-tree`).
-- **Diff & Change Review**: Integrated, super-fast diffing (`dix`) of derivation changes before activation or switch. Enabled by default (bypass with `--no-review-changes`).
+- Nix checks and builds are displayed using `nix-output-monitor` (`nom`). Disable the display with `--build-tree false`.
+- Derivation changes are shown using `dix` before activation. Disable the review with `--review-changes false`.
 - **Batched Nix Evaluation, Builds & Pushes**: Intelligently groups multiple deployment targets from the same flake into a single `nix eval`, batches local builds into one `nix build`, and batches compatible pushes to the same target into one `nix copy`, reducing Nix and SSH overhead for multi-profile deployments.
+
+The `--build-tree`, `--review-changes`, `--ssh-multiplexing`, and `--rollback-fresh-connection` options accept `true` or `false`. All four default to `true`.
 
 Builds on different SSH connections run concurrently with the local batch. Copies can overlap builds on other connections, while work on the same connection runs in order. Profiles activate in deployment order after all builds, checks, signing, and copies succeed. If preparation fails, the command waits for other started work to finish before returning an error.
 

@@ -38,8 +38,8 @@
 
           cargoLock.lockFile = ./Cargo.lock;
 
-          nativeBuildInputs = [ final.makeWrapper ];
-          nativeCheckInputs = [ final.nix-output-monitor ];
+          nativeBuildInputs = [ final.makeWrapper final.installShellFiles ];
+          nativeCheckInputs = [ final.nix-output-monitor final.bashInteractive ];
 
           env = {
             DEPLOY_RX_TEST_NOM = "${final.nix-output-monitor}/bin/nom";
@@ -51,6 +51,13 @@
               done
             '';
           };
+
+          postInstall = final.lib.optionalString (final.stdenv.buildPlatform.canExecute final.stdenv.hostPlatform) ''
+            installShellCompletion --cmd deploy \
+              --bash <("$out/bin/deploy" --generate-completion bash) \
+              --zsh <("$out/bin/deploy" --generate-completion zsh) \
+              --fish <("$out/bin/deploy" --generate-completion fish)
+          '';
 
           postFixup = ''
             wrapProgram "$out/bin/deploy" \
@@ -216,6 +223,7 @@
           RUST_SRC_PATH = "${pkgs.rust.packages.stable.rustPlatform.rustLibSrc}";
           buildInputs = with pkgs; [
             nix
+            bashInteractive
             cargo
             rustc
             rust-analyzer

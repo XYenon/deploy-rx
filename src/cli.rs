@@ -6,7 +6,8 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{stdin, stdout, Write};
 
-use clap::{ArgMatches, FromArgMatches, Parser};
+use clap::{ArgAction, ArgMatches, CommandFactory, FromArgMatches, Parser, ValueHint};
+use clap_complete::Shell;
 
 use crate as deploy;
 
@@ -50,6 +51,10 @@ fn unique_repos<'a>(deploy_flakes: &[DeployFlake<'a>]) -> Vec<&'a str> {
 #[derive(Parser, Debug, Clone)]
 #[command(version, author = "Serokell <https://serokell.io/>")]
 pub struct Opts {
+    /// Generate a shell completion script and exit
+    #[arg(long, value_enum, exclusive = true)]
+    generate_completion: Option<Shell>,
+
     /// The flake to deploy
     #[arg(group = "deploy")]
     target: Option<String>,
@@ -61,7 +66,7 @@ pub struct Opts {
     #[arg(short = 't', long = "tag")]
     tags: Vec<String>,
     /// Treat targets as files instead of flakes
-    #[clap(short, long)]
+    #[arg(short, long, value_hint = ValueHint::AnyPath)]
     file: Option<String>,
     /// Check signatures when using `nix copy`
     #[arg(short, long)]
@@ -69,18 +74,12 @@ pub struct Opts {
     /// Use the interactive prompt before deployment
     #[arg(short, long)]
     interactive: bool,
-    /// Show Nix build trees using nix-output-monitor (`nom`) when available (enabled by default)
-    #[arg(long, default_value_t = true)]
+    /// Show Nix build trees using nix-output-monitor (`nom`) when available
+    #[arg(long, action = ArgAction::Set, default_value_t = true)]
     build_tree: bool,
-    /// Disable Nix build tree visualization
-    #[arg(long)]
-    no_build_tree: bool,
-    /// Review derivation changes on the target host before activating profiles (enabled by default)
-    #[arg(long, default_value_t = true)]
+    /// Review derivation changes on the target host before activating profiles
+    #[arg(long, action = ArgAction::Set, default_value_t = true)]
     review_changes: bool,
-    /// Disable derivation change review before activation
-    #[arg(long)]
-    no_review_changes: bool,
     /// Extra arguments to be passed to nix build
     #[arg(last = true)]
     extra_build_args: Vec<String>,
@@ -89,7 +88,7 @@ pub struct Opts {
     #[arg(short, long)]
     debug_logs: bool,
     /// Directory to print logs to (including the background activation process)
-    #[arg(long)]
+    #[arg(long, value_hint = ValueHint::DirPath)]
     log_dir: Option<String>,
     /// Disable labeling lines from remote hosts with node and profile
     #[arg(long)]
@@ -99,7 +98,7 @@ pub struct Opts {
     #[arg(short, long)]
     keep_result: bool,
     /// Location to keep outputs from built profiles in
-    #[arg(short, long)]
+    #[arg(short, long, value_hint = ValueHint::AnyPath)]
     result_path: Option<String>,
 
     /// Skip the automatic pre-build checks
@@ -138,7 +137,7 @@ pub struct Opts {
     #[arg(long)]
     activation_timeout: Option<u16>,
     /// Where to store temporary files (only used by magic-rollback)
-    #[arg(long)]
+    #[arg(long, value_hint = ValueHint::DirPath)]
     temp_path: Option<PathBuf>,
     /// Show what will be activated on the machines
     #[arg(long, conflicts_with_all = ["test", "boot"])]
@@ -158,14 +157,14 @@ pub struct Opts {
     /// Prompt for sudo password during activation.
     #[arg(long)]
     interactive_sudo: Option<bool>,
-    /// Disable SSH connection multiplexing (reusing connections for multiple profiles)
-    #[arg(long)]
-    no_ssh_multiplexing: bool,
-    /// Disable fresh SSH connection for rollback check.
+    /// Reuse SSH connections for multiple profiles
+    #[arg(long, action = ArgAction::Set, default_value_t = true)]
+    ssh_multiplexing: bool,
+    /// Use a fresh SSH connection for deployment confirmation.
     /// When disabled, rollback check may reuse existing SSH connections, which can cause
     /// false-positive success even if SSH is broken (see https://github.com/serokell/deploy-rs/issues/106)
-    #[arg(long)]
-    no_rollback_fresh_connection: bool,
+    #[arg(long, action = ArgAction::Set, default_value_t = true)]
+    rollback_fresh_connection: bool,
 }
 
 /// Returns if the available Nix installation supports flakes
@@ -1224,6 +1223,39 @@ mod tests {
     }
 
     #[test]
+    fn boolean_overrides_require_explicit_values() {
+        let opts = Opts::try_parse_from(["deploy", "."]).unwrap();
+        assert!(opts.build_tree);
+        assert!(opts.review_changes);
+        assert!(opts.ssh_multiplexing);
+        assert!(opts.rollback_fresh_connection);
+
+        for flag in [
+            "--build-tree",
+            "--review-changes",
+            "--ssh-multiplexing",
+            "--rollback-fresh-connection",
+        ] {
+            for value in ["true", "false"] {
+                let opts = Opts::try_parse_from(["deploy", flag, value, "."]).unwrap();
+                let expected = value == "true";
+                let actual = match flag {
+                    "--build-tree" => opts.build_tree,
+                    "--review-changes" => opts.review_changes,
+                    "--ssh-multiplexing" => opts.ssh_multiplexing,
+                    "--rollback-fresh-connection" => opts.rollback_fresh_connection,
+                    _ => unreachable!(),
+                };
+                assert_eq!(actual, expected, "{flag} {value}");
+            }
+            assert!(Opts::try_parse_from(["deploy", flag]).is_err());
+            assert!(Opts::try_parse_from(["deploy", flag, "yes", "."]).is_err());
+            let old_flag = format!("--no-{}", &flag[2..]);
+            assert!(Opts::try_parse_from(["deploy", &old_flag, "."]).is_err());
+        }
+    }
+
+    #[test]
     fn parses_hyphen_prefixed_ssh_options_from_cli() {
         let opts = Opts::try_parse_from([
             "deploy",
@@ -2010,6 +2042,11 @@ pub async fn run(args: Option<&ArgMatches>) -> Result<(), RunError> {
         None => Opts::parse(),
     };
 
+    if let Some(shell) = opts.generate_completion {
+        clap_complete::generate(shell, &mut Opts::command(), "deploy", &mut stdout().lock());
+        return Ok(());
+    }
+
     deploy::init_logger(
         opts.debug_logs,
         opts.log_dir.as_deref(),
@@ -2086,12 +2123,10 @@ pub async fn run(args: Option<&ArgMatches>) -> Result<(), RunError> {
     }
 
     let using_flakes = supports_flakes && !do_not_want_flakes;
-    let build_tree = opts.build_tree && !opts.no_build_tree;
-    let review_changes = opts.review_changes && !opts.no_review_changes;
 
     if !opts.skip_checks {
         for repo in unique_repos(&deploy_flakes) {
-            check_deployment(using_flakes, repo, &opts.extra_build_args, build_tree).await?;
+            check_deployment(using_flakes, repo, &opts.extra_build_args, opts.build_tree).await?;
         }
     }
     let result_path = opts.result_path.as_deref();
@@ -2113,10 +2148,10 @@ pub async fn run(args: Option<&ArgMatches>) -> Result<(), RunError> {
         opts.test,
         &opts.log_dir,
         opts.rollback_succeeded.unwrap_or(true),
-        !opts.no_ssh_multiplexing,
-        !opts.no_rollback_fresh_connection,
-        build_tree,
-        review_changes,
+        opts.ssh_multiplexing,
+        opts.rollback_fresh_connection,
+        opts.build_tree,
+        opts.review_changes,
         !opts.no_demarcate_output,
         &opts.tags,
     )

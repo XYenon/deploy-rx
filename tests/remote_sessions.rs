@@ -17,6 +17,99 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 #[test]
+fn completion_generation_does_not_require_deployment_tools() {
+    let root = tempfile::tempdir().unwrap();
+    for shell in ["bash", "zsh", "fish", "powershell", "elvish"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_deploy"))
+            .args(["--generate-completion", shell])
+            .env("PATH", "")
+            .current_dir(root.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{shell}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.stderr.is_empty());
+        let script = String::from_utf8(output.stdout).unwrap();
+        for option in [
+            "build-tree",
+            "review-changes",
+            "ssh-multiplexing",
+            "rollback-fresh-connection",
+        ] {
+            assert!(script.contains(option), "{}: missing {}", shell, option);
+            assert!(!script.contains(&format!("no-{option}")));
+        }
+    }
+
+    for args in [
+        vec!["--generate-completion", "unknown"],
+        vec!["--generate-completion", "bash", ".#node"],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_deploy"))
+            .args(args)
+            .env("PATH", "")
+            .current_dir(root.path())
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stdout.is_empty());
+    }
+}
+
+#[test]
+fn bash_completion_suggests_boolean_values() {
+    let root = tempfile::tempdir().unwrap();
+    let script = root.path().join("deploy.bash");
+    let output = Command::new(env!("CARGO_BIN_EXE_deploy"))
+        .args(["--generate-completion", "bash"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    std::fs::write(&script, output.stdout).unwrap();
+
+    for option in [
+        "--build-tree",
+        "--review-changes",
+        "--ssh-multiplexing",
+        "--rollback-fresh-connection",
+    ] {
+        for (prefix, expected) in [("", "true\nfalse\n"), ("t", "true\n"), ("f", "false\n")] {
+            let output = Command::new("bash")
+                .args([
+                    "--noprofile",
+                    "--norc",
+                    "-ec",
+                    r#"
+source "$1"
+[[ $(complete -p deploy) =~ -F[[:space:]]+([^[:space:]]+) ]]
+callback=${BASH_REMATCH[1]}
+COMP_WORDS=(deploy "$2" "$3")
+COMP_CWORD=2
+"$callback" deploy "$3" "$2"
+printf '%s\n' "${COMPREPLY[@]}"
+"#,
+                    "bash",
+                ])
+                .arg(&script)
+                .args([option, prefix])
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{} {}: {}",
+                option,
+                prefix,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(String::from_utf8(output.stdout).unwrap(), expected);
+        }
+    }
+}
+
+#[test]
 fn flake_probe_preserves_extra_nix_arguments() {
     let root = tempfile::tempdir().unwrap();
     let log = root.path().join("nix-args");
@@ -54,7 +147,13 @@ fn flake_probe_preserves_extra_nix_arguments() {
                 std::env::var("PATH").unwrap()
             ),
         )
-        .args(["--skip-checks", "--no-build-tree", "--no-review-changes"])
+        .args([
+            "--skip-checks",
+            "--build-tree",
+            "false",
+            "--review-changes",
+            "false",
+        ])
         .arg(root.path().join("missing-deployment"))
         .arg("--")
         .args(extra_args)
@@ -123,7 +222,13 @@ fn minimum_nix_version_is_checked_before_deployment_evaluation() {
                     std::env::var("PATH").unwrap()
                 ),
             )
-            .args(["--skip-checks", "--no-build-tree", "--no-review-changes"])
+            .args([
+                "--skip-checks",
+                "--build-tree",
+                "false",
+                "--review-changes",
+                "false",
+            ])
             .arg(root.path().join("missing-deployment"))
             .stdin(Stdio::null())
             .output()

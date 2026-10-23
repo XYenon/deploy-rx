@@ -684,7 +684,7 @@ fn cli_checks_monitor_lifecycle() {
             .env("FAIL", if fail_check { "flake-check" } else { "none" })
             .env("RUST_LOG", "info")
             .env_remove("LOCAL_KEY")
-            .arg("--no-review-changes")
+            .args(["--review-changes", "false"])
             .arg(".")
             .stdin(Stdio::null());
         let started = Instant::now();
@@ -756,7 +756,7 @@ fn cli_many_monitored_profiles() {
         .env("RESOURCE_CASE", "1")
         .env_remove("NOM_FAILURE")
         .env_remove("LOCAL_KEY")
-        .args(["--skip-checks", "--no-review-changes", ".#stress"])
+        .args(["--skip-checks", "--review-changes", "false", ".#stress"])
         .stdin(Stdio::null());
     unsafe {
         command.pre_exec(|| {
@@ -857,7 +857,8 @@ fn cli_activation_and_connection_identity(build_tree: bool) {
             .env_remove("NOM_FAILURE")
             .args([
                 "--skip-checks",
-                "--no-review-changes",
+                "--review-changes",
+                "false",
                 "--tag",
                 "fleet",
                 "--tag",
@@ -866,10 +867,10 @@ fn cli_activation_and_connection_identity(build_tree: bool) {
                 "service",
             ]);
         if !build_tree {
-            command.arg("--no-build-tree");
+            command.args(["--build-tree", "false"]);
         }
         if !multiplex {
-            command.arg("--no-ssh-multiplexing");
+            command.args(["--ssh-multiplexing", "false"]);
         }
         command.arg("--targets");
         if spawn_failure {
@@ -1240,14 +1241,15 @@ async fn concurrent_preparation_preserves_mapping_and_drains_failures(build_tree
         } else {
             let mut command = Command::new(env!("CARGO_BIN_EXE_deploy"));
             if !build_tree {
-                command.arg("--no-build-tree");
+                command.args(["--build-tree", "false"]);
             }
             let output = command
                 // Nix builders set RUST_LOG="", which disables the logs asserted below.
                 .env("RUST_LOG", "info")
                 .args([
                     "--skip-checks",
-                    "--no-review-changes",
+                    "--review-changes",
+                    "false",
                     "--tag",
                     "fleet",
                     "--tag",
