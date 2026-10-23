@@ -65,6 +65,13 @@ tempfile = "3"
 name = "deploy"
 path = "src/lib.rs"
 
+# This test executable also runs the Nix/SSH subprocess fixtures by argv[0].
+# It is excluded from the published package along with the rest of tests/.
+[[test]]
+name = "concurrent_preparation"
+path = "tests/concurrent_preparation.rs"
+harness = false
+
 [profile.release]
 lto = true
 opt-level = "s"

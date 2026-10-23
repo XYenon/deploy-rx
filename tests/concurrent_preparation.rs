@@ -11,106 +11,189 @@
 
 use deploy::push::{build_and_push_profiles, PushProfileData};
 use serde_json::json;
-use std::os::unix::fs::PermissionsExt;
+use std::io::{self, Write};
+use std::os::unix::fs::symlink;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
-fn executable(path: &Path, source: &str) {
-    std::fs::write(path, source).unwrap();
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+fn main() {
+    // Cargo builds just this test target. Its temporary nix/ssh symlinks run
+    // these fixtures directly, without a shell or a separately installed binary.
+    let program = std::env::args_os().next().unwrap();
+    let fixture = match Path::new(&program).file_name().and_then(|s| s.to_str()) {
+        Some("nix") => Some(nix_fixture as fn() -> io::Result<i32>),
+        Some("ssh") => Some(ssh_fixture as fn() -> io::Result<i32>),
+        _ => None,
+    };
+    if let Some(fixture) = fixture {
+        std::env::set_current_dir(std::env::var_os("FIXTURE").unwrap()).unwrap();
+        let code = fixture().unwrap_or_else(|error| {
+            eprintln!("fixture failed: {error}");
+            92
+        });
+        std::process::exit(code);
+    }
+
+    // Match the ignored-test invocation used by the repository's checks.
+    if std::env::args().any(|arg| arg == "--ignored") {
+        return;
+    }
+    tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(concurrent_preparation_preserves_mapping_and_drains_failures());
+    println!("concurrent_preparation_preserves_mapping_and_drains_failures: ok (6 scenarios)");
 }
 
-const NIX: &str = r#"#!/bin/sh
-set -eu
-cd "$FIXTURE"
-event() { printf '%s\n' "$1" >> events; : > "$1"; }
-wait_for() {
-  tries=0
-  while [ ! -f "$1" ]; do
-    tries=$((tries + 1))
-    if [ "$tries" -gt 250 ]; then echo "barrier timed out: $1" >&2; exit 90; fi
-    sleep 0.02
-  done
+fn append_line(path: &str, line: &str) -> io::Result<()> {
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?
+        .write_all(format!("{line}\n").as_bytes())
 }
-case " $* " in
-  *' eval '*)
-    case " $* " in
-      *' --json '*) cat deployment.json ;;
-      *) printf 'true\n' ;;
-    esac
-    exit 0 ;;
-  *' show-derivation '*)
-    case " $* " in
-      *resolve-fail*) wait_for resolve.slow.start; event resolve.fail; exit 45 ;;
-    esac
-    event resolve.slow.start
-    echo "$$" > pid.resolve.slow
-    sleep 0.2
-    event resolve.slow.end
-    printf '{"/nix/store/resolved.drv":{}}\n'
-    exit 0 ;;
-  *' copy '*' --derivation '*) exit 0 ;;
-  *' store ls '*)
-    case " $* " in
-      *remote-a1*) event check.a1 ;;
-      *remote-a2*) event check.a2 ;;
-    esac
-    if [ "$FAIL" = check ]; then exit 43; fi
-    printf '{"entries":{"deploy-rx-activate":{},"activate-rs":{}}}\n'
-    exit 0 ;;
-  *' build '*)
-    case " $* " in
-      *remote-a1.drv*) name=a1 ;;
-      *remote-a2.drv*) name=a2 ;;
-      *remote-b.drv*) name=b ;;
-      *) name=local ;;
-    esac
-    event "build.$name.start"
-    echo "streamed build $name" >&2
-    echo "$$" > "pid.build.$name"
-    printf '%s\n' "$@" > "build.$name.args"
-    if [ "$FAIL" = none ]; then
-      case "$name" in
-        a1) wait_for build.b.start; wait_for build.local.start ;;
-        b) wait_for copy.local.start ;;
-      esac
-    fi
-    if [ "$name" = b ]; then sleep 0.3; else sleep 0.1; fi
-    event "build.$name.end"
-    case "$FAIL:$name" in
-      remote:a1|local:local) exit 42 ;;
-    esac
-    cat "result.$name.json"
-    exit 0 ;;
-  *' copy '*)
-    case " $* " in
-      *'ssh://root@local '*) name=local ;;
-      *'ssh://root@other '*) name=other ;;
-      *'ssh://root@remote-a '*) name=a ;;
-      *) echo "unexpected copy: $*" >&2; exit 91 ;;
-    esac
-    event "copy.$name.start"
-    echo "$$" > "pid.copy.$name"
-    printf '%s\n' "$@" > "copy.$name.args"
-    printf '%s\n' "$NIX_SSHOPTS" > "copy.$name.ssh"
-    if [ "$FAIL" = none ] && [ "$name" = local ]; then wait_for copy.other.start; fi
-    sleep 0.1
-    event "copy.$name.end"
-    if [ "$FAIL:$name" = copy:local ]; then exit 44; fi
-    exit 0 ;;
-esac
-echo "unexpected nix: $*" >&2
-exit 92
-"#;
 
-const SSH: &str = r#"#!/bin/sh
-set -eu
-cd "$FIXTURE"
-printf '%s\n' "activate:$*" >> events
-read -r request
-printf '%s\n' "$request" >> activations
-printf '%s\n' '{"Finished":{"ok":true,"rolled_back":false,"message":"done","rollback":null}}'
-"#;
+fn event(name: &str) -> io::Result<()> {
+    append_line("events", name)?;
+    std::fs::write(name, [])
+}
+
+fn wait_for(name: &str) -> io::Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !Path::new(name).exists() {
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("barrier timed out: {name}"),
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    Ok(())
+}
+
+fn record_pid(name: &str) -> io::Result<()> {
+    std::fs::write(format!("pid.{name}"), std::process::id().to_string())
+}
+
+fn print_file(path: &str) -> io::Result<()> {
+    io::stdout().write_all(&std::fs::read(path)?)
+}
+
+fn nix_fixture() -> io::Result<i32> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let has = |arg: &str| args.iter().any(|item| item == arg);
+    let failure = std::env::var("FAIL").unwrap();
+    if has("eval") {
+        if has("--json") {
+            print_file("deployment.json")?;
+        } else {
+            println!("true");
+        }
+    } else if has("show-derivation") {
+        if has("/nix/store/resolve-fail") {
+            wait_for("resolve.slow.start")?;
+            event("resolve.fail")?;
+            return Ok(45);
+        }
+        record_pid("resolve.slow")?;
+        event("resolve.slow.start")?;
+        std::thread::sleep(Duration::from_millis(200));
+        event("resolve.slow.end")?;
+        println!("{}", json!({"/nix/store/resolved.drv": {}}));
+    } else if has("copy") && has("--derivation") {
+        // Remote derivation transfer succeeds before that target's build.
+    } else if has("store") && has("ls") {
+        if has("/nix/store/remote-a1-profile") {
+            event("check.a1")?;
+        } else if has("/nix/store/remote-a2-profile") {
+            event("check.a2")?;
+        }
+        if failure == "check" {
+            return Ok(43);
+        }
+        println!(
+            "{}",
+            json!({"entries": {"deploy-rx-activate": {}, "activate-rs": {}}})
+        );
+    } else if has("build") {
+        let name = if has("/nix/store/remote-a1.drv^out") {
+            "a1"
+        } else if has("/nix/store/remote-a2.drv^out") {
+            "a2"
+        } else if has("/nix/store/remote-b.drv^out") {
+            "b"
+        } else {
+            "local"
+        };
+        record_pid(&format!("build.{name}"))?;
+        std::fs::write(format!("build.{name}.args"), args.join("\n"))?;
+        event(&format!("build.{name}.start"))?;
+        eprintln!("streamed build {name}");
+        if failure == "none" {
+            match name {
+                "a1" => {
+                    wait_for("build.b.start")?;
+                    wait_for("build.local.start")?;
+                }
+                "b" => wait_for("copy.local.start")?,
+                _ => (),
+            }
+        }
+        std::thread::sleep(Duration::from_millis(if name == "b" { 300 } else { 100 }));
+        event(&format!("build.{name}.end"))?;
+        if matches!(
+            (failure.as_str(), name),
+            ("remote", "a1") | ("local", "local")
+        ) {
+            return Ok(42);
+        }
+        print_file(&format!("result.{name}.json"))?;
+    } else if has("copy") {
+        let name = if has("ssh://root@local") {
+            "local"
+        } else if has("ssh://root@other") {
+            "other"
+        } else if has("ssh://root@remote-a") {
+            "a"
+        } else {
+            return Err(io::Error::other(format!("unexpected copy: {args:?}")));
+        };
+        record_pid(&format!("copy.{name}"))?;
+        std::fs::write(format!("copy.{name}.args"), args.join("\n"))?;
+        std::fs::write(
+            format!("copy.{name}.ssh"),
+            std::env::var("NIX_SSHOPTS").unwrap(),
+        )?;
+        event(&format!("copy.{name}.start"))?;
+        if failure == "none" && name == "local" {
+            wait_for("copy.other.start")?;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        event(&format!("copy.{name}.end"))?;
+        if failure == "copy" && name == "local" {
+            return Ok(44);
+        }
+    } else {
+        return Err(io::Error::other(format!("unexpected nix: {args:?}")));
+    }
+    Ok(0)
+}
+
+fn ssh_fixture() -> io::Result<i32> {
+    let args: Vec<_> = std::env::args().skip(1).collect();
+    append_line("events", &format!("activate:{}", args.join(" ")))?;
+    let mut request = String::new();
+    io::stdin().read_line(&mut request)?;
+    append_line("activations", request.trim_end())?;
+    println!(
+        "{}",
+        json!({"Finished": {
+            "ok": true, "rolled_back": false, "message": "done", "rollback": null
+        }})
+    );
+    Ok(0)
+}
 
 fn before(events: &str, first: &str, second: &str) {
     let lines: Vec<_> = events.lines().collect();
@@ -119,14 +202,14 @@ fn before(events: &str, first: &str, second: &str) {
     assert!(a < b, "expected {} before {}:\n{}", first, second, events);
 }
 
-#[tokio::test]
 async fn concurrent_preparation_preserves_mapping_and_drains_failures() {
     // One test owns this process's PATH; child CLI runs get isolated environments.
     let root = tempfile::tempdir().unwrap();
     let bin = root.path().join("bin");
     std::fs::create_dir(&bin).unwrap();
-    executable(&bin.join("nix"), NIX);
-    executable(&bin.join("ssh"), SSH);
+    let executable = std::env::current_exe().unwrap();
+    symlink(&executable, bin.join("nix")).unwrap();
+    symlink(&executable, bin.join("ssh")).unwrap();
     let original_path = std::env::var_os("PATH").unwrap();
     let path = std::env::join_paths(
         std::iter::once(bin.clone()).chain(std::env::split_paths(&original_path)),
