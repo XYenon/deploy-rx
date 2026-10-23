@@ -16,7 +16,7 @@ use log::{debug, info, warn};
 use serde::Serialize;
 use std::ffi::OsStr;
 use std::path::PathBuf;
-use std::process::{Command as StdCommand, Stdio};
+use std::process::Stdio;
 use thiserror::Error;
 use tokio::process::Command;
 
@@ -212,6 +212,7 @@ async fn command_exists(command: &str, path: Option<&OsStr>) -> std::io::Result<
         .arg("--version")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
+        .kill_on_drop(true)
         .status()
         .await
     {
@@ -225,7 +226,7 @@ async fn command_exists(command: &str, path: Option<&OsStr>) -> std::io::Result<
 }
 
 async fn run_check_command(
-    mut check_command: Command,
+    check_command: Command,
     build_tree: bool,
 ) -> Result<(), CheckDeploymentError> {
     debug!("check command: {:?}", check_command);
@@ -245,72 +246,10 @@ async fn run_check_command(
                 "Build tree visualization requested for checks but `nom` is not available in PATH; falling back to regular check logs"
             );
         } else {
-            check_command
-                .arg("--log-format")
-                .arg("internal-json")
-                .arg("--verbose")
-                .stdout(Stdio::null())
-                .stderr(Stdio::piped());
-
-            let (nix_status, nom_status) =
-                tokio::task::spawn_blocking(move || -> Result<_, CheckDeploymentError> {
-                    let mut nix_child = check_command.into_std().spawn().map_err(|err| {
-                        CheckDeploymentError::NixCheck(command::CommandError::RunError(err))
-                    })?;
-
-                    let nix_stderr = nix_child.stderr.take().ok_or_else(|| {
-                        CheckDeploymentError::NixCheck(command::CommandError::RunError(
-                            std::io::Error::other("failed to capture nix check stderr for nom"),
-                        ))
-                    })?;
-
-                    let mut nom_command = StdCommand::new("nom");
-                    if let Some(path) = path {
-                        nom_command.env("PATH", path);
-                    }
-
-                    let nom_status = nom_command
-                        .arg("--json")
-                        .stdin(Stdio::from(nix_stderr))
-                        .stdout(Stdio::inherit())
-                        .stderr(Stdio::inherit())
-                        .status()
-                        .map_err(|err| {
-                            CheckDeploymentError::NixCheck(command::CommandError::RunError(err))
-                        })?;
-
-                    let nix_status = nix_child.wait().map_err(|err| {
-                        CheckDeploymentError::NixCheck(command::CommandError::RunError(err))
-                    })?;
-
-                    Ok((nix_status, nom_status))
-                })
-                .await
-                .map_err(|err| {
-                    CheckDeploymentError::NixCheck(command::CommandError::RunError(
-                        std::io::Error::other(format!(
-                            "failed waiting for check build tree process: {}",
-                            err
-                        )),
-                    ))
-                })??;
-
-            if nom_status.code() != Some(0) {
-                warn!(
-                    "`nom` exited with status {:?}; continuing based on Nix check result",
-                    nom_status.code()
-                );
-            }
-
-            return match nix_status.code() {
-                Some(0) => Ok(()),
-                a => Err(CheckDeploymentError::NixCheck(
-                    command::CommandError::RunError(std::io::Error::other(format!(
-                        "nix check piped to nom resulted in a bad exit code: {:?}",
-                        a
-                    ))),
-                )),
-            };
+            command::Command::new(check_command)
+                .run_with_tree::<NixCheckError>("Check", Stdio::null())
+                .await?;
+            return Ok(());
         }
     }
 
@@ -1068,92 +1007,96 @@ async fn run_deploy(
         }
     };
 
-    let mut succeeded: Vec<(
-        &deploy::DeployData,
-        &deploy::DeployDefs,
-        &str,
-        deploy::remote_protocol::RollbackReceipt,
-    )> = vec![];
+    let activation = async {
+        let mut succeeded: Vec<(
+            &deploy::DeployData,
+            &deploy::DeployDefs,
+            &str,
+            deploy::remote_protocol::RollbackReceipt,
+        )> = vec![];
 
-    // Only revoke profiles activated earlier in this run. A dry activation
-    // must not revoke profiles from earlier dry runs.
-    for ((_, deploy_data, deploy_defs), closure) in parts.iter().zip(&closures) {
-        let rollback = match deploy::deploy::deploy_profile(
-            deploy_data,
-            deploy_defs,
-            closure,
-            dry_activate,
-            boot,
-            test,
-            rollback_fresh_connection,
-            review_changes,
-            demarcate_output,
-        )
-        .await
-        {
-            Ok(rollback) => rollback,
-            Err(e) => {
-                let to_revoke = rollback_targets(
-                    dry_activate,
-                    rollback_succeeded,
-                    cmd_overrides.auto_rollback.unwrap_or(true),
-                    succeeded
-                        .iter()
-                        .map(|(data, _, _, _)| data.merged_settings.auto_rollback),
-                );
-                if !to_revoke.is_empty() {
-                    info!(
-                        "Revoking {} previously deployed profile(s)",
-                        to_revoke.len()
+        // Only revoke profiles activated earlier in this run. A dry activation
+        // must not revoke profiles from earlier dry runs.
+        for ((_, deploy_data, deploy_defs), closure) in parts.iter().zip(&closures) {
+            let rollback = match deploy::deploy::deploy_profile(
+                deploy_data,
+                deploy_defs,
+                closure,
+                dry_activate,
+                boot,
+                test,
+                rollback_fresh_connection,
+                review_changes,
+                demarcate_output,
+            )
+            .await
+            {
+                Ok(rollback) => rollback,
+                Err(e) => {
+                    let to_revoke = rollback_targets(
+                        dry_activate,
+                        rollback_succeeded,
+                        cmd_overrides.auto_rollback.unwrap_or(true),
+                        succeeded
+                            .iter()
+                            .map(|(data, _, _, _)| data.merged_settings.auto_rollback),
                     );
-                    let (revoked, failures) = revoke_all(&to_revoke, |index| {
-                        let (deploy_data, deploy_defs, closure, rollback) = &succeeded[index];
-                        deploy::deploy::revoke(
-                            deploy_data,
-                            deploy_defs,
-                            closure,
-                            rollback,
-                            demarcate_output,
-                        )
-                    })
-                    .await;
-                    if !failures.is_empty() {
-                        let failures = failures
-                            .into_iter()
-                            .map(|(index, error)| {
-                                let (data, _, _, _) = &succeeded[index];
-                                format!("{}.{}: {}", data.node_name, data.profile_name, error)
-                            })
-                            .collect::<Vec<_>>()
-                            .join("; ");
-                        return Err(RunDeployError::RollbackFailed {
-                            node: deploy_data.node_name.to_string(),
-                            deployment: e,
-                            revoked,
-                            failures,
-                        });
+                    if !to_revoke.is_empty() {
+                        info!(
+                            "Revoking {} previously deployed profile(s)",
+                            to_revoke.len()
+                        );
+                        let (revoked, failures) = revoke_all(&to_revoke, |index| {
+                            let (deploy_data, deploy_defs, closure, rollback) = &succeeded[index];
+                            deploy::deploy::revoke(
+                                deploy_data,
+                                deploy_defs,
+                                closure,
+                                rollback,
+                                demarcate_output,
+                            )
+                        })
+                        .await;
+                        if !failures.is_empty() {
+                            let failures = failures
+                                .into_iter()
+                                .map(|(index, error)| {
+                                    let (data, _, _, _) = &succeeded[index];
+                                    format!("{}.{}: {}", data.node_name, data.profile_name, error)
+                                })
+                                .collect::<Vec<_>>()
+                                .join("; ");
+                            return Err(RunDeployError::RollbackFailed {
+                                node: deploy_data.node_name.to_string(),
+                                deployment: e,
+                                revoked,
+                                failures,
+                            });
+                        }
+                        return Err(RunDeployError::Rollback(
+                            deploy_data.node_name.to_string(),
+                            e,
+                        ));
                     }
-                    return Err(RunDeployError::Rollback(
+                    return Err(RunDeployError::DeployProfile(
                         deploy_data.node_name.to_string(),
                         e,
                     ));
                 }
-                return Err(RunDeployError::DeployProfile(
-                    deploy_data.node_name.to_string(),
-                    e,
-                ));
+            };
+            if let Some(rollback) = rollback {
+                succeeded.push((deploy_data, deploy_defs, closure.as_str(), rollback));
             }
-        };
-        if let Some(rollback) = rollback {
-            succeeded.push((deploy_data, deploy_defs, closure.as_str(), rollback));
         }
+        Ok(())
     }
+    .await;
 
     if let Some(multiplexer) = ssh_multiplexer {
         multiplexer.close_all().await;
     }
 
-    Ok(())
+    activation
 }
 
 #[cfg(test)]

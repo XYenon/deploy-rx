@@ -300,6 +300,8 @@ pub(crate) fn panel(label: String) -> usize {
 pub(crate) fn finish(id: usize, result: &str) {
     if let Some(display) = TERMINAL.lock().unwrap().as_mut() {
         display.panels[id].state = result.into();
+        // The reader has settled; retain the screen, not the PTY descriptor.
+        display.panels[id].terminal = None;
         let mut out = io::stderr().lock();
         let _ = display.clear(&mut out);
         let _ = writeln!(out, "[{result}] {}", display.panels[id].label);

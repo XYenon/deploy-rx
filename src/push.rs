@@ -202,103 +202,10 @@ async fn run_build_command_inner(
                 "Build tree visualization requested but `nom` is not available in PATH; falling back to regular build logs"
             );
         } else {
-            let label = display::command_label(&build_command, "Build");
-            let panel = display::panel(label.clone());
-            let mut monitor_failed = false;
-            let result = async {
-            let (terminal, nom_stderr) = display::nom_terminal(panel)
-                .map_err(|error| PushProfileError::Build(command::CommandError::RunError(error)))?;
-            build_command
-                .arg("--log-format")
-                .arg("internal-json")
-                .arg("--verbose")
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped());
-
-            let command_debug = format!("{build_command:?}");
-            let mut nix_child = build_command
-                .kill_on_drop(true)
-                .spawn()
-                .map_err(|err| PushProfileError::Build(command::CommandError::RunError(err)))?;
-            let mut nix_stdout = nix_child.stdout.take().unwrap();
-            let nix_stderr = nix_child.stderr.take().unwrap();
-            let mut nom_command = Command::new("nom");
-            if let Some(path) = path {
-                nom_command.env("PATH", path);
-            }
-            let start_nom = nom_command
-                    .arg("--json")
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::piped())
-                    .stderr(nom_stderr)
-                    .kill_on_drop(true)
-                    .spawn();
-            // Command retains explicitly configured Stdio across spawns.
-            // Release its slave descriptor so nom's exit produces PTY EOF.
-            drop(nom_command);
-            let mut nom_child = match start_nom {
-                Ok(child) => child,
-                Err(err) => {
-                    let _ = nix_child.kill().await;
-                    return Err(PushProfileError::Build(command::CommandError::RunError(
-                        err,
-                    )));
-                }
-            };
-            let nom_stdin = nom_child.stdin.take().unwrap();
-            let nom_stdout = nom_child.stdout.take().unwrap();
-            let mut stdout = Vec::new();
-            let monitor = async {
-                // Keep draining Nix even if nom exits early. A display failure
-                // must neither block Nix on a full pipe nor give it SIGPIPE.
-                let feed = display::feed_nom(&label, nix_stderr, nom_stdin).await;
-                let status = match tokio::time::timeout(std::time::Duration::from_secs(5), nom_child.wait()).await {
-                    Ok(status) => status,
-                    Err(_) => {
-                        let _ = nom_child.kill().await;
-                        Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "nom did not exit after EOF"))
-                    }
-                };
-                (feed, status)
-            };
-            let (nix_status, (feed, nom_status), read_result, screen_result, log_result) = tokio::join!(
-                nix_child.wait(),
-                monitor,
-                nix_stdout.read_to_end(&mut stdout),
-                display::read_nom(panel, terminal),
-                display::stream(&label, nom_stdout),
-            );
-            // All children and pipe reads have settled before propagating errors.
-            let nix_status = nix_status
-                .map_err(|err| PushProfileError::Build(command::CommandError::RunError(err)))?;
-            read_result
-                .map_err(|err| PushProfileError::Build(command::CommandError::RunError(err)))?;
-
-            // nom itself returns 1 when Nix reports a build error. That is a
-            // successful error display, not an independent monitor failure.
-            if (nix_status.success() && !nom_status.as_ref().is_ok_and(|status| status.success())) || feed.is_err() || screen_result.is_err() || log_result.is_err() {
-                monitor_failed = true;
-                warn!(
-                    "{label}: monitor failed ({nom_status:?}); continuing based on Nix build result"
-                );
-            }
-
-            if nix_status.success() { Ok(stdout) } else {
-                Err(PushProfileError::Build(command::CommandError::ExitStatus(nix_status, command_debug)))
-            }
-            }.await;
-            // Nix's outcome always wins over a monitor error.
-            display::finish(
-                panel,
-                if result.is_ok() && monitor_failed {
-                    "completed; monitor FAILED"
-                } else if result.is_ok() {
-                    "completed"
-                } else {
-                    "FAILED"
-                },
-            );
-            return result;
+            return command::Command::new(build_command)
+                .run_with_tree("Build", Stdio::piped())
+                .await
+                .map_err(PushProfileError::Build);
         }
     }
 
@@ -1250,7 +1157,7 @@ pub async fn build_profiles(
 
 /// Build and copy everything before returning closures in deployment order.
 /// Local copies can overlap builds on other remote connections. A build/copy
-/// error stops subsequent builds/copies in that chain; independent work is
+/// error stops subsequent work on that connection; independent work is
 /// awaited before returning an error. Callers must not activate until success.
 pub async fn build_and_push_profiles(
     datas: &[PushProfileData<'_>],
@@ -1258,7 +1165,8 @@ pub async fn build_and_push_profiles(
     build_profiles_inner(datas, true).await
 }
 
-type Connections = HashMap<(String, String), tokio::sync::Mutex<()>>;
+// The lock serializes a connection; its value remembers a failed operation.
+type Connections = HashMap<(String, String), tokio::sync::Mutex<bool>>;
 
 async fn build_profiles_inner(
     datas: &[PushProfileData<'_>],
@@ -1316,8 +1224,11 @@ async fn prepare_profiles(
             let connections = &connections;
             let derivations = &derivations;
             async move {
-                let _connection = connections[connection].lock().await;
+                let mut failed = connections[connection].lock().await;
                 let mut built = Vec::new();
+                if *failed {
+                    return Ok(built);
+                }
                 for &index in indexes {
                     let data = &datas[index];
                     let closure = async {
@@ -1330,8 +1241,9 @@ async fn prepare_profiles(
                         node: data.deploy_data.node_name.to_owned(),
                         profile: data.deploy_data.profile_name.to_owned(),
                         source: Box::new(source),
-                    })?;
-                    built.push((index, closure));
+                    });
+                    *failed = closure.is_err();
+                    built.push((index, closure?));
                 }
                 Ok::<_, PushProfileError>(built)
             }
@@ -1488,7 +1400,10 @@ async fn push_profiles_with_connections(
     }
     let results = futures_util::future::join_all(by_connection.into_iter().map(
         |(connection, groups)| async move {
-            let _connection = connections[&connection].lock().await;
+            let mut failed = connections[&connection].lock().await;
+            if *failed {
+                return Ok(());
+            }
             for group in groups {
                 let profiles_str = group
                     .indexes
@@ -1522,7 +1437,7 @@ async fn push_profiles_with_connections(
                     .map(|&index| closures[index].as_str())
                     .collect();
 
-                command::Command::new(make_copy_command(&group.key, &paths))
+                let result = command::Command::new(make_copy_command(&group.key, &paths))
                     .status()
                     .await
                     .map_err(|source| PushProfileError::CopyGroup {
@@ -1530,7 +1445,9 @@ async fn push_profiles_with_connections(
                         target: target.clone(),
                         profiles: profiles_str.clone(),
                         source: Box::new(source),
-                    })?;
+                    });
+                *failed = result.is_err();
+                result?;
             }
             Ok::<_, PushProfileError>(())
         },

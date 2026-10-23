@@ -67,6 +67,8 @@ fn main() {
         runtime.block_on(concurrent_preparation_preserves_mapping_and_drains_failures(true));
         return;
     }
+    cli_checks_monitor_lifecycle();
+    cli_many_monitored_profiles();
     runtime.block_on(concurrent_preparation_preserves_mapping_and_drains_failures(false));
     cli_activation_and_connection_identity(false);
     println!("concurrent_preparation: ok (8 preparation scenarios, signed CLI activation and connection isolation)");
@@ -74,10 +76,10 @@ fn main() {
         runtime.block_on(concurrent_preparation_preserves_mapping_and_drains_failures(true));
         cli_activation_and_connection_identity(true);
         println!("real_nom_preparation: ok (8 preparation scenarios, signed CLI activation and connection isolation)");
-        for scenario in ["none", "remote"] {
+        for scenario in ["none", "remote", "resize"] {
             real_nom_in_pty(scenario);
         }
-        for mode in ["early", "hang"] {
+        for mode in ["early", "hang", "blocked"] {
             std::env::set_var("NOM_FAILURE", mode);
             runtime.block_on(concurrent_preparation_preserves_mapping_and_drains_failures(true));
             println!("nom_{mode}: ok (Nix result preserved, all children reaped)");
@@ -116,18 +118,34 @@ fn real_nom_in_pty(scenario: &str) {
         unsafe { libc::fcntl(master.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) },
         -1
     );
-    let mut child = Command::new(std::env::current_exe().unwrap())
-        .env("DISPLAY_DEMO", scenario)
+    let sync = tempfile::tempdir().unwrap();
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    if scenario == "resize" {
+        command.env("DISPLAY_RESIZE", sync.path());
+    }
+    let mut child = command
+        .env(
+            "DISPLAY_DEMO",
+            if scenario == "resize" {
+                "none"
+            } else {
+                scenario
+            },
+        )
         .env("RUST_LOG", "info")
         .stdin(Stdio::null())
         .stdout(slave.try_clone().unwrap())
         .stderr(slave)
         .spawn()
         .unwrap();
+    drop(command);
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut terminal = vt100::Parser::new(50, 120, 0);
     let mut transcript = Vec::new();
     let mut saw_three_trees = false;
+    let mut resized = false;
+    let mut restored = false;
+    let mut pages = std::collections::HashSet::new();
     let mut buffer = [0; 8192];
     loop {
         match master.read(&mut buffer) {
@@ -136,7 +154,7 @@ fn real_nom_in_pty(scenario: &str) {
                 transcript.extend_from_slice(&buffer[..count]);
                 terminal.process(&buffer[..count]);
                 let screen = terminal.screen().contents();
-                saw_three_trees |= screen.contains("[running] Build local batch")
+                let three_trees = screen.contains("[running] Build local batch")
                     && screen.lines().any(|line| {
                         line.starts_with("[running] Build connection") && line.contains("remote-a")
                     })
@@ -144,6 +162,27 @@ fn real_nom_in_pty(scenario: &str) {
                         line.starts_with("[running] Build connection") && line.contains("remote-b")
                     })
                     && screen.matches("Dependency Graph").count() >= 3;
+                saw_three_trees |= three_trees;
+                if scenario == "resize" {
+                    if !resized && three_trees {
+                        resize_terminal(&master, &mut terminal, 18, 64);
+                        resized = true;
+                    } else if resized && !restored {
+                        for page in 1..=3 {
+                            if screen.contains(&format!("page {page}/3"))
+                                && screen.matches("Dependency Graph").count() == 1
+                            {
+                                pages.insert(page);
+                            }
+                        }
+                        if pages.len() == 3 {
+                            resize_terminal(&master, &mut terminal, 50, 120);
+                            restored = true;
+                        }
+                    } else if restored && three_trees {
+                        std::fs::write(sync.path().join("resized"), []).unwrap();
+                    }
+                }
             }
             Err(error) if error.raw_os_error() == Some(libc::EIO) => break,
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
@@ -168,7 +207,28 @@ fn real_nom_in_pty(scenario: &str) {
     if scenario == "remote" {
         assert!(transcript.contains("[FAILED] Build"));
     }
+    if scenario == "resize" {
+        assert_eq!(pages.len(), 3, "not all compact pages were rendered");
+        assert!(
+            sync.path().join("resized").exists(),
+            "three trees did not return after resizing"
+        );
+    }
     println!("real_nom_pty_{scenario}: ok (three isolated trees, completion and failure states)");
+}
+
+fn resize_terminal(master: &std::fs::File, parser: &mut vt100::Parser, rows: u16, cols: u16) {
+    let size = libc::winsize {
+        ws_row: rows,
+        ws_col: cols,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    assert_eq!(
+        unsafe { libc::ioctl(master.as_raw_fd(), libc::TIOCSWINSZ, &size) },
+        0
+    );
+    parser.screen_mut().set_size(rows, cols);
 }
 
 fn nom_fixture() -> io::Result<i32> {
@@ -184,10 +244,27 @@ fn nom_fixture() -> io::Result<i32> {
         event("nom.probe.succeeded")?;
         return Ok(0);
     }
+    if std::env::args().any(|arg| arg == "--version")
+        && (std::env::var_os("RESOURCE_CASE").is_some()
+            || std::env::var_os("NOM_FAILURE").is_some())
+    {
+        return Ok(0);
+    }
     if std::env::args().any(|arg| arg == "--json") {
         record_pid(&format!("nom.{}", std::process::id()))?;
+        if std::env::var_os("RESOURCE_CASE").is_some()
+            || std::env::var("NOM_FAILURE").as_deref() == Ok("consume")
+        {
+            io::stdin().read_to_end(&mut Vec::new())?;
+            return Ok(0);
+        }
         match std::env::var("NOM_FAILURE").as_deref() {
             Ok("early") => return Ok(73),
+            Ok("blocked") => {
+                event("nom.blocked")?;
+                std::thread::sleep(Duration::from_secs(60));
+                return Ok(75);
+            }
             Ok("hang") => {
                 io::stdin().read_to_end(&mut Vec::new())?;
                 std::thread::sleep(Duration::from_secs(60));
@@ -220,11 +297,15 @@ fn wait_for(name: &str) -> io::Result<()> {
     // The injected hung monitor deliberately consumes the production EOF
     // timeout before local copies start. Keep that test's barrier longer.
     let deadline = Instant::now()
-        + Duration::from_secs(if std::env::var_os("NOM_FAILURE").is_some() {
-            20
-        } else {
-            5
-        });
+        + Duration::from_secs(
+            if std::env::var_os("NOM_FAILURE").is_some()
+                || std::env::var_os("DISPLAY_RESIZE").is_some()
+            {
+                20
+            } else {
+                5
+            },
+        );
     while !Path::new(name).exists() {
         if Instant::now() >= deadline {
             return Err(io::Error::new(
@@ -249,7 +330,16 @@ fn nix_fixture() -> io::Result<i32> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let has = |arg: &str| args.iter().any(|item| item == arg);
     let failure = std::env::var("FAIL").unwrap();
-    if has("eval") {
+    if has("flake") && has("check") {
+        record_pid("check")?;
+        event("check.start")?;
+        // More than a pipe's capacity: a monitor that never reads must trigger
+        // the write timeout, not just the post-EOF wait timeout.
+        flood_monitor()?;
+        println!("discarded check stdout");
+        event("check.end")?;
+        return Ok(if failure == "flake-check" { 42 } else { 0 });
+    } else if has("eval") {
         if has("--json") {
             print_file("deployment.json")?;
         } else {
@@ -325,9 +415,14 @@ fn nix_fixture() -> io::Result<i32> {
         std::fs::write(format!("build.{name}.args"), args.join("\n"))?;
         event(&format!("build.{name}.start"))?;
         eprintln!("streamed build {name}");
+        if std::env::var_os("RESOURCE_CASE").is_some() {
+            event(&format!("build.{name}.end"))?;
+            return print_file("result.a1.json").map(|()| 0);
+        }
         let monitored = has("internal-json");
         let activity = u64::from(std::process::id()) << 32;
         if monitored {
+            flood_monitor()?;
             // Identical drv path across independent hosts is deliberate: a
             // merged nom session would conflate these builds.
             eprintln!(
@@ -359,6 +454,11 @@ fn nix_fixture() -> io::Result<i32> {
                     "b" => wait_for("copy.local.start")?,
                     _ => (),
                 }
+            }
+        }
+        if let Some(sync) = std::env::var_os("DISPLAY_RESIZE") {
+            if matches!(name, "a1" | "local") {
+                wait_for(Path::new(&sync).join("resized").to_str().unwrap())?;
             }
         }
         let scale = if std::env::var_os("DISPLAY_DEMO").is_some() {
@@ -449,23 +549,44 @@ fn ssh_fixture() -> io::Result<i32> {
         return Ok(0);
     }
     check_master(&args)?;
-    append_line("events", &format!("activate:{}", args.join(" ")))?;
     let mut request = String::new();
     io::stdin().read_line(&mut request)?;
-    let request_json: serde_json::Value = serde_json::from_str(&request)?;
-    let closure = request_json["operation"]["Deploy"]["closure"]
-        .as_str()
-        .unwrap();
+    let parsed: deploy::remote_protocol::BootstrapRequest = serde_json::from_str(&request)?;
+    let (closure, operation) = match &parsed.operation {
+        deploy::remote_protocol::RemoteOperation::Deploy(request) => (&request.closure, "activate"),
+        deploy::remote_protocol::RemoteOperation::Revoke(request) => {
+            let name = Path::new(&request.closure)
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap();
+            assert_eq!(request.rollback.session_id, format!("receipt-{name}"));
+            (&request.closure, "revoke")
+        }
+    };
     let name = Path::new(closure).file_name().unwrap().to_str().unwrap();
-    record_pid(&format!("activate.{name}"))?;
-    event(&format!("activate.{name}.start"))?;
+    append_line("events", &format!("{operation}:{}", args.join(" ")))?;
+    record_pid(&format!("{operation}.{name}"))?;
+    event(&format!("{operation}.{name}.start"))?;
     append_line("activations", request.trim_end())?;
     std::thread::sleep(Duration::from_millis(20));
-    event(&format!("activate.{name}.end"))?;
+    event(&format!("{operation}.{name}.end"))?;
+    let mode = std::env::var("ACTIVATION_FAILURE").unwrap_or_else(|_| "none".into());
+    let failed = mode != "none" && operation == "activate" && name == "remote-c-profile"
+        || mode == "revoke-fail" && operation == "revoke" && name == "remote-a1-profile";
+    let receipt = (mode != "none" && operation == "activate" && !failed).then(|| {
+        json!({
+            "session_id": format!("receipt-{name}"), "previous_session": null,
+            "previous_link": null, "previous_target": null, "previous_running_target": null,
+            "expected_link": null, "created_generation": null, "boot": false, "test": false
+        })
+    });
     println!(
         "{}",
         json!({"Finished": {
-            "ok": true, "rolled_back": false, "message": "done", "rollback": null
+            "ok": !failed, "rolled_back": false,
+            "message": if failed { format!("injected {operation} failure") } else { "done".into() },
+            "rollback": receipt
         }})
     );
     Ok(0)
@@ -508,10 +629,160 @@ fn before(events: &str, first: &str, second: &str) {
     assert!(a < b, "expected {} before {}:\n{}", first, second, events);
 }
 
+fn flood_monitor() -> io::Result<()> {
+    if std::env::var("NOM_FAILURE").as_deref() == Ok("blocked") {
+        let line = format!(
+            "@nix {}\n",
+            json!({
+                "action": "result", "id": 1, "type": 100, "fields": ["x".repeat(4096)]
+            })
+        );
+        for _ in 0..512 {
+            io::stderr().write_all(line.as_bytes())?;
+        }
+        event("nix.flood.drained")?;
+    }
+    Ok(())
+}
+
+fn cli_checks_monitor_lifecycle() {
+    for (mode, fail_check) in [
+        ("consume", false),
+        ("consume", true),
+        ("early", false),
+        ("early", true),
+        ("hang", false),
+        ("blocked", false),
+        ("spawn", false),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let bin = root.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        for name in ["nix", "nom"] {
+            symlink(std::env::current_exe().unwrap(), bin.join(name)).unwrap();
+        }
+        std::fs::write(root.path().join("deployment.json"), r#"{"nodes":{}}"#).unwrap();
+        let mut command = Command::new(env!("CARGO_BIN_EXE_deploy"));
+        command
+            .env("PATH", &bin)
+            .env("FIXTURE", root.path())
+            .env("NOM_FAILURE", mode)
+            .env("FAIL", if fail_check { "flake-check" } else { "none" })
+            .env("RUST_LOG", "info")
+            .env_remove("LOCAL_KEY")
+            .arg("--no-review-changes")
+            .arg(".")
+            .stdin(Stdio::null());
+        let started = Instant::now();
+        let output = command.output().unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            output.status.success(),
+            !fail_check && mode != "spawn",
+            "{stderr}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "{} did not settle promptly",
+            mode
+        );
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("discarded check stdout"));
+        assert!(!output.stderr.contains(&0x1b));
+        let events = std::fs::read_to_string(root.path().join("events")).unwrap_or_default();
+        if mode == "spawn" {
+            assert!(events.contains("nom.probe.succeeded"));
+        } else {
+            assert!(events.contains("check.end"), "{}", stderr);
+            if mode == "blocked" {
+                assert!(events.contains("nom.blocked"));
+                assert!(events.contains("nix.flood.drained"));
+            }
+        }
+        assert_reaped(root.path());
+    }
+    println!("cli_checks_monitor: ok (Nix outcomes, spawn failure, early exit, EOF hang and input backpressure)");
+}
+
+fn cli_many_monitored_profiles() {
+    let root = tempfile::tempdir().unwrap();
+    let bin = root.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    for name in ["nix", "nom", "ssh"] {
+        symlink(std::env::current_exe().unwrap(), bin.join(name)).unwrap();
+    }
+    let profiles: serde_json::Map<String, serde_json::Value> = (0..96)
+        .map(|index| {
+            (
+                format!("p{index}"),
+                json!({
+                    "path": "/nix/store/placeholder", "drvPath": "/nix/store/remote-a1.drv"
+                }),
+            )
+        })
+        .collect();
+    std::fs::write(
+        root.path().join("deployment.json"),
+        json!({
+            "user":"root", "sshUser":"root", "nodes":{"stress":{
+                "hostname":"remote-a", "remoteBuild":true, "profiles":profiles
+            }}
+        })
+        .to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        root.path().join("result.a1.json"),
+        json!([{
+            "drvPath":"/nix/store/remote-a1.drv", "outputs":{"out":"/nix/store/remote-a1-profile"}
+        }])
+        .to_string(),
+    )
+    .unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_deploy"));
+    command
+        .env("PATH", &bin)
+        .env("FIXTURE", root.path())
+        .env("FAIL", "none")
+        .env("RESOURCE_CASE", "1")
+        .env_remove("NOM_FAILURE")
+        .env_remove("LOCAL_KEY")
+        .args(["--skip-checks", "--no-review-changes", ".#stress"])
+        .stdin(Stdio::null());
+    unsafe {
+        command.pre_exec(|| {
+            let limit = libc::rlimit {
+                rlim_cur: 64,
+                rlim_max: 64,
+            };
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let output = command.output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let requests = std::fs::read_to_string(root.path().join("activations")).unwrap();
+    assert_eq!(requests.lines().count(), 96);
+    assert_masters_closed(root.path(), 1);
+    assert_reaped(root.path());
+    println!("monitor_descriptors: ok (96 sequential builds with RLIMIT_NOFILE=64)");
+}
+
 fn cli_activation_and_connection_identity(build_tree: bool) {
     // Remote-only profiles permit successful CLI activation without writing
     // /nix/store, including inside Nix's read-only build sandbox.
-    for (multiplex, spawn_failure) in [(false, false), (true, false), (true, true)] {
+    for (multiplex, spawn_failure, rollback) in [
+        (false, false, "none"),
+        (true, false, "none"),
+        (true, true, "none"),
+        (true, false, "rollback"),
+        (true, false, "revoke-fail"),
+    ] {
         if spawn_failure && !build_tree {
             continue;
         }
@@ -576,6 +847,7 @@ fn cli_activation_and_connection_identity(build_tree: bool) {
             .env("LOCAL_KEY", &key)
             .env("RUST_LOG", "info")
             .env("CONNECTION_CASE", "1")
+            .env("ACTIVATION_FAILURE", rollback)
             .env_remove("NOM_FAILURE")
             .args([
                 "--skip-checks",
@@ -606,7 +878,11 @@ fn cli_activation_and_connection_identity(build_tree: bool) {
         }
         let output = command.stdin(Stdio::null()).output().unwrap();
         let stderr = String::from_utf8_lossy(&output.stderr);
-        assert_eq!(output.status.success(), !spawn_failure, "{stderr}");
+        assert_eq!(
+            output.status.success(),
+            !spawn_failure && rollback == "none",
+            "{stderr}"
+        );
         assert!(!stderr.contains("barrier timed out"), "{}", stderr);
         let events = std::fs::read_to_string(root.path().join("events")).unwrap();
         if spawn_failure {
@@ -617,20 +893,24 @@ fn cli_activation_and_connection_identity(build_tree: bool) {
             let requests = std::fs::read_to_string(root.path().join("activations")).unwrap();
             let closures: Vec<String> = requests
                 .lines()
-                .map(|line| {
+                .filter_map(|line| {
                     let request: deploy::remote_protocol::BootstrapRequest =
                         serde_json::from_str(line).unwrap();
                     match request.operation {
                         deploy::remote_protocol::RemoteOperation::Deploy(request) => {
-                            request.closure
+                            Some(request.closure)
                         }
-                        _ => panic!("unexpected revoke"),
+                        _ => None,
                     }
                 })
                 .collect();
             assert_eq!(
                 closures,
-                profiles.map(|(_, name, ..)| format!("/nix/store/remote-{name}-profile"))
+                profiles
+                    .iter()
+                    .take(if rollback == "none" { 4 } else { 3 })
+                    .map(|(_, name, ..)| format!("/nix/store/remote-{name}-profile"))
+                    .collect::<Vec<_>>()
             );
             for (index, (_, name, user, options)) in profiles.iter().enumerate() {
                 before(
@@ -644,7 +924,7 @@ fn cli_activation_and_connection_identity(build_tree: bool) {
                     &format!("sign.remote-{name}-profile.end"),
                     "activate.remote-b-profile.start",
                 );
-                if index > 0 {
+                if index > 0 && (rollback == "none" || index < 3) {
                     before(
                         &events,
                         &format!("activate.remote-{}-profile.end", profiles[index - 1].1),
@@ -662,6 +942,47 @@ fn cli_activation_and_connection_identity(build_tree: bool) {
                 assert_eq!(actual.len(), if multiplex { 4 } else { 2 });
             }
             before(&events, "sign.remote-a1-profile.end", "build.a2.start");
+            if rollback != "none" {
+                let revoked: Vec<_> = requests
+                    .lines()
+                    .filter_map(|line| {
+                        let request: deploy::remote_protocol::BootstrapRequest =
+                            serde_json::from_str(line).unwrap();
+                        match request.operation {
+                            deploy::remote_protocol::RemoteOperation::Revoke(request) => {
+                                Some(request.closure)
+                            }
+                            _ => None,
+                        }
+                    })
+                    .collect();
+                assert_eq!(
+                    revoked,
+                    [
+                        "/nix/store/remote-a1-profile",
+                        "/nix/store/remote-b-profile"
+                    ]
+                );
+                before(
+                    &events,
+                    "activate.remote-c-profile.end",
+                    "revoke.remote-a1-profile.start",
+                );
+                before(
+                    &events,
+                    "revoke.remote-a1-profile.end",
+                    "revoke.remote-b-profile.start",
+                );
+                assert!(stderr.contains("injected activate failure"), "{}", stderr);
+                if rollback == "revoke-fail" {
+                    assert!(stderr.contains("injected revoke failure"), "{}", stderr);
+                    assert!(
+                        stderr.contains("revoked 1 previous profile(s)"),
+                        "{}",
+                        stderr
+                    );
+                }
+            }
         }
         if multiplex {
             assert_masters_closed(root.path(), if spawn_failure { 1 } else { 3 });
@@ -1006,6 +1327,7 @@ async fn concurrent_preparation_preserves_mapping_and_drains_failures(build_tree
             }
             if matches!(failure, "remote" | "check" | "sign-remote") {
                 assert!(!events.contains("build.a2.start"), "{}", events);
+                assert!(!events.contains("copy.a.start"), "{}", events);
             }
             if failure == "sign-local" {
                 assert!(events.contains("sign.local-profile.failed"), "{}", events);

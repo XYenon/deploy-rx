@@ -6,6 +6,7 @@ use std::fmt;
 use std::fmt::Debug;
 
 use thiserror::Error;
+use tokio::io::AsyncReadExt;
 use tokio::process::Command as TokioCommand;
 
 pub trait HasCommandError {
@@ -62,6 +63,130 @@ pub struct Command {
 impl Command {
     pub fn new(command: TokioCommand) -> Self {
         Self { command }
+    }
+
+    /// Nix owns the outcome; nom owns only its private terminal and log pipe.
+    pub(crate) async fn run_with_tree<T: HasCommandError + Debug + fmt::Display>(
+        &mut self,
+        operation: &str,
+        stdout: std::process::Stdio,
+    ) -> Result<Vec<u8>, CommandError<T>> {
+        use crate::display;
+        use std::process::Stdio;
+
+        display::run(true, async {
+            let label = display::command_label(&self.command, operation);
+            let panel = display::panel(label.clone());
+            let mut monitor_failed = false;
+            let result = async {
+                let (terminal, nom_stderr) = display::nom_terminal(panel)?;
+                self.command
+                    .arg("--log-format")
+                    .arg("internal-json")
+                    .arg("--verbose")
+                    .stdout(stdout)
+                    .stderr(Stdio::piped());
+                let mut nix_child = self.command.kill_on_drop(true).spawn()?;
+                let nix_stdout = nix_child.stdout.take();
+                let nix_stderr = nix_child.stderr.take().unwrap();
+                let mut nom_command = TokioCommand::new("nom");
+                if let Some((_, Some(path))) = self
+                    .command
+                    .as_std()
+                    .get_envs()
+                    .find(|(key, _)| *key == "PATH")
+                {
+                    nom_command.env("PATH", path);
+                }
+                let start_nom = nom_command
+                    .arg("--json")
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(nom_stderr)
+                    .kill_on_drop(true)
+                    .spawn();
+                // Release Command's slave descriptor so monitor exit yields EOF.
+                drop(nom_command);
+                let mut nom_child = match start_nom {
+                    Ok(child) => child,
+                    Err(error) => {
+                        let _ = nix_child.kill().await;
+                        return Err(error);
+                    }
+                };
+                let nom_stdin = nom_child.stdin.take().unwrap();
+                let nom_stdout = nom_child.stdout.take().unwrap();
+                let mut stdout = Vec::new();
+                let monitor = async {
+                    // Drain Nix even when nom exits or stops consuming input.
+                    let feed = display::feed_nom(&label, nix_stderr, nom_stdin).await;
+                    let status = match tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        nom_child.wait(),
+                    )
+                    .await
+                    {
+                        Ok(status) => status,
+                        Err(_) => {
+                            let _ = nom_child.kill().await;
+                            Err(std::io::Error::new(
+                                std::io::ErrorKind::TimedOut,
+                                "nom did not exit after EOF",
+                            ))
+                        }
+                    };
+                    (feed, status)
+                };
+                let (nix_status, (feed, nom_status), read, screen, logs) = tokio::join!(
+                    nix_child.wait(),
+                    monitor,
+                    async {
+                        if let Some(mut input) = nix_stdout {
+                            input.read_to_end(&mut stdout).await?;
+                        }
+                        Ok::<_, std::io::Error>(())
+                    },
+                    display::read_nom(panel, terminal),
+                    display::stream(&label, nom_stdout),
+                );
+                let nix_status = nix_status?;
+                read?;
+                // nom returning 1 for a Nix error is a successful error display.
+                monitor_failed = (nix_status.success()
+                    && !nom_status.as_ref().is_ok_and(|status| status.success()))
+                    || feed.is_err()
+                    || screen.is_err()
+                    || logs.is_err();
+                if monitor_failed {
+                    log::warn!(
+                        "{label}: monitor failed ({nom_status:?}); continuing based on Nix result"
+                    );
+                }
+                Ok((nix_status, stdout))
+            }
+            .await;
+            let success = result.as_ref().is_ok_and(|(status, _)| status.success());
+            display::finish(
+                panel,
+                if success && monitor_failed {
+                    "completed; monitor FAILED"
+                } else if success {
+                    "completed"
+                } else {
+                    "FAILED"
+                },
+            );
+            let (status, stdout) = result.map_err(CommandError::RunError)?;
+            if status.success() {
+                Ok(stdout)
+            } else {
+                Err(CommandError::ExitStatus(
+                    status,
+                    format!("{:?}", self.command),
+                ))
+            }
+        })
+        .await
     }
 
     pub async fn run<T: HasCommandError + Debug + fmt::Display>(
