@@ -81,6 +81,47 @@ impl Command {
     pub async fn status<T: HasCommandError + Debug + fmt::Display>(
         &mut self,
     ) -> Result<std::process::ExitStatus, CommandError<T>> {
+        if crate::display::active() {
+            let label = crate::display::command_label(&self.command, &T::title());
+            let panel = crate::display::panel(label.clone());
+            let result = async {
+                let mut child = self
+                    .command
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .kill_on_drop(true)
+                    .spawn()
+                    .map_err(CommandError::RunError)?;
+                let stdout = child.stdout.take().unwrap();
+                let stderr = child.stderr.take().unwrap();
+                let (status, stdout, stderr) = tokio::join!(
+                    child.wait(),
+                    crate::display::stream(&label, stdout),
+                    crate::display::stream(&label, stderr),
+                );
+                let status = status.map_err(CommandError::RunError)?;
+                stdout.map_err(CommandError::RunError)?;
+                stderr.map_err(CommandError::RunError)?;
+                if status.success() {
+                    Ok(status)
+                } else {
+                    Err(CommandError::ExitStatus(
+                        status,
+                        format!("{:?}", self.command),
+                    ))
+                }
+            }
+            .await;
+            crate::display::finish(
+                panel,
+                if result.is_ok() {
+                    "completed"
+                } else {
+                    "FAILED"
+                },
+            );
+            return result;
+        }
         let status = self
             .command
             .status()

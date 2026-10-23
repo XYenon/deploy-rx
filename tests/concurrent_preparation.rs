@@ -11,8 +11,10 @@
 
 use deploy::push::{build_and_push_profiles, PushProfileData};
 use serde_json::json;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::symlink;
+use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -24,6 +26,7 @@ fn main() {
     let fixture = match Path::new(&program).file_name().and_then(|s| s.to_str()) {
         Some("nix") => Some(nix_fixture as fn() -> io::Result<i32>),
         Some("ssh") => Some(ssh_fixture as fn() -> io::Result<i32>),
+        Some("nom") => Some(nom_fixture as fn() -> io::Result<i32>),
         _ => None,
     };
     if let Some(fixture) = fixture {
@@ -39,10 +42,150 @@ fn main() {
     if std::env::args().any(|arg| arg == "--ignored") {
         return;
     }
-    tokio::runtime::Runtime::new()
-        .unwrap()
-        .block_on(concurrent_preparation_preserves_mapping_and_drains_failures());
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    if std::env::var_os("DEPLOY_RX_TEST_NOM").is_some()
+        && std::env::var_os("DEPLOY_RX_TEST_DRV").is_none()
+    {
+        let output = Command::new("nix-instantiate")
+            .args([
+                "--expr",
+                r#"builtins.derivation {
+            name = "display-shared-workload"; system = builtins.currentSystem;
+            builder = "/does-not-exist";
+        }"#,
+            ])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        std::env::set_var(
+            "DEPLOY_RX_TEST_DRV",
+            String::from_utf8(output.stdout).unwrap().trim(),
+        );
+    }
+    if std::env::var_os("DISPLAY_DEMO").is_some() {
+        deploy::init_logger(false, None, &deploy::LoggerType::Deploy).unwrap();
+        runtime.block_on(concurrent_preparation_preserves_mapping_and_drains_failures(true));
+        return;
+    }
+    runtime.block_on(concurrent_preparation_preserves_mapping_and_drains_failures(false));
     println!("concurrent_preparation_preserves_mapping_and_drains_failures: ok (6 scenarios)");
+    if std::env::var_os("DEPLOY_RX_TEST_NOM").is_some() {
+        runtime.block_on(concurrent_preparation_preserves_mapping_and_drains_failures(true));
+        println!("real_nom_preparation: ok (6 scenarios)");
+        for scenario in ["none", "remote"] {
+            real_nom_in_pty(scenario);
+        }
+        for mode in ["early", "hang"] {
+            std::env::set_var("NOM_FAILURE", mode);
+            runtime.block_on(concurrent_preparation_preserves_mapping_and_drains_failures(true));
+            println!("nom_{mode}: ok (Nix result preserved, all children reaped)");
+        }
+    }
+}
+
+fn real_nom_in_pty(scenario: &str) {
+    let (mut master, mut slave) = (-1, -1);
+    let size = libc::winsize {
+        ws_row: 50,
+        ws_col: 120,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    assert_eq!(
+        unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                &size,
+            )
+        },
+        0
+    );
+    let mut master = unsafe { std::fs::File::from_raw_fd(master) };
+    let slave = unsafe { std::fs::File::from_raw_fd(slave) };
+    assert_ne!(
+        unsafe { libc::fcntl(master.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) },
+        -1
+    );
+    assert_ne!(
+        unsafe { libc::fcntl(master.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) },
+        -1
+    );
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .env("DISPLAY_DEMO", scenario)
+        .env("RUST_LOG", "info")
+        .stdin(Stdio::null())
+        .stdout(slave.try_clone().unwrap())
+        .stderr(slave)
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut terminal = vt100::Parser::new(50, 120, 0);
+    let mut transcript = Vec::new();
+    let mut saw_three_trees = false;
+    let mut buffer = [0; 8192];
+    loop {
+        match master.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(count) => {
+                transcript.extend_from_slice(&buffer[..count]);
+                terminal.process(&buffer[..count]);
+                let screen = terminal.screen().contents();
+                saw_three_trees |= screen.contains("[running] Build local batch")
+                    && screen.lines().any(|line| {
+                        line.starts_with("[running] Build connection") && line.contains("remote-a")
+                    })
+                    && screen.lines().any(|line| {
+                        line.starts_with("[running] Build connection") && line.contains("remote-b")
+                    })
+                    && screen.matches("Dependency Graph").count() >= 3;
+            }
+            Err(error) if error.raw_os_error() == Some(libc::EIO) => break,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(20))
+            }
+            Err(error) => panic!("PTY read failed: {}", error),
+        }
+        if Instant::now() > deadline {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("PTY scenario timed out");
+        }
+    }
+    assert!(child.wait().unwrap().success());
+    let transcript = String::from_utf8_lossy(&transcript);
+    assert!(
+        saw_three_trees,
+        "three independent live nom trees were not visible"
+    );
+    assert!(!transcript.contains("do-not-change-title"));
+    assert!(transcript.contains("[completed] Build"));
+    if scenario == "remote" {
+        assert!(transcript.contains("[FAILED] Build"));
+    }
+    println!("real_nom_pty_{scenario}: ok (three isolated trees, completion and failure states)");
+}
+
+fn nom_fixture() -> io::Result<i32> {
+    if std::env::args().any(|arg| arg == "--json") {
+        record_pid(&format!("nom.{}", std::process::id()))?;
+        match std::env::var("NOM_FAILURE").as_deref() {
+            Ok("early") => return Ok(73),
+            Ok("hang") => {
+                io::stdin().read_to_end(&mut Vec::new())?;
+                std::thread::sleep(Duration::from_secs(60));
+                return Ok(74);
+            }
+            _ => (),
+        }
+    }
+    Err(
+        Command::new(std::env::var_os("DEPLOY_RX_TEST_NOM").unwrap())
+            .args(std::env::args_os().skip(1))
+            .exec(),
+    )
 }
 
 fn append_line(path: &str, line: &str) -> io::Result<()> {
@@ -59,7 +202,14 @@ fn event(name: &str) -> io::Result<()> {
 }
 
 fn wait_for(name: &str) -> io::Result<()> {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    // The injected hung monitor deliberately consumes the production EOF
+    // timeout before local copies start. Keep that test's barrier longer.
+    let deadline = Instant::now()
+        + Duration::from_secs(if std::env::var_os("NOM_FAILURE").is_some() {
+            20
+        } else {
+            5
+        });
     while !Path::new(name).exists() {
         if Instant::now() >= deadline {
             return Err(io::Error::new(
@@ -130,6 +280,22 @@ fn nix_fixture() -> io::Result<i32> {
         std::fs::write(format!("build.{name}.args"), args.join("\n"))?;
         event(&format!("build.{name}.start"))?;
         eprintln!("streamed build {name}");
+        let monitored = has("internal-json");
+        let activity = u64::from(std::process::id()) << 32;
+        if monitored {
+            // Identical drv path across independent hosts is deliberate: a
+            // merged nom session would conflate these builds.
+            eprintln!(
+                "@nix {}",
+                json!({"action":"start", "id":activity, "level":3,
+                "type":105, "text":"building shared-workload", "fields":[
+                    std::env::var("DEPLOY_RX_TEST_DRV").unwrap(), "", 1, 1
+                ], "parent":0})
+            );
+            for index in 0..200 {
+                eprintln!("ordinary {name} diagnostic {index}: 中文 λ \u{1b}]0;do-not-change-title\u{7}ok");
+            }
+        }
         if failure == "none" {
             match name {
                 "a1" => {
@@ -140,13 +306,31 @@ fn nix_fixture() -> io::Result<i32> {
                 _ => (),
             }
         }
-        std::thread::sleep(Duration::from_millis(if name == "b" { 300 } else { 100 }));
+        let scale = if std::env::var_os("DISPLAY_DEMO").is_some() {
+            15
+        } else if monitored {
+            4
+        } else {
+            1
+        };
+        std::thread::sleep(Duration::from_millis(
+            scale * if name == "b" { 300 } else { 100 },
+        ));
         event(&format!("build.{name}.end"))?;
         if matches!(
             (failure.as_str(), name),
             ("remote", "a1") | ("local", "local")
         ) {
+            if monitored {
+                eprintln!(
+                    "@nix {}",
+                    json!({"action":"msg", "level":0, "msg":format!("error: {name} build failed")})
+                );
+            }
             return Ok(42);
+        }
+        if monitored {
+            eprintln!("@nix {}", json!({"action":"stop", "id":activity}));
         }
         print_file(&format!("result.{name}.json"))?;
     } else if has("copy") {
@@ -166,10 +350,17 @@ fn nix_fixture() -> io::Result<i32> {
             std::env::var("NIX_SSHOPTS").unwrap(),
         )?;
         event(&format!("copy.{name}.start"))?;
+        eprintln!("copy {name}: transferring closures");
         if failure == "none" && name == "local" {
             wait_for("copy.other.start")?;
         }
-        std::thread::sleep(Duration::from_millis(100));
+        std::thread::sleep(Duration::from_millis(
+            if std::env::var_os("DISPLAY_DEMO").is_some() {
+                1500
+            } else {
+                100
+            },
+        ));
         event(&format!("copy.{name}.end"))?;
         if failure == "copy" && name == "local" {
             return Ok(44);
@@ -202,7 +393,7 @@ fn before(events: &str, first: &str, second: &str) {
     assert!(a < b, "expected {} before {}:\n{}", first, second, events);
 }
 
-async fn concurrent_preparation_preserves_mapping_and_drains_failures() {
+async fn concurrent_preparation_preserves_mapping_and_drains_failures(build_tree: bool) {
     // One test owns this process's PATH; child CLI runs get isolated environments.
     let root = tempfile::tempdir().unwrap();
     let bin = root.path().join("bin");
@@ -210,6 +401,9 @@ async fn concurrent_preparation_preserves_mapping_and_drains_failures() {
     let executable = std::env::current_exe().unwrap();
     symlink(&executable, bin.join("nix")).unwrap();
     symlink(&executable, bin.join("ssh")).unwrap();
+    if build_tree {
+        symlink(&executable, bin.join("nom")).unwrap();
+    }
     let original_path = std::env::var_os("PATH").unwrap();
     let path = std::env::join_paths(
         std::iter::once(bin.clone()).chain(std::env::split_paths(&original_path)),
@@ -219,6 +413,14 @@ async fn concurrent_preparation_preserves_mapping_and_drains_failures() {
     std::env::remove_var("LOCAL_KEY");
 
     for failure in ["none", "resolve", "remote", "local", "check", "copy"] {
+        if let Ok(scenario) = std::env::var("DISPLAY_DEMO") {
+            if failure != scenario {
+                continue;
+            }
+        }
+        if std::env::var_os("NOM_FAILURE").is_some() && failure != "none" {
+            continue;
+        }
         let fixture = root.path().join(failure);
         std::fs::create_dir(&fixture).unwrap();
         std::env::set_var("FIXTURE", &fixture);
@@ -348,7 +550,7 @@ async fn concurrent_preparation_preserves_mapping_and_drains_failures() {
                 keep_result: false,
                 result_path: None,
                 extra_build_args: &[],
-                build_tree: false,
+                build_tree,
             })
             .collect();
         let expected_closures = vec![
@@ -360,8 +562,15 @@ async fn concurrent_preparation_preserves_mapping_and_drains_failures() {
             local.display().to_string(),
             shared.display().to_string(),
         ];
-        if failure == "none" {
-            let closures = build_and_push_profiles(&datas).await.unwrap();
+        if failure == "none" || std::env::var_os("DISPLAY_DEMO").is_some() {
+            let result = build_and_push_profiles(&datas).await;
+            if failure != "none" {
+                assert!(result.is_err());
+                log::error!("Preparation failed: {}", result.unwrap_err());
+                assert_reaped(&fixture);
+                continue;
+            }
+            let closures = result.unwrap();
             assert_eq!(closures, expected_closures);
             let events = std::fs::read_to_string(fixture.join("events")).unwrap();
             before(&events, "build.b.start", "build.a1.end");
@@ -399,12 +608,15 @@ async fn concurrent_preparation_preserves_mapping_and_drains_failures() {
                 ["-o", "ProxyCommand=ssh jump host -W %h:%p"]
             );
         } else {
-            let output = Command::new(env!("CARGO_BIN_EXE_deploy"))
+            let mut command = Command::new(env!("CARGO_BIN_EXE_deploy"));
+            if !build_tree {
+                command.arg("--no-build-tree");
+            }
+            let output = command
                 // Nix builders set RUST_LOG="", which disables the logs asserted below.
                 .env("RUST_LOG", "info")
                 .args([
                     "--skip-checks",
-                    "--no-build-tree",
                     "--no-review-changes",
                     "--no-ssh-multiplexing",
                     "--tag",
@@ -443,19 +655,35 @@ async fn concurrent_preparation_preserves_mapping_and_drains_failures() {
             if failure == "remote" || failure == "check" {
                 assert!(!events.contains("build.a2.start"), "{}", events);
             }
-        }
-        // Every recorded Nix process must have been reaped before returning.
-        for entry in std::fs::read_dir(&fixture).unwrap() {
-            let entry = entry.unwrap();
-            if entry.file_name().to_string_lossy().starts_with("pid.") {
-                let pid: i32 = std::fs::read_to_string(entry.path())
-                    .unwrap()
-                    .trim()
-                    .parse()
-                    .unwrap();
-                assert_eq!(unsafe { libc::kill(pid, 0) }, -1, "child {pid} still alive");
+            if build_tree {
+                assert!(
+                    !output.stderr.contains(&0x1b),
+                    "non-TTY output contains terminal controls"
+                );
+                if failure != "resolve" {
+                    assert!(stderr.contains("Build local batch"), "{}", stderr);
+                    assert!(stderr.contains("ssh-ng://root@remote-b"), "{}", stderr);
+                    assert!(stderr.contains("[completed] Build"), "{}", stderr);
+                    assert!(!stderr.contains("monitor failed"), "{}", stderr);
+                }
             }
         }
+        assert_reaped(&fixture);
     }
     std::env::set_var("PATH", original_path);
+}
+
+fn assert_reaped(fixture: &Path) {
+    // Every recorded Nix and nom process must be reaped before returning.
+    for entry in std::fs::read_dir(fixture).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_name().to_string_lossy().starts_with("pid.") {
+            let pid: i32 = std::fs::read_to_string(entry.path())
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            assert_eq!(unsafe { libc::kill(pid, 0) }, -1, "child {pid} still alive");
+        }
+    }
 }

@@ -65,11 +65,13 @@ First-class support for deploying [system-manager](https://github.com/numtide/sy
 
 Builds on different SSH connections run concurrently with the local batch. Copies can overlap builds on other connections, while work on the same connection runs in order. Profiles activate in deployment order after all builds, checks, signing, and copies succeed. If preparation fails, other started work finishes before the command returns an error.
 
+With build-tree visualization enabled, each build has an independent `nom` tree. A shared display labels local builds and remote connections, and shows completion or failure for each task. The display cycles through pages when the terminal cannot show all running tasks. Ordinary build and copy logs appear above the trees with their source labels. Redirected output contains plain text logs and the final trees without terminal control sequences.
+
 For the NixOS system profile, `--test` changes the running system while preserving the system profile and boot default. If a later switch fails, rollback restores the previous boot configuration and the previous running system independently.
 
 ### Logs
 
-Application messages use `[deploy LEVEL]`, `[activate LEVEL]`, or `[revoke LEVEL]` on each line. Non-interactive deployments show a short target summary; interactive deployments still show the full preview for confirmation. Remote stderr is labeled `[node.profile remote]` by default, so output from different deployment targets can be distinguished. Nix, `nom`, and diff output retain their native formatting. Use `--no-demarcate-output` to leave remote stderr unchanged, `--debug-logs` for debug messages on the terminal, and `--log-dir DIR` to save application logs (including remote activation logs) while keeping normal terminal output concise.
+Application messages use `[deploy LEVEL]`, `[activate LEVEL]`, or `[revoke LEVEL]` on each line. Non-interactive deployments show a short target summary; interactive deployments still show the full preview for confirmation. Remote stderr is labeled `[node.profile remote]` by default, so output from different deployment targets can be distinguished. During build-tree visualization, Nix logs and `nom` trees use the shared display described above. Diff output retains its native formatting. Use `--no-demarcate-output` to leave remote stderr unchanged, `--debug-logs` for debug messages on the terminal, and `--log-dir DIR` to save application logs (including remote activation logs) while keeping normal terminal output concise.
 
 Remote terminal output uses a bounded buffer and may be dropped if the connection stops consuming stderr. This keeps activation deadlines and rollback independent of log delivery. Application logs saved with `--log-dir` are still written to their files.
 

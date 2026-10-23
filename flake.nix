@@ -39,6 +39,9 @@
           cargoLock.lockFile = ./Cargo.lock;
 
           nativeBuildInputs = [ final.makeWrapper ];
+          nativeCheckInputs = [ final.nix-output-monitor ];
+          DEPLOY_RX_TEST_NOM = "${final.nix-output-monitor}/bin/nom";
+          DEPLOY_RX_TEST_DRV = (final.runCommand "display-shared-workload" { } "touch $out").drvPath;
 
           postFixup = ''
             wrapProgram "$out/bin/deploy" \

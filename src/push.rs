@@ -5,7 +5,6 @@
 use log::{debug, info, warn};
 use rnix::ast::{self, HasEntry};
 use std::collections::HashMap;
-use std::convert::TryInto;
 use std::ffi::OsStr;
 use std::path::Path;
 use std::process::Stdio;
@@ -13,7 +12,7 @@ use thiserror::Error;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
-use crate::command;
+use crate::{command, display};
 
 #[derive(Error, Debug)]
 pub enum ShowDerivationError {
@@ -172,6 +171,17 @@ async fn command_exists(command: &str, path: Option<&OsStr>) -> std::io::Result<
 }
 
 async fn run_build_command(
+    build_command: Command,
+    build_tree: bool,
+) -> Result<Vec<u8>, PushProfileError> {
+    display::run(
+        build_tree,
+        run_build_command_inner(build_command, build_tree),
+    )
+    .await
+}
+
+async fn run_build_command_inner(
     mut build_command: Command,
     build_tree: bool,
 ) -> Result<Vec<u8>, PushProfileError> {
@@ -192,6 +202,12 @@ async fn run_build_command(
                 "Build tree visualization requested but `nom` is not available in PATH; falling back to regular build logs"
             );
         } else {
+            let label = display::command_label(&build_command, "Build");
+            let panel = display::panel(label.clone());
+            let mut monitor_failed = false;
+            let result = async {
+            let (terminal, nom_stderr) = display::nom_terminal(panel)
+                .map_err(|error| PushProfileError::Build(command::CommandError::RunError(error)))?;
             build_command
                 .arg("--log-format")
                 .arg("internal-json")
@@ -199,6 +215,7 @@ async fn run_build_command(
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
 
+            let command_debug = format!("{build_command:?}");
             let mut nix_child = build_command
                 .kill_on_drop(true)
                 .spawn()
@@ -209,18 +226,16 @@ async fn run_build_command(
             if let Some(path) = path {
                 nom_command.env("PATH", path);
             }
-            // Connect the pipe directly: no detached blocking task or reader
-            // thread can outlive this future, including when nom fails to spawn.
-            let start_nom = (|| -> std::io::Result<_> {
-                let stdin: Stdio = nix_stderr.try_into()?;
-                nom_command
+            let start_nom = nom_command
                     .arg("--json")
-                    .stdin(stdin)
-                    .stdout(Stdio::inherit())
-                    .stderr(Stdio::inherit())
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(nom_stderr)
                     .kill_on_drop(true)
-                    .spawn()
-            })();
+                    .spawn();
+            // Command retains explicitly configured Stdio across spawns.
+            // Release its slave descriptor so nom's exit produces PTY EOF.
+            drop(nom_command);
             let mut nom_child = match start_nom {
                 Ok(child) => child,
                 Err(err) => {
@@ -230,39 +245,105 @@ async fn run_build_command(
                     )));
                 }
             };
+            let nom_stdin = nom_child.stdin.take().unwrap();
+            let nom_stdout = nom_child.stdout.take().unwrap();
             let mut stdout = Vec::new();
-            let (nix_status, nom_status, read_result) = tokio::join!(
+            let monitor = async {
+                // Keep draining Nix even if nom exits early. A display failure
+                // must neither block Nix on a full pipe nor give it SIGPIPE.
+                let feed = display::feed_nom(&label, nix_stderr, nom_stdin).await;
+                let status = match tokio::time::timeout(std::time::Duration::from_secs(5), nom_child.wait()).await {
+                    Ok(status) => status,
+                    Err(_) => {
+                        let _ = nom_child.kill().await;
+                        Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "nom did not exit after EOF"))
+                    }
+                };
+                (feed, status)
+            };
+            let (nix_status, (feed, nom_status), read_result, screen_result, log_result) = tokio::join!(
                 nix_child.wait(),
-                nom_child.wait(),
+                monitor,
                 nix_stdout.read_to_end(&mut stdout),
+                display::read_nom(panel, terminal),
+                display::stream(&label, nom_stdout),
             );
             // All children and pipe reads have settled before propagating errors.
             let nix_status = nix_status
                 .map_err(|err| PushProfileError::Build(command::CommandError::RunError(err)))?;
-            let nom_status = nom_status
-                .map_err(|err| PushProfileError::Build(command::CommandError::RunError(err)))?;
             read_result
                 .map_err(|err| PushProfileError::Build(command::CommandError::RunError(err)))?;
 
-            if nom_status.code() != Some(0) {
+            // nom itself returns 1 when Nix reports a build error. That is a
+            // successful error display, not an independent monitor failure.
+            if (nix_status.success() && !nom_status.as_ref().is_ok_and(|status| status.success())) || feed.is_err() || screen_result.is_err() || log_result.is_err() {
+                monitor_failed = true;
                 warn!(
-                    "`nom` exited with status {:?}; continuing based on Nix build result",
-                    nom_status.code()
+                    "{label}: monitor failed ({nom_status:?}); continuing based on Nix build result"
                 );
             }
 
-            return match nix_status.code() {
-                Some(0) => Ok(stdout),
-                a => Err(PushProfileError::Build(command::CommandError::RunError(
-                    std::io::Error::other(format!(
-                        "Nix build command resulted in a bad exit code: {:?}",
-                        a
-                    )),
-                ))),
-            };
+            if nix_status.success() { Ok(stdout) } else {
+                Err(PushProfileError::Build(command::CommandError::ExitStatus(nix_status, command_debug)))
+            }
+            }.await;
+            // Nix's outcome always wins over a monitor error.
+            display::finish(
+                panel,
+                if result.is_ok() && monitor_failed {
+                    "completed; monitor FAILED"
+                } else if result.is_ok() {
+                    "completed"
+                } else {
+                    "FAILED"
+                },
+            );
+            return result;
         }
     }
 
+    if display::active() {
+        let label = display::command_label(&build_command, "Build");
+        let panel = display::panel(label.clone());
+        let command_debug = format!("{build_command:?}");
+        let result = async {
+            let mut child = build_command
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()?;
+            let mut output = Vec::new();
+            let mut stdout = child.stdout.take().unwrap();
+            let stderr = child.stderr.take().unwrap();
+            let (status, read, logs) = tokio::join!(
+                child.wait(),
+                stdout.read_to_end(&mut output),
+                display::stream(&label, stderr),
+            );
+            read?;
+            logs?;
+            Ok::<_, std::io::Error>((status?, output))
+        }
+        .await
+        .map_err(|error| PushProfileError::Build(command::CommandError::RunError(error)));
+        display::finish(
+            panel,
+            if result.as_ref().is_ok_and(|(status, _)| status.success()) {
+                "completed"
+            } else {
+                "FAILED"
+            },
+        );
+        let (status, stdout) = result?;
+        return if status.success() {
+            Ok(stdout)
+        } else {
+            Err(PushProfileError::Build(command::CommandError::ExitStatus(
+                status,
+                command_debug,
+            )))
+        };
+    }
     build_command
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit());
@@ -1180,6 +1261,17 @@ pub async fn build_and_push_profiles(
 type Connections = HashMap<(String, String), tokio::sync::Mutex<()>>;
 
 async fn build_profiles_inner(
+    datas: &[PushProfileData<'_>],
+    push: bool,
+) -> Result<Vec<String>, PushProfileError> {
+    display::run(
+        datas.iter().any(|data| data.build_tree),
+        prepare_profiles(datas, push),
+    )
+    .await
+}
+
+async fn prepare_profiles(
     datas: &[PushProfileData<'_>],
     push: bool,
 ) -> Result<Vec<String>, PushProfileError> {
