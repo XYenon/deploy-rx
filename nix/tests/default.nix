@@ -340,44 +340,44 @@ in {
     scenarioScript = ''
       with subtest("dry-activate-selects-dry-script"):
         server.succeed("rm -rf /tmp/mode-select /home/deploy/.local/state/nix/profiles/mode-aware")
-        work("deploy -s --no-build-tree --no-review-changes --dry-activate .#mode-aware -- --offline > /tmp/dry-activate.out 2>&1", timeout=600)
+        work("deploy -s --build-tree false --review-changes false --dry-activate .#mode-aware -- --offline > /tmp/dry-activate.out 2>&1", timeout=600)
         server.succeed("grep -Fx dry /tmp/mode-select/result")
         server.succeed("test ! -e /home/deploy/.local/state/nix/profiles/mode-aware")
         client_sh("grep -F 'Dry activation completed for `mode-aware.app`' /tmp/dry-activate.out")
 
       with subtest("boot-selects-boot-script"):
         server.succeed("rm -rf /tmp/mode-select /home/deploy/.local/state/nix/profiles/mode-aware")
-        work("deploy -s --no-build-tree --no-review-changes --boot .#mode-aware -- --offline > /tmp/boot.out 2>&1", timeout=600)
+        work("deploy -s --build-tree false --review-changes false --boot .#mode-aware -- --offline > /tmp/boot.out 2>&1", timeout=600)
         server.succeed("grep -Fx boot /tmp/mode-select/result")
         server.succeed("test -L /home/deploy/.local/state/nix/profiles/mode-aware")
         client_sh("grep -F 'Next-boot activation prepared for `mode-aware.app`' /tmp/boot.out")
 
       with subtest("test-selects-test-script"):
         server.succeed("rm -rf /tmp/mode-select /home/deploy/.local/state/nix/profiles/mode-aware")
-        work("deploy -s --no-build-tree --no-review-changes --test .#mode-aware -- --offline > /tmp/test.out 2>&1", timeout=600)
+        work("deploy -s --build-tree false --review-changes false --test .#mode-aware -- --offline > /tmp/test.out 2>&1", timeout=600)
         server.succeed("grep -Fx test /tmp/mode-select/result")
         server.succeed("test -L /home/deploy/.local/state/nix/profiles/mode-aware")
         client_sh("grep -F 'Test activation completed for `mode-aware.app`' /tmp/test.out")
 
       with subtest("system-manager-profile"):
         server.succeed("rm -rf /tmp/system-manager && mkdir -p /nix/var/nix/profiles/system-manager-profiles")
-        work("deploy -s --no-build-tree --no-review-changes .#system-manager-target -- --offline", timeout=600)
+        work("deploy -s --build-tree false --review-changes false .#system-manager-target -- --offline", timeout=600)
         server.succeed("grep -Fx activated /tmp/system-manager/state")
         server.succeed("test -L /nix/var/nix/profiles/system-manager-profiles/system-manager")
         server.succeed("test -x /nix/var/nix/profiles/system-manager-profiles/system-manager/bin/activate")
 
       with subtest("inherited-tags-and-profile-order"):
         server.succeed("rm -rf /tmp/tag-select")
-        work("deploy -s --no-build-tree --no-review-changes --tag test-fleet --tag edge --tag observability --tag prod --tag edge . -- --offline", timeout=600)
+        work("deploy -s --build-tree false --review-changes false --tag test-fleet --tag edge --tag observability --tag prod --tag edge . -- --offline", timeout=600)
         assert server.succeed("cat /tmp/tag-select/order.log").splitlines() == ["metrics", "logs"]
         server.succeed("test ! -e /tmp/tag-select/traces && test ! -e /tmp/tag-select/api")
 
       with subtest("inherited-tags-explicit-profile"):
-        work("deploy -s --no-build-tree --no-review-changes --tag test-fleet --tag edge --tag prod .#tagged.metrics -- --offline", timeout=600)
+        work("deploy -s --build-tree false --review-changes false --tag test-fleet --tag edge --tag prod .#tagged.metrics -- --offline", timeout=600)
         assert server.succeed("cat /tmp/tag-select/order.log").splitlines() == ["metrics", "logs", "metrics"]
 
       with subtest("inherited-tags-zero-matches-is-an-error"):
-        work_fail("deploy -s --no-build-tree --no-review-changes --tag test-fleet --tag edge --tag prod .#tagged.traces -- --offline > /tmp/tag-no-match.out 2>&1", timeout=600)
+        work_fail("deploy -s --build-tree false --review-changes false --tag test-fleet --tag edge --tag prod .#tagged.traces -- --offline > /tmp/tag-no-match.out 2>&1", timeout=600)
         client_sh("grep -F 'No profiles matched the requested tags' /tmp/tag-no-match.out")
         server.succeed("test ! -e /tmp/tag-select/traces")
     '';
@@ -388,27 +388,27 @@ in {
     scenarioScript = ''
       with subtest("activation-failure-rolls-back"):
         server.succeed("rm -rf /tmp/activation")
-        work("deploy -s --no-build-tree --no-review-changes .#activation-baseline -- --offline", timeout=600)
+        work("deploy -s --build-tree false --review-changes false .#activation-baseline -- --offline", timeout=600)
         server.succeed("grep -Fx baseline /tmp/activation/version")
-        work_fail("deploy -s --no-build-tree --no-review-changes .#activation-fail -- --offline > /tmp/activation-fail.out 2>&1", timeout=600)
+        work_fail("deploy -s --build-tree false --review-changes false .#activation-fail -- --offline > /tmp/activation-fail.out 2>&1", timeout=600)
         server.succeed("grep -Fx baseline /tmp/activation/version")
 
       with subtest("multi-target-rollback-succeeded"):
         server.succeed("rm -rf /tmp/multi-rollback")
-        work("deploy -s --no-build-tree --no-review-changes .#multi-rollback-baseline -- --offline", timeout=600)
+        work("deploy -s --build-tree false --review-changes false .#multi-rollback-baseline -- --offline", timeout=600)
         server.succeed("grep -Fx baseline /tmp/multi-rollback/app")
         server.succeed("grep -Fx baseline /tmp/multi-rollback/bad")
-        work_fail("deploy -s --no-build-tree --no-review-changes --targets .#multi-rollback-ok .#multi-rollback-fail -- --offline > /tmp/multi-rollback.out 2>&1", timeout=600)
+        work_fail("deploy -s --build-tree false --review-changes false --targets .#multi-rollback-ok .#multi-rollback-fail -- --offline > /tmp/multi-rollback.out 2>&1", timeout=600)
         client_sh("grep -F 'Revoking 1 previously deployed profile(s)' /tmp/multi-rollback.out")
         server.succeed("grep -Fx baseline /tmp/multi-rollback/app")
         server.succeed("grep -Fx baseline /tmp/multi-rollback/bad")
 
       with subtest("review-changes-on-off"):
         server.succeed("rm -rf /tmp/review")
-        work("deploy -s --no-build-tree --no-review-changes .#review-baseline -- --offline", timeout=600)
-        work("deploy -s --no-build-tree .#review-a -- --offline > /tmp/review-on.out 2>&1", timeout=600)
+        work("deploy -s --build-tree false --review-changes false .#review-baseline -- --offline", timeout=600)
+        work("deploy -s --build-tree false .#review-a -- --offline > /tmp/review-on.out 2>&1", timeout=600)
         client_sh("grep -F 'Derivation changes for ' /tmp/review-on.out")
-        work("deploy -s --no-build-tree --no-review-changes .#review-b -- --offline > /tmp/review-off.out 2>&1", timeout=600)
+        work("deploy -s --build-tree false --review-changes false .#review-b -- --offline > /tmp/review-off.out 2>&1", timeout=600)
         client_fail("grep -F 'Derivation changes for ' /tmp/review-off.out")
         server.succeed("grep -Fx b /tmp/review/version")
     '';
@@ -423,17 +423,17 @@ in {
         server2.succeed("rm -rf /tmp/multi-host")
         client_fail("ssh -o ConnectTimeout=5 -o ConnectionAttempts=1 -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no server2 true", timeout=10)
         client_sh("ssh -p 2222 -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no server2 true", timeout=30)
-        work("deploy -s --no-build-tree --no-review-changes --targets .#multi-host-a-updated .#multi-host-b-updated -- --offline", timeout=600)
+        work("deploy -s --build-tree false --review-changes false --targets .#multi-host-a-updated .#multi-host-b-updated -- --offline", timeout=600)
         server.succeed("grep -Fx updated /tmp/multi-host/a")
         server2.succeed("grep -Fx updated /tmp/multi-host/b")
 
       with subtest("multi-host-rollback-succeeded"):
         server.succeed("rm -rf /tmp/multi-host")
         server2.succeed("rm -rf /tmp/multi-host")
-        work("deploy -s --no-build-tree --no-review-changes --targets .#multi-host-a-baseline .#multi-host-b-baseline -- --offline", timeout=600)
+        work("deploy -s --build-tree false --review-changes false --targets .#multi-host-a-baseline .#multi-host-b-baseline -- --offline", timeout=600)
         server.succeed("grep -Fx baseline /tmp/multi-host/a")
         server2.succeed("grep -Fx baseline /tmp/multi-host/b")
-        work_fail("deploy -s --no-build-tree --no-review-changes --targets .#multi-host-a-updated .#multi-host-b-fail -- --offline > /tmp/multi-host-rollback.out 2>&1", timeout=600)
+        work_fail("deploy -s --build-tree false --review-changes false --targets .#multi-host-a-updated .#multi-host-b-fail -- --offline > /tmp/multi-host-rollback.out 2>&1", timeout=600)
         client_sh("grep -F 'Revoking 1 previously deployed profile(s)' /tmp/multi-host-rollback.out")
         server.succeed("grep -Fx baseline /tmp/multi-host/a")
         server2.succeed("grep -Fx baseline /tmp/multi-host/b")
@@ -445,7 +445,7 @@ in {
     scenarioScript = ''
       with subtest("ssh-multiplexing-reuse"):
         install_wrapper("ssh", ssh_wrapper_source)
-        work("PATH=/tmp/wrappers:$PATH deploy -s --no-build-tree --no-review-changes .#multiplex -- --offline > /tmp/ssh-multiplexing.out 2>&1", timeout=600)
+        work("PATH=/tmp/wrappers:$PATH deploy -s --build-tree false --review-changes false .#multiplex -- --offline > /tmp/ssh-multiplexing.out 2>&1", timeout=600)
         server.succeed("grep -Fx first /tmp/multiplex/first")
         server.succeed("grep -Fx second /tmp/multiplex/second")
         ssh_commands = [line.split() for line in client_sh("cat /tmp/deploy-rx-e2e/ssh.log").splitlines()]
@@ -459,12 +459,12 @@ in {
         assert set(shared_sockets) == {socket}, ssh_commands
         assert any(f"ControlPath={socket}" in args and "-O" in args and "exit" in args for args in ssh_commands), ssh_commands
 
-      with subtest("no-ssh-multiplexing"):
+      with subtest("ssh-multiplexing-disabled"):
         reset_logs()
         install_wrapper("deploy", deploy_wrapper_source)
         install_wrapper("ssh", ssh_wrapper_source)
         server.succeed("rm -rf /tmp/multiplex /home/deploy/.local/state/nix/profiles/multiplex-first* /home/deploy/.local/state/nix/profiles/multiplex-second*")
-        work("PATH=/tmp/wrappers:$PATH deploy -s --no-build-tree --no-review-changes --no-ssh-multiplexing .#multiplex -- --offline > /tmp/no-ssh-multiplexing.out 2>&1", timeout=600)
+        work("PATH=/tmp/wrappers:$PATH deploy -s --build-tree false --review-changes false --ssh-multiplexing false .#multiplex -- --offline > /tmp/no-ssh-multiplexing.out 2>&1", timeout=600)
         server.succeed("grep -Fx first /tmp/multiplex/first")
         server.succeed("grep -Fx second /tmp/multiplex/second")
         ssh_commands = [line.split() for line in client_sh("cat /tmp/deploy-rx-e2e/ssh.log").splitlines()]
@@ -478,7 +478,7 @@ in {
     name = "ssh-rollback";
     scenarioScript = ''
       with subtest("magic-rollback-default"):
-        work_fail("deploy -s --no-build-tree --no-review-changes .#broken-ssh -- --offline > /tmp/broken-ssh.out 2>&1", timeout=900)
+        work_fail("deploy -s --build-tree false --review-changes false .#broken-ssh -- --offline > /tmp/broken-ssh.out 2>&1", timeout=900)
         client_sh("sed -n '1,200p' /tmp/broken-ssh.out >&2 || true")
         server.succeed("ss -tlnp | sed -n '1,200p' >&2 || true")
         server.wait_for_open_port(22, timeout=60)
@@ -486,7 +486,7 @@ in {
         client_fail("ssh -p 2222 -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no server true", timeout=30)
 
       with subtest("rollback-fresh-connection-toggle"):
-        work("deploy -s --no-build-tree --no-review-changes --no-rollback-fresh-connection .#broken-ssh -- --offline > /tmp/no-fresh-connection.out 2>&1", timeout=900)
+        work("deploy -s --build-tree false --review-changes false --rollback-fresh-connection false .#broken-ssh -- --offline > /tmp/no-fresh-connection.out 2>&1", timeout=900)
         server.wait_for_open_port(2222)
         client_fail("ssh -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no server true", timeout=30)
         client_sh("ssh -p 2222 -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no server true", timeout=30)
