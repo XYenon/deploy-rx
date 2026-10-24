@@ -91,16 +91,21 @@ impl Display {
         let rows =
             ((height as usize).saturating_sub(headers + 2) / live_trees.max(1)).max(2) as u16;
         if self.interactive && !final_frame {
-            writeln!(
-                out,
+            let header = format!(
                 "Preparation: {} tasks | page {}/{}",
                 self.panels.len(),
                 page + 1,
                 page_count
-            )?;
+            );
+            // Keep the header on one physical line, as counted by `drawn`.
+            writeln!(out, "{header:.width$}", width = usize::from(cols))?;
             self.drawn += 1;
         }
         for (index, panel) in self.panels.iter_mut().enumerate() {
+            // Finished panels were already committed with their final tree.
+            if final_frame && panel.state != "interrupted" {
+                continue;
+            }
             if !final_frame && !visible.contains(&index) {
                 continue;
             }
@@ -152,8 +157,12 @@ impl Display {
             if !final_frame && panel.state != "running" {
                 continue;
             }
-            let content = panel.screen.screen().contents();
-            let lines: Vec<_> = content.lines().collect();
+            // contents() joins wrapped rows into logical lines; redraws must
+            // count and emit the physical rows that the terminal displays.
+            let mut lines: Vec<_> = panel.screen.screen().rows(0, cols).collect();
+            while lines.last().is_some_and(String::is_empty) {
+                lines.pop();
+            }
             for line in lines.iter().skip(lines.len().saturating_sub(rows as usize)) {
                 writeln!(out, "{line}")?;
             }
@@ -311,6 +320,10 @@ pub(crate) fn finish(id: usize, result: &str) {
         let mut out = io::stderr().lock();
         let _ = display.clear(&mut out);
         let _ = writeln!(out, "[{result}] {}", display.panels[id].label);
+        let content = display.panels[id].screen.screen().contents();
+        if !content.is_empty() {
+            let _ = writeln!(out, "{content}");
+        }
     }
 }
 
@@ -433,7 +446,11 @@ pub(crate) async fn feed_nom(
             serde_json::from_slice::<serde_json::Value>(json)
                 .ok()
                 .and_then(|value| match value["action"].as_str() {
-                    Some("msg") => value["msg"].as_str().map(str::to_owned),
+                    // --verbose supplies nom's activity events, but its
+                    // talkative evaluation messages are not ordinary logs.
+                    Some("msg") if value["level"].as_u64().is_none_or(|level| level <= 3) => {
+                        value["msg"].as_str().map(str::to_owned)
+                    }
                     Some("result") if value["type"] == 101 => {
                         value["fields"][0].as_str().map(str::to_owned)
                     }
