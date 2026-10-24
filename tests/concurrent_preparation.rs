@@ -69,6 +69,7 @@ fn main() {
         return;
     }
     cli_checks_monitor_lifecycle();
+    cli_check_terminal_redraw();
     cli_many_monitored_profiles();
     runtime.block_on(concurrent_preparation_preserves_mapping_and_drains_failures(false));
     cli_activation_and_connection_identity(false);
@@ -260,10 +261,15 @@ fn nom_fixture() -> io::Result<i32> {
     }
     if std::env::args().any(|arg| arg == "--json") {
         record_pid(&format!("nom.{}", std::process::id()))?;
+        if std::env::var_os("CHECK_DISPLAY").is_some() {
+            // Force physical wrapping inside nom's private terminal.
+            eprintln!("{}", "wrapped-tree-content-".repeat(4));
+        }
         if std::env::var_os("RESOURCE_CASE").is_some()
             || std::env::var("NOM_FAILURE").as_deref() == Ok("consume")
         {
             io::stdin().read_to_end(&mut Vec::new())?;
+            eprintln!("monitor final tree");
             return Ok(0);
         }
         match std::env::var("NOM_FAILURE").as_deref() {
@@ -344,6 +350,26 @@ fn nix_fixture() -> io::Result<i32> {
         // More than a pipe's capacity: a monitor that never reads must trigger
         // the write timeout, not just the post-EOF wait timeout.
         flood_monitor()?;
+        for (level, message) in [
+            (0, "check error diagnostic"),
+            (1, "check warning diagnostic"),
+            (3, "check info diagnostic"),
+            (4, "evaluating file 'check-fixture.nix'"),
+            (5, "check debug diagnostic"),
+        ] {
+            eprintln!(
+                "@nix {}",
+                json!({"action":"msg", "level":level, "msg":message})
+            );
+        }
+        eprintln!(
+            "@nix {}",
+            json!({"action":"result", "type":101, "fields":["check builder diagnostic"]})
+        );
+        eprintln!("check ordinary diagnostic");
+        if std::env::var_os("CHECK_DISPLAY").is_some() {
+            std::thread::sleep(Duration::from_millis(500));
+        }
         println!("discarded check stdout");
         event("check.end")?;
         return Ok(if failure == "flake-check" { 42 } else { 0 });
@@ -702,6 +728,36 @@ fn cli_checks_monitor_lifecycle() {
         );
         assert!(!String::from_utf8_lossy(&output.stdout).contains("discarded check stdout"));
         assert!(!output.stderr.contains(&0x1b));
+        if mode != "spawn" {
+            for message in [
+                "check error diagnostic",
+                "check warning diagnostic",
+                "check info diagnostic",
+                "check builder diagnostic",
+                "check ordinary diagnostic",
+            ] {
+                assert!(stderr.contains(message), "{}", stderr);
+            }
+            assert!(!stderr.contains("evaluating file"), "{}", stderr);
+            assert!(!stderr.contains("check debug diagnostic"), "{}", stderr);
+            let status = if fail_check {
+                "FAILED"
+            } else if mode == "consume" {
+                "completed"
+            } else {
+                "completed; monitor FAILED"
+            };
+            assert_eq!(
+                stderr
+                    .matches(&format!("[{status}] Check local batch"))
+                    .count(),
+                1,
+                "{stderr}"
+            );
+            if mode == "consume" {
+                assert_eq!(stderr.matches("monitor final tree").count(), 1, "{stderr}");
+            }
+        }
         let events = std::fs::read_to_string(root.path().join("events")).unwrap_or_default();
         if mode == "spawn" {
             assert!(events.contains("nom.probe.succeeded"));
@@ -715,6 +771,80 @@ fn cli_checks_monitor_lifecycle() {
         assert_reaped(root.path());
     }
     println!("cli_checks_monitor: ok (Nix outcomes, spawn failure, early exit, EOF hang and input backpressure)");
+}
+
+fn cli_check_terminal_redraw() {
+    for cols in [20, 120] {
+        let root = tempfile::tempdir().unwrap();
+        let bin = fixture_bin(root.path(), &["nix", "nom"]);
+        std::fs::write(root.path().join("deployment.json"), r#"{"nodes":{}}"#).unwrap();
+        let (mut master, mut slave) = (-1, -1);
+        let mut size = libc::winsize {
+            ws_row: 50,
+            ws_col: cols,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        assert_eq!(
+            unsafe {
+                libc::openpty(
+                    &mut master,
+                    &mut slave,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    &raw mut size,
+                )
+            },
+            0
+        );
+        let mut master = unsafe { std::fs::File::from_raw_fd(master) };
+        let slave = unsafe { std::fs::File::from_raw_fd(slave) };
+        let mut child = Command::new(env!("CARGO_BIN_EXE_deploy"))
+            .env("PATH", &bin)
+            .env("FIXTURE", root.path())
+            .env("NOM_FAILURE", "consume")
+            .env("FAIL", "none")
+            .env("CHECK_DISPLAY", "1")
+            .env("RUST_LOG", "info")
+            .args(["--review-changes", "false", "."])
+            .stdin(Stdio::null())
+            .stdout(slave.try_clone().unwrap())
+            .stderr(slave)
+            .spawn()
+            .unwrap();
+        let mut terminal = vt100::Parser::new(
+            NonZeroU16::new(50).unwrap(),
+            NonZeroU16::new(cols).unwrap(),
+            0,
+        );
+        let mut buffer = [0; 8192];
+        let mut frames = 0;
+        loop {
+            match master.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(count) => {
+                    terminal.process(&buffer[..count]);
+                    let screen = terminal.screen().contents();
+                    assert!(
+                        screen.matches("Preparation:").count() <= 1,
+                        "{} columns: {}",
+                        cols,
+                        screen
+                    );
+                    if screen.contains("Preparation:") {
+                        frames += 1;
+                    }
+                }
+                Err(error) if error.raw_os_error() == Some(libc::EIO) => break,
+                Err(error) => panic!("{}", error),
+            }
+        }
+        assert!(child.wait().unwrap().success());
+        assert!(frames >= 2, "not enough live frames at {} columns", cols);
+        assert!(!terminal.screen().contents().contains("Preparation:"));
+        assert_reaped(root.path());
+    }
+    println!("cli_check_terminal: ok (20 and 120 columns, live redraw and final cleanup)");
 }
 
 fn cli_many_monitored_profiles() {
