@@ -4,8 +4,10 @@
 
 //! Exercise the public preparation API and real CLI with controlled subprocesses.
 //! Barriers, rather than elapsed-time assertions, require remote/local builds
-//! and copies to overlap. Reordered JSON, repeated installables and selected
-//! dynamic outputs must still map to the original deployment order. Failures
+//! and copies to overlap in the unmonitored scenarios. Monitor and PTY scenarios
+//! separately check rendering, outcomes and cleanup without cross-phase barriers.
+//! Reordered JSON, repeated installables and selected dynamic outputs must still
+//! map to the original deployment order. Failures
 //! must drain all started children and prevent every activation.
 #![cfg(unix)]
 
@@ -71,8 +73,12 @@ fn main() {
     cli_checks_monitor_lifecycle();
     cli_check_terminal_redraw();
     cli_many_monitored_profiles();
+    // Prove overlap without including monitor shutdown and terminal rendering
+    // in a barrier's deadline. Monitored scenarios retain ordering and cleanup.
+    std::env::set_var("CONCURRENCY_CASE", "1");
     runtime.block_on(concurrent_preparation_preserves_mapping_and_drains_failures(false));
     cli_activation_and_connection_identity(false);
+    std::env::remove_var("CONCURRENCY_CASE");
     println!("concurrent_preparation: ok (8 preparation scenarios, signed CLI activation and connection isolation)");
     if std::env::var_os("DEPLOY_RX_TEST_NOM").is_some() {
         runtime.block_on(concurrent_preparation_preserves_mapping_and_drains_failures(true));
@@ -135,6 +141,7 @@ fn real_nom_in_pty(scenario: &str) {
             },
         )
         .env("RUST_LOG", "info")
+        .env("DISPLAY_SYNC", sync.path())
         .stdin(Stdio::null())
         .stdout(slave.try_clone().unwrap())
         .stderr(slave)
@@ -168,6 +175,9 @@ fn real_nom_in_pty(scenario: &str) {
                         line.starts_with("[running] Build connection") && line.contains("remote-b")
                     })
                     && screen.matches("Dependency Graph").count() >= 3;
+                if three_trees && !saw_three_trees {
+                    std::fs::write(sync.path().join("trees-visible"), []).unwrap();
+                }
                 saw_three_trees |= three_trees;
                 if scenario == "resize" {
                     if !resized && three_trees {
@@ -202,7 +212,12 @@ fn real_nom_in_pty(scenario: &str) {
             panic!("PTY scenario timed out");
         }
     }
-    assert!(child.wait().unwrap().success());
+    let status = child.wait().unwrap();
+    assert!(
+        status.success(),
+        "PTY child failed: {status}\n{}",
+        String::from_utf8_lossy(&transcript)
+    );
     let transcript = String::from_utf8_lossy(&transcript);
     assert!(
         saw_three_trees,
@@ -308,18 +323,14 @@ fn event(name: &str) -> io::Result<()> {
 }
 
 fn wait_for(name: &str) -> io::Result<()> {
-    // The injected hung monitor deliberately consumes the production EOF
-    // timeout before local copies start. Keep that test's barrier longer.
+    // Display handshakes include cycling through all compact pages on resize.
+    // Monitor shutdown is tested separately from concurrency barriers.
     let deadline = Instant::now()
-        + Duration::from_secs(
-            if std::env::var_os("NOM_FAILURE").is_some()
-                || std::env::var_os("DISPLAY_RESIZE").is_some()
-            {
-                20
-            } else {
-                5
-            },
-        );
+        + Duration::from_secs(if std::env::var_os("DISPLAY_SYNC").is_some() {
+            20
+        } else {
+            5
+        });
     while !Path::new(name).exists() {
         if Instant::now() >= deadline {
             return Err(io::Error::new(
@@ -470,7 +481,7 @@ fn nix_fixture() -> io::Result<i32> {
                 eprintln!("ordinary {name} diagnostic {index}: 中文 λ \u{1b}]0;do-not-change-title\u{7}ok");
             }
         }
-        if failure == "none" {
+        if failure == "none" && std::env::var_os("CONCURRENCY_CASE").is_some() {
             if std::env::var_os("CONNECTION_CASE").is_some() {
                 // A hostname-only, user-only, or options-only connection key
                 // serializes one of these independent chains and times out.
@@ -490,9 +501,14 @@ fn nix_fixture() -> io::Result<i32> {
                 }
             }
         }
-        if let Some(sync) = std::env::var_os("DISPLAY_RESIZE") {
-            if matches!(name, "a1" | "local") {
-                wait_for(Path::new(&sync).join("resized").to_str().unwrap())?;
+        if let Some(sync) = std::env::var_os("DISPLAY_SYNC") {
+            if matches!(name, "a1" | "b" | "local") {
+                // Keep the trees alive until the PTY reader observes them,
+                // independently of how long local signing and copies take.
+                wait_for(Path::new(&sync).join("trees-visible").to_str().unwrap())?;
+                if std::env::var_os("DISPLAY_RESIZE").is_some() {
+                    wait_for(Path::new(&sync).join("resized").to_str().unwrap())?;
+                }
             }
         }
         let scale = if std::env::var_os("DISPLAY_DEMO").is_some() {
@@ -540,7 +556,7 @@ fn nix_fixture() -> io::Result<i32> {
         )?;
         event(&format!("copy.{name}.start"))?;
         eprintln!("copy {name}: transferring closures");
-        if failure == "none" && name == "local" {
+        if failure == "none" && name == "local" && std::env::var_os("CONCURRENCY_CASE").is_some() {
             wait_for("copy.other.start")?;
         }
         std::thread::sleep(Duration::from_millis(
@@ -1328,10 +1344,12 @@ async fn concurrent_preparation_preserves_mapping_and_drains_failures(build_tree
             let closures = result.unwrap();
             assert_eq!(closures, expected_closures);
             let events = std::fs::read_to_string(fixture.join("events")).unwrap();
-            before(&events, "build.b.start", "build.a1.end");
-            before(&events, "build.local.start", "build.a1.end");
-            before(&events, "copy.local.start", "build.b.end");
-            before(&events, "copy.other.start", "copy.local.end");
+            if !build_tree {
+                before(&events, "build.b.start", "build.a1.end");
+                before(&events, "build.local.start", "build.a1.end");
+                before(&events, "copy.local.start", "build.b.end");
+                before(&events, "copy.other.start", "copy.local.end");
+            }
             before(&events, "check.a1", "sign.remote-a1-profile.start");
             before(&events, "sign.remote-a1-profile.end", "build.a2.start");
             before(&events, "check.a2", "sign.remote-a2-profile.start");
