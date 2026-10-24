@@ -317,7 +317,7 @@ pub(crate) fn finish(id: usize, result: &str) {
 /// PTY provides dimensions to nom; stdin remains its isolated JSON pipe.
 pub(crate) fn nom_terminal(id: usize) -> io::Result<(Arc<AsyncFd<File>>, Stdio)> {
     let (rows, cols) = dimensions();
-    let size = libc::winsize {
+    let mut size = libc::winsize {
         ws_row: rows,
         ws_col: cols.saturating_sub(1),
         ws_xpixel: 0,
@@ -329,8 +329,8 @@ pub(crate) fn nom_terminal(id: usize) -> io::Result<(Arc<AsyncFd<File>>, Stdio)>
             &mut master,
             &mut slave,
             std::ptr::null_mut(),
-            std::ptr::null(),
-            &size,
+            std::ptr::null_mut(),
+            &raw mut size,
         )
     } != 0
     {

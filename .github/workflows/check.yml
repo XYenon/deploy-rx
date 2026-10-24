@@ -32,6 +32,16 @@ jobs:
             cargo test --test remote_sessions -- --ignored
           '
 
+  darwin:
+    name: Darwin build
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@main
+      - uses: DeterminateSystems/determinate-nix-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+      - name: Build deploy-rx
+        run: nix build -L .#packages.aarch64-darwin.default
+
   get-matrix:
     name: Get matrix
     runs-on: ubuntu-latest

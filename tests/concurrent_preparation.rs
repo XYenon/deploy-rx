@@ -91,7 +91,7 @@ fn main() {
 
 fn real_nom_in_pty(scenario: &str) {
     let (mut master, mut slave) = (-1, -1);
-    let size = libc::winsize {
+    let mut size = libc::winsize {
         ws_row: 50,
         ws_col: 120,
         ws_xpixel: 0,
@@ -103,8 +103,8 @@ fn real_nom_in_pty(scenario: &str) {
                 &mut master,
                 &mut slave,
                 std::ptr::null_mut(),
-                std::ptr::null(),
-                &size,
+                std::ptr::null_mut(),
+                &raw mut size,
             )
         },
         0
