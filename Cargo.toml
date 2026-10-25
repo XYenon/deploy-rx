@@ -53,7 +53,7 @@ serde_json = "1.0.140"
 shlex = "2.0"
 signal-hook = "0.4"
 thiserror = "2.0"
-tokio = { version = "1.44.2", features = [ "process", "macros", "sync", "rt-multi-thread", "fs", "time", "io-util", "io-std", "net" ] }
+tokio = { version = "1.44.2", features = [ "process", "macros", "sync", "rt-multi-thread", "fs", "time", "io-util", "io-std" ] }
 toml = "1.0"
 whoami = "2.0"
 yn = "0.1"
@@ -61,18 +61,10 @@ rpassword = "7.5.0"
 unescape = "0.1.0"
 dix = "2.2.0"
 tempfile = "3"
-vt100 = "0.18"
 
 [lib]
 name = "deploy"
 path = "src/lib.rs"
-
-# This test executable also runs the Nix/SSH subprocess fixtures by argv[0].
-# It is excluded from the published package along with the rest of tests/.
-[[test]]
-name = "concurrent_preparation"
-path = "tests/concurrent_preparation.rs"
-harness = false
 
 [profile.release]
 lto = true

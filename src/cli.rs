@@ -17,7 +17,7 @@ use log::{debug, info, warn};
 use serde::Serialize;
 use std::ffi::OsStr;
 use std::path::PathBuf;
-use std::process::Stdio;
+use std::process::{Command as StdCommand, Stdio};
 use thiserror::Error;
 use tokio::process::Command;
 
@@ -225,7 +225,7 @@ async fn command_exists(command: &str, path: Option<&OsStr>) -> std::io::Result<
 }
 
 async fn run_check_command(
-    check_command: Command,
+    mut check_command: Command,
     build_tree: bool,
 ) -> Result<(), CheckDeploymentError> {
     debug!("check command: {:?}", check_command);
@@ -245,10 +245,72 @@ async fn run_check_command(
                 "Build tree visualization requested for checks but `nom` is not available in PATH; falling back to regular check logs"
             );
         } else {
-            command::Command::new(check_command)
-                .run_with_tree::<NixCheckError>("Check", Stdio::null())
-                .await?;
-            return Ok(());
+            check_command
+                .arg("--log-format")
+                .arg("internal-json")
+                .arg("--verbose")
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped());
+
+            let (nix_status, nom_status) =
+                tokio::task::spawn_blocking(move || -> Result<_, CheckDeploymentError> {
+                    let mut nix_child = check_command.into_std().spawn().map_err(|err| {
+                        CheckDeploymentError::NixCheck(command::CommandError::RunError(err))
+                    })?;
+
+                    let nix_stderr = nix_child.stderr.take().ok_or_else(|| {
+                        CheckDeploymentError::NixCheck(command::CommandError::RunError(
+                            std::io::Error::other("failed to capture nix check stderr for nom"),
+                        ))
+                    })?;
+
+                    let mut nom_command = StdCommand::new("nom");
+                    if let Some(path) = path {
+                        nom_command.env("PATH", path);
+                    }
+
+                    let nom_status = nom_command
+                        .arg("--json")
+                        .stdin(Stdio::from(nix_stderr))
+                        .stdout(Stdio::inherit())
+                        .stderr(Stdio::inherit())
+                        .status()
+                        .map_err(|err| {
+                            CheckDeploymentError::NixCheck(command::CommandError::RunError(err))
+                        })?;
+
+                    let nix_status = nix_child.wait().map_err(|err| {
+                        CheckDeploymentError::NixCheck(command::CommandError::RunError(err))
+                    })?;
+
+                    Ok((nix_status, nom_status))
+                })
+                .await
+                .map_err(|err| {
+                    CheckDeploymentError::NixCheck(command::CommandError::RunError(
+                        std::io::Error::other(format!(
+                            "failed waiting for check build tree process: {}",
+                            err
+                        )),
+                    ))
+                })??;
+
+            if nom_status.code() != Some(0) {
+                warn!(
+                    "`nom` exited with status {:?}; continuing based on Nix check result",
+                    nom_status.code()
+                );
+            }
+
+            return match nix_status.code() {
+                Some(0) => Ok(()),
+                a => Err(CheckDeploymentError::NixCheck(
+                    command::CommandError::RunError(std::io::Error::other(format!(
+                        "nix check piped to nom resulted in a bad exit code: {:?}",
+                        a
+                    ))),
+                )),
+            };
         }
     }
 
@@ -951,6 +1013,18 @@ async fn run_deploy(
         build_tree,
     };
 
+    let push_profile_datas = make_push_profile_datas(&parts, &push_profile_data_options);
+    let closures = deploy::push::build_profiles(&push_profile_datas)
+        .await
+        .map_err(|e| {
+            let node_names = push_profile_datas
+                .iter()
+                .map(|d| d.deploy_data.node_name.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            RunDeployError::BuildProfile(node_names, e)
+        })?;
+
     let ssh_multiplexer = if ssh_multiplexing {
         let multiplexer = deploy::ssh::SshMultiplexer::new();
 
@@ -981,30 +1055,19 @@ async fn run_deploy(
 
     let push_profile_datas = make_push_profile_datas(&parts, &push_profile_data_options);
 
-    // Activation is a barrier: no profile starts until every build, validation,
-    // signature and copy has succeeded and all concurrent work has settled.
-    let prepared = deploy::push::build_and_push_profiles(&push_profile_datas).await;
-    let closures = match prepared {
-        Ok(closures) => closures,
-        Err(e) => {
-            if let Some(multiplexer) = &ssh_multiplexer {
-                multiplexer.close_all().await;
-            }
-            let node_names = e.node_context().map(str::to_string).unwrap_or_else(|| {
-                push_profile_datas
-                    .iter()
-                    .map(|d| d.deploy_data.node_name.to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            });
-            return Err(match e {
-                deploy::push::PushProfileError::CopyGroup { .. } => {
-                    RunDeployError::PushProfile(node_names, e)
-                }
-                _ => RunDeployError::BuildProfile(node_names, e),
-            });
+    if let Err(e) = deploy::push::push_profiles(&push_profile_datas, &closures).await {
+        if let Some(multiplexer) = &ssh_multiplexer {
+            multiplexer.close_all().await;
         }
-    };
+        let node_names = e.node_context().map(str::to_string).unwrap_or_else(|| {
+            push_profile_datas
+                .iter()
+                .map(|d| d.deploy_data.node_name.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        });
+        return Err(RunDeployError::PushProfile(node_names, e));
+    }
 
     let activation = async {
         let mut succeeded: Vec<(
