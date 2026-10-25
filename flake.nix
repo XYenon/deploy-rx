@@ -39,18 +39,7 @@
           cargoLock.lockFile = ./Cargo.lock;
 
           nativeBuildInputs = [ final.makeWrapper final.installShellFiles ];
-          nativeCheckInputs = [ final.nix-output-monitor final.bashInteractive ];
-
-          env = {
-            DEPLOY_RX_TEST_NOM = "${final.nix-output-monitor}/bin/nom";
-            DEPLOY_RX_TEST_DRV = (final.runCommand "display-shared-workload" { } "touch $out").drvPath;
-            DEPLOY_RX_TEST_PROFILE = final.runCommand "preparation-test-profiles" { } ''
-              for profile in local-profile dev-profile shared-profile; do
-                mkdir -p "$out/$profile"
-                touch "$out/$profile/deploy-rx-activate" "$out/$profile/activate-rs"
-              done
-            '';
-          };
+          nativeCheckInputs = [ final.bashInteractive ];
 
           postInstall = final.lib.optionalString (final.stdenv.buildPlatform.canExecute final.stdenv.hostPlatform) ''
             installShellCompletion --cmd deploy \
