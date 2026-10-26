@@ -59,7 +59,7 @@ whoami = "2.0"
 yn = "0.1"
 rpassword = "7.5.0"
 unescape = "0.1.0"
-dix = "2.2.0"
+dix = "3.0.0"
 tempfile = "3"
 
 [lib]
