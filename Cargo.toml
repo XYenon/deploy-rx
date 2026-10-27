@@ -8,7 +8,7 @@ version = "0.1.0"
 authors = ["notgne2 <gen2@gen2.space>", "Serokell <hi@serokell.io>", "XYenon <i@xyenon.bid>"]
 edition = "2018"
 resolver = "3"
-rust-version = "1.95"
+rust-version = "1.97"
 description = "An extended multi-profile Nix-flake deployment tool."
 license = "MPL-2.0"
 repository = "https://github.com/XYenon/deploy-rx"
@@ -59,7 +59,7 @@ whoami = "2.0"
 yn = "0.1"
 rpassword = "7.5.0"
 unescape = "0.1.0"
-dix = "2.2.0"
+dix = { version = "3.0.0", default-features = false, features = [ "store" ] }
 tempfile = "3"
 
 [lib]
