@@ -38,7 +38,8 @@
 
           cargoLock.lockFile = ./Cargo.lock;
 
-          nativeBuildInputs = [ final.makeWrapper final.installShellFiles ];
+          nativeBuildInputs = [ final.makeWrapper final.installShellFiles final.pkg-config ];
+          buildInputs = [ final.sqlite ];
           nativeCheckInputs = [ final.bashInteractive ];
 
           postInstall = final.lib.optionalString (final.stdenv.buildPlatform.canExecute final.stdenv.hostPlatform) ''

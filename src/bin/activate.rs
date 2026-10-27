@@ -538,9 +538,23 @@ fn render_dry_diff(profile_path: &str, new_closure: &str) -> Result<String, DryD
     writeln!(&mut output, "Derivation changes for {}:", profile_path).unwrap();
 
     // Use dix for the diff
-    let report = dix::query_diff_report(&old_generation, &new_generation, true)
+    let store = dix::Store::open();
+    let old_snapshot = store
+        .query_snapshot_document(&old_generation)
         .map_err(|e| DryDiffError::DiffReport(e.to_string()))?;
-    dix::write_diff_report(&mut output, &report).map_err(DryDiffError::WriteDiff)?;
+    let new_snapshot = store
+        .query_snapshot_document(&new_generation)
+        .map_err(|e| DryDiffError::DiffReport(e.to_string()))?;
+    let report = dix::diff_store_snapshots(&old_snapshot.snapshot, &new_snapshot.snapshot);
+    dix::write_diff_report(
+        &mut output,
+        &report,
+        dix::RenderOptions {
+            full: true,
+            ..Default::default()
+        },
+    )
+    .map_err(DryDiffError::WriteDiff)?;
 
     Ok(output)
 }

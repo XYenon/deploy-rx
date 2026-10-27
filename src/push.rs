@@ -757,7 +757,7 @@ pub async fn resolve_derivation(data: &PushProfileData<'_>) -> Result<String, Pu
 
     debug!(
         "Finding the deriver of store path for {}",
-        &profile_settings.path
+        profile_settings.path
     );
 
     // `nix-store --query --deriver` doesn't work on invalid paths, so we parse output of show-derivation :(

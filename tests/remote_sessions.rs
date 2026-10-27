@@ -395,6 +395,46 @@ fn success(event: RemoteEvent) {
 
 #[test]
 #[ignore = "requires a writable Nix store"]
+fn dry_diff_reports_version_and_small_size_changes() {
+    for new_name in ["review-package-2.0", "review-package-1.0"] {
+        let fixture = Fixture::new();
+        let next = Fixture::new();
+        let old = fixture.closure("review-package-1.0", "exit 0");
+        let new = next.closure(new_name, &format!("#{}\nexit 0", "x".repeat(16 * 1024)));
+        fixture.set(&old);
+
+        let output = Command::new(env!("CARGO_BIN_EXE_activate"))
+            .args(["dry-diff", &new, "--profile-path"])
+            .arg(&fixture.profile)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let report = String::from_utf8(output.stdout).unwrap();
+        let report: String = report
+            .split("\x1b[")
+            .enumerate()
+            .map(|(index, text)| {
+                if index == 0 {
+                    text
+                } else {
+                    text.split_once('m').unwrap().1
+                }
+            })
+            .collect();
+        assert!(report.contains("review-package"), "{}", report);
+        if new_name == "review-package-2.0" {
+            assert!(report.contains("1.0 -> 2.0"), "{}", report);
+        }
+        assert_eq!(fixture.profile.canonicalize().unwrap(), Path::new(&old));
+    }
+}
+
+#[test]
+#[ignore = "requires a writable Nix store"]
 fn unchanged_deployment_does_not_revoke_an_existing_generation() {
     let fixture = Fixture::new();
     let old = fixture.closure("old", "exit 0");
