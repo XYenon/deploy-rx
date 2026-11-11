@@ -5,14 +5,9 @@
 
 set -euo pipefail
 
-nix_profile="/nix/var/nix/profiles/default"
-
-if [ ! -x "$nix_profile/bin/nix" ]; then
-  echo "Nix is missing; run .agents/setup to install it." >&2
-  exit 1
+if [[ -x "$HOME/.nix-profile/bin/nix" ]]; then
+  export PATH="$HOME/.nix-profile/bin:$PATH"
 fi
 
-# Verify the daemon is ready without doing work that could delay orb resumption.
-# shellcheck disable=SC1091
-source "$nix_profile/etc/profile.d/nix-daemon.sh"
+# Verify the built-in local store without realizing the development shell.
 nix store info >/dev/null
