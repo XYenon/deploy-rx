@@ -27,11 +27,12 @@ use std::process::Stdio;
 use thiserror::Error;
 
 use log::{debug, error, info, warn};
+use yansi::Paint;
 
 use deploy::command;
 use deploy::remote_protocol::{
-    BootstrapRequest, ConfirmRequest, ProfileTarget, RemoteEvent, RemoteOperation, RollbackReceipt,
-    REMOTE_PROTOCOL_VERSION,
+    BootstrapRequest, ConfirmRequest, ProfileTarget, RemoteEvent, RemoteOperation, ReviewChanges,
+    RollbackReceipt, REMOTE_PROTOCOL_VERSION,
 };
 
 /// Remote activation utility for deploy-rx
@@ -101,6 +102,9 @@ pub struct DryDiffOpts {
     /// The profile name
     #[arg(long, requires = "profile_user")]
     profile_name: Option<String>,
+    /// Also show packages whose version did not change
+    #[arg(long)]
+    full: bool,
 }
 
 #[derive(Error, Debug)]
@@ -284,7 +288,7 @@ mod tests {
         get_profile_path, process_deploy_session, resolve_interactive_sudo_password,
         session_error_after_rollback, write_confirmation_file,
     };
-    use deploy::remote_protocol::{ProfileTarget, RemoteDeployRequest};
+    use deploy::remote_protocol::{ProfileTarget, RemoteDeployRequest, ReviewChanges};
     use std::env;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
@@ -298,7 +302,7 @@ mod tests {
                 profile_path: closure.join("unused-profile").display().to_string(),
             },
             profile_user: "root".to_string(),
-            review_changes: false,
+            review_changes: ReviewChanges::Off,
             dry_activate: true,
             boot: false,
             test: false,
@@ -519,7 +523,11 @@ pub enum DryDiffError {
     WriteDiff(std::fmt::Error),
 }
 
-fn render_dry_diff(profile_path: &str, new_closure: &str) -> Result<String, DryDiffError> {
+fn render_dry_diff(
+    profile_path: &str,
+    new_closure: &str,
+    full: bool,
+) -> Result<String, DryDiffError> {
     if !Path::new(&profile_path).exists() {
         return Ok(format!(
             "No existing generation found at {}, skipping derivation diff.\n",
@@ -535,7 +543,8 @@ fn render_dry_diff(profile_path: &str, new_closure: &str) -> Result<String, DryD
         .map_err(DryDiffError::ReadProfile)?;
 
     let mut output = String::new();
-    writeln!(&mut output, "Derivation changes for {}:", profile_path).unwrap();
+    writeln!(&mut output, "{} {}", "<<<".bold(), old_generation.display()).unwrap();
+    writeln!(&mut output, "{} {}", ">>>".bold(), new_generation.display()).unwrap();
 
     // Use dix for the diff
     let store = dix::Store::open();
@@ -546,15 +555,26 @@ fn render_dry_diff(profile_path: &str, new_closure: &str) -> Result<String, DryD
         .query_snapshot_document(&new_generation)
         .map_err(|e| DryDiffError::DiffReport(e.to_string()))?;
     let report = dix::diff_store_snapshots(&old_snapshot.snapshot, &new_snapshot.snapshot);
-    dix::write_diff_report(
+    let hidden = dix::write_diff_report(
         &mut output,
         &report,
         dix::RenderOptions {
-            full: true,
+            full,
             ..Default::default()
         },
     )
     .map_err(DryDiffError::WriteDiff)?;
+
+    if hidden > 0 {
+        writeln!(
+            &mut output,
+            "\n{}: {} hidden {}",
+            "NOTE".bold(),
+            hidden.yellow(),
+            "(--review-changes full to show)".dim()
+        )
+        .unwrap();
+    }
 
     Ok(output)
 }
@@ -562,7 +582,10 @@ fn render_dry_diff(profile_path: &str, new_closure: &str) -> Result<String, DryD
 pub async fn dry_diff(opts: DryDiffOpts) -> Result<(), DryDiffError> {
     let profile_path = get_profile_path(opts.profile_path, opts.profile_user, opts.profile_name)?;
 
-    print!("{}", render_dry_diff(&profile_path, &opts.new_closure)?);
+    print!(
+        "{}",
+        render_dry_diff(&profile_path, &opts.new_closure, opts.full)?
+    );
 
     Ok(())
 }
@@ -1141,8 +1164,12 @@ async fn process_deploy_session(
                 .map_err(|err| SessionError::failed(err.to_string()))?;
     let nonce = random_token().map_err(|err| SessionError::failed(err.to_string()))?;
 
-    if request.review_changes {
-        match render_dry_diff(&profile_path, &request.closure) {
+    if request.review_changes != ReviewChanges::Off {
+        match render_dry_diff(
+            &profile_path,
+            &request.closure,
+            request.review_changes == ReviewChanges::Full,
+        ) {
             Ok(output) => {
                 deploy::write_remote_stderr(output.as_bytes());
             }

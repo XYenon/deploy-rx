@@ -8,7 +8,7 @@
 
 use deploy::remote_protocol::{
     BootstrapRequest, ProfileTarget, RemoteDeployRequest, RemoteEvent, RemoteOperation,
-    RemoteRevokeRequest, RollbackReceipt, REMOTE_PROTOCOL_VERSION,
+    RemoteRevokeRequest, ReviewChanges, RollbackReceipt, REMOTE_PROTOCOL_VERSION,
 };
 use std::io::Write;
 use std::os::unix::{fs::PermissionsExt, process::CommandExt};
@@ -59,8 +59,39 @@ fn completion_generation_does_not_require_deployment_tools() {
     }
 }
 
+fn completion_values(script: &Path, option: &str, prefix: &str) -> String {
+    let output = Command::new("bash")
+        .args([
+            "--noprofile",
+            "--norc",
+            "-ec",
+            r#"
+source "$1"
+[[ $(complete -p deploy) =~ -F[[:space:]]+([^[:space:]]+) ]]
+callback=${BASH_REMATCH[1]}
+COMP_WORDS=(deploy "$2" "$3")
+COMP_CWORD=2
+"$callback" deploy "$3" "$2"
+printf '%s\n' "${COMPREPLY[@]}"
+"#,
+            "bash",
+        ])
+        .arg(script)
+        .args([option, prefix])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{} {}: {}",
+        option,
+        prefix,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap()
+}
+
 #[test]
-fn bash_completion_suggests_boolean_values() {
+fn bash_completion_suggests_option_values() {
     let root = tempfile::tempdir().unwrap();
     let script = root.path().join("deploy.bash");
     let output = Command::new(env!("CARGO_BIN_EXE_deploy"))
@@ -72,40 +103,22 @@ fn bash_completion_suggests_boolean_values() {
 
     for option in [
         "--build-tree",
-        "--review-changes",
         "--ssh-multiplexing",
         "--rollback-fresh-connection",
     ] {
         for (prefix, expected) in [("", "true\nfalse\n"), ("t", "true\n"), ("f", "false\n")] {
-            let output = Command::new("bash")
-                .args([
-                    "--noprofile",
-                    "--norc",
-                    "-ec",
-                    r#"
-source "$1"
-[[ $(complete -p deploy) =~ -F[[:space:]]+([^[:space:]]+) ]]
-callback=${BASH_REMATCH[1]}
-COMP_WORDS=(deploy "$2" "$3")
-COMP_CWORD=2
-"$callback" deploy "$3" "$2"
-printf '%s\n' "${COMPREPLY[@]}"
-"#,
-                    "bash",
-                ])
-                .arg(&script)
-                .args([option, prefix])
-                .output()
-                .unwrap();
-            assert!(
-                output.status.success(),
-                "{} {}: {}",
-                option,
-                prefix,
-                String::from_utf8_lossy(&output.stderr)
-            );
-            assert_eq!(String::from_utf8(output.stdout).unwrap(), expected);
+            assert_eq!(completion_values(&script, option, prefix), expected);
         }
+    }
+    for (prefix, expected) in [
+        ("", "off\nfiltered\nfull\n"),
+        ("o", "off\n"),
+        ("f", "filtered\nfull\n"),
+    ] {
+        assert_eq!(
+            completion_values(&script, "--review-changes", prefix),
+            expected
+        );
     }
 }
 
@@ -285,7 +298,7 @@ impl Fixture {
                 profile_path: self.profile.display().to_string(),
             },
             profile_user: "unused-without-sudo".into(),
-            review_changes: false,
+            review_changes: ReviewChanges::Off,
             dry_activate: false,
             boot: false,
             test: false,
@@ -393,44 +406,77 @@ fn success(event: RemoteEvent) {
     );
 }
 
+fn dry_diff(profile: &Path, new: &str, full: bool) -> String {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_activate"));
+    command
+        .args(["dry-diff", new, "--profile-path"])
+        .arg(profile);
+    if full {
+        command.arg("--full");
+    }
+    let output = command.output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    strip_ansi(&String::from_utf8(output.stdout).unwrap())
+}
+
 #[test]
 #[ignore = "requires a writable Nix store"]
-fn dry_diff_reports_version_and_small_size_changes() {
-    for new_name in ["review-package-2.0", "review-package-1.0"] {
-        let fixture = Fixture::new();
-        let next = Fixture::new();
-        let old = fixture.closure("review-package-1.0", "exit 0");
-        let new = next.closure(new_name, &format!("#{}\nexit 0", "x".repeat(16 * 1024)));
-        fixture.set(&old);
+fn dry_diff_hides_and_shows_small_size_changes() {
+    let fixture = Fixture::new();
+    let next = Fixture::new();
+    let old = fixture.closure("review-package-1.0", "exit 0");
+    let new = next.closure(
+        "review-package-2.0",
+        &format!("#{}\nexit 0", "x".repeat(16 * 1024)),
+    );
+    fixture.set(&old);
 
-        let output = Command::new(env!("CARGO_BIN_EXE_activate"))
-            .args(["dry-diff", &new, "--profile-path"])
-            .arg(&fixture.profile)
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let report = String::from_utf8(output.stdout).unwrap();
-        let report: String = report
-            .split("\x1b[")
-            .enumerate()
-            .map(|(index, text)| {
-                if index == 0 {
-                    text
-                } else {
-                    text.split_once('m').unwrap().1
-                }
-            })
-            .collect();
-        assert!(report.contains("review-package"), "{}", report);
-        if new_name == "review-package-2.0" {
-            assert!(report.contains("1.0 -> 2.0"), "{}", report);
-        }
-        assert_eq!(fixture.profile.canonicalize().unwrap(), Path::new(&old));
-    }
+    let report = dry_diff(&fixture.profile, &new, false);
+    assert!(
+        report.starts_with(&format!("<<< {}\n>>> {}\n", old, new)),
+        "{}",
+        report
+    );
+    assert!(report.contains("1.0 -> 2.0"), "{}", report);
+    assert!(!report.contains("NOTE:"), "{}", report);
+    assert_eq!(fixture.profile.canonicalize().unwrap(), Path::new(&old));
+
+    let small_old = fixture.closure("review-helper-1.0", "exit 0");
+    let small_new = next.closure(
+        "review-helper-1.0",
+        &format!("#{}\nexit 0", "x".repeat(16 * 1024)),
+    );
+    fixture.set(&small_old);
+
+    let report = dry_diff(&fixture.profile, &small_new, false);
+    assert!(!report.contains("[C.] review-helper"), "{}", report);
+    assert!(
+        report.contains("NOTE: 1 hidden (--review-changes full to show)"),
+        "{}",
+        report
+    );
+
+    let report = dry_diff(&fixture.profile, &small_new, true);
+    assert!(report.contains("[C.] review-helper"), "{}", report);
+    assert!(report.contains("+16.0 KiB"), "{}", report);
+    assert!(!report.contains("NOTE:"), "{}", report);
+}
+
+fn strip_ansi(text: &str) -> String {
+    text.split("\x1b[")
+        .enumerate()
+        .map(|(index, part)| {
+            if index == 0 {
+                part
+            } else {
+                part.split_once('m').map_or("", |(_, rest)| rest)
+            }
+        })
+        .collect()
 }
 
 #[test]

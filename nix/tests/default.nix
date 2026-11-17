@@ -398,9 +398,9 @@ in {
         server.succeed("rm -rf /tmp/review")
         work("deploy -s --build-tree false --review-changes false .#review-baseline -- --offline", timeout=600)
         work("deploy -s --build-tree false .#review-a -- --offline > /tmp/review-on.out 2>&1", timeout=600)
-        client_sh("grep -F 'Derivation changes for ' /tmp/review-on.out")
+        client_sh("grep -F '<<< /nix/store/' /tmp/review-on.out")
         work("deploy -s --build-tree false --review-changes false .#review-b -- --offline > /tmp/review-off.out 2>&1", timeout=600)
-        client_fail("grep -F 'Derivation changes for ' /tmp/review-off.out")
+        client_fail("grep -F '<<< /nix/store/' /tmp/review-off.out")
         server.succeed("grep -Fx b /tmp/review/version")
     '';
   };

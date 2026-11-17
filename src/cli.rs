@@ -12,6 +12,7 @@ use clap_complete::Shell;
 use crate as deploy;
 
 use self::deploy::{command, DeployFlake, ParseFlakeError};
+use crate::remote_protocol::ReviewChanges;
 use futures_util::future::try_join_all;
 use log::{debug, info, warn};
 use serde::Serialize;
@@ -77,8 +78,8 @@ pub struct Opts {
     #[arg(long, action = ArgAction::Set, default_value_t = true)]
     build_tree: bool,
     /// Review derivation changes on the target host before activating profiles
-    #[arg(long, action = ArgAction::Set, default_value_t = true)]
-    review_changes: bool,
+    #[arg(long, value_enum, default_value = "filtered")]
+    review_changes: ReviewChanges,
     /// Extra arguments to be passed to nix build
     #[arg(last = true)]
     extra_build_args: Vec<String>,
@@ -833,7 +834,7 @@ async fn run_deploy(
     ssh_multiplexing: bool,
     rollback_fresh_connection: bool,
     build_tree: bool,
-    review_changes: bool,
+    review_changes: ReviewChanges,
     demarcate_output: bool,
     tags: &[String],
 ) -> Result<(), RunDeployError> {
@@ -1193,16 +1194,35 @@ mod tests {
     }
 
     #[test]
+    fn parses_review_changes_modes() {
+        for (value, expected) in [
+            ("off", ReviewChanges::Off),
+            ("filtered", ReviewChanges::Filtered),
+            ("full", ReviewChanges::Full),
+            ("true", ReviewChanges::Filtered),
+            ("false", ReviewChanges::Off),
+        ] {
+            let opts = Opts::try_parse_from(["deploy", "--review-changes", value, "."]).unwrap();
+            assert_eq!(opts.review_changes, expected, "{value}");
+        }
+
+        let opts = Opts::try_parse_from(["deploy", "."]).unwrap();
+        assert_eq!(opts.review_changes, ReviewChanges::Filtered);
+        assert!(Opts::try_parse_from(["deploy", "--review-changes", "yes", "."]).is_err());
+        assert!(Opts::try_parse_from(["deploy", "--review-changes"]).is_err());
+        assert!(Opts::try_parse_from(["deploy", "--no-review-changes", "."]).is_err());
+    }
+
+    #[test]
     fn boolean_overrides_require_explicit_values() {
         let opts = Opts::try_parse_from(["deploy", "."]).unwrap();
         assert!(opts.build_tree);
-        assert!(opts.review_changes);
+        assert_eq!(opts.review_changes, ReviewChanges::Filtered);
         assert!(opts.ssh_multiplexing);
         assert!(opts.rollback_fresh_connection);
 
         for flag in [
             "--build-tree",
-            "--review-changes",
             "--ssh-multiplexing",
             "--rollback-fresh-connection",
         ] {
@@ -1211,7 +1231,6 @@ mod tests {
                 let expected = value == "true";
                 let actual = match flag {
                     "--build-tree" => opts.build_tree,
-                    "--review-changes" => opts.review_changes,
                     "--ssh-multiplexing" => opts.ssh_multiplexing,
                     "--rollback-fresh-connection" => opts.rollback_fresh_connection,
                     _ => unreachable!(),
@@ -1728,7 +1747,7 @@ mod tests {
             false,
             false,
             false,
-            false,
+            ReviewChanges::Off,
             false,
             &tags,
         )

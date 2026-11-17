@@ -2,12 +2,27 @@
 //
 // SPDX-License-Identifier: MPL-2.0
 
+use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 use crate::sudo::SudoCommand;
 
-pub const REMOTE_PROTOCOL_VERSION: u16 = 3;
+pub const REMOTE_PROTOCOL_VERSION: u16 = 4;
+
+/// How to review derivation changes before activation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum ReviewChanges {
+    /// Do not review derivation changes.
+    #[value(alias = "false")]
+    Off,
+    /// Review changes, hiding packages whose version did not change.
+    #[value(alias = "true")]
+    Filtered,
+    /// Review changes, showing every package.
+    Full,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RollbackReceipt {
@@ -38,7 +53,7 @@ pub struct RemoteDeployRequest {
     pub closure: String,
     pub profile: ProfileTarget,
     pub profile_user: String,
-    pub review_changes: bool,
+    pub review_changes: ReviewChanges,
     pub dry_activate: bool,
     pub boot: bool,
     pub test: bool,
