@@ -59,13 +59,6 @@ let
     exec ${pkgs.nix}/bin/nix "$@"
   '';
 
-  nomWrapper = pkgs.writeShellScript "deploy-rx-test-nom-wrapper" ''
-    set -eu
-    ${pkgs.coreutils}/bin/mkdir -p /tmp/deploy-rx-e2e
-    printf '%s\n' "$*" >> /tmp/deploy-rx-e2e/nom.log
-    exec ${pkgs.nix-output-monitor}/bin/nom "$@"
-  '';
-
   deployWrapper = pkgs.writeShellScript "deploy-rx-test-deploy-wrapper" ''
     exec ${pkgs.deploy-rx.deploy-rx}/bin/deploy --fast-connection true "$@"
   '';
@@ -168,10 +161,8 @@ if True:
       import shlex
 
       workspace = "/root/tmp"
-      raw_deploy_cmd = "${pkgs.deploy-rx.deploy-rx}/bin/.deploy-wrapped"
       ssh_wrapper_source = "${sshWrapper}"
       nix_wrapper_source = "${nixWrapper}"
-      nom_wrapper_source = "${nomWrapper}"
       deploy_wrapper_source = "${deployWrapper}"
 
       def client_sh(command, timeout=900):

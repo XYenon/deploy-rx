@@ -38,7 +38,7 @@
 
           cargoLock.lockFile = ./Cargo.lock;
 
-          nativeBuildInputs = [ final.makeWrapper final.installShellFiles final.pkg-config ];
+          nativeBuildInputs = [ final.installShellFiles final.pkg-config ];
           buildInputs = [ final.sqlite ];
           nativeCheckInputs = [ final.bashInteractive ];
 
@@ -47,11 +47,6 @@
               --bash <("$out/bin/deploy" --generate-completion bash) \
               --zsh <("$out/bin/deploy" --generate-completion zsh) \
               --fish <("$out/bin/deploy" --generate-completion fish)
-          '';
-
-          postFixup = ''
-            wrapProgram "$out/bin/deploy" \
-              --prefix PATH : ${final.lib.makeBinPath [ final."nix-output-monitor" ]}
           '';
 
           meta = {
@@ -234,7 +229,6 @@
             buildPhase = "cargo clippy --all-targets -- --deny warnings";
             doCheck = false;
             installPhase = "touch $out";
-            postFixup = "";
           });
 
           # Enforce `cargo fmt` formatting.

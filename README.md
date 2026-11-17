@@ -21,7 +21,7 @@ cargo install --git https://github.com/XYenon/deploy-rx --locked deploy-rx
 
 Install a local checkout with `cargo install --path . --locked`. After deploy-rx is published on crates.io, you can also use `cargo install --locked deploy-rx`.
 
-Cargo installs `deploy` and the internal `activate` helper in its binary directory, usually `~/.cargo/bin`. Add that directory to your `PATH`. Deployment also requires Nix and SSH. The default build display uses [`nix-output-monitor`](https://github.com/maralorn/nix-output-monitor) (`nom`). Install it or disable the display with `--build-tree false`.
+Cargo installs `deploy` and the internal `activate` helper in its binary directory, usually `~/.cargo/bin`. Add that directory to your `PATH`. Deployment also requires Nix and SSH. The default build display uses [`rom`](https://github.com/manic-systems/rom), which is built into deploy-rx. Disable the display with `--build-tree false`.
 
 The Cargo package includes the Nix transformation embedded in the CLI. It excludes integration tests and their fixtures, which you can run from a checkout using the Nix development shell.
 
@@ -63,7 +63,7 @@ First-class support for deploying [system-manager](https://github.com/numtide/sy
 
 ### Modern Deployment UX
 
-- Nix checks and builds are displayed using `nix-output-monitor` (`nom`). Disable the display with `--build-tree false`.
+- Nix checks and builds are displayed using `rom`. Disable the display with `--build-tree false`.
 - Derivation changes are shown using `dix` before activation. Disable the review with `--review-changes false`.
 - **Batched Nix Evaluation, Builds & Pushes**: Intelligently groups multiple deployment targets from the same flake into a single `nix eval`, batches local builds into one `nix build`, and batches compatible pushes to the same target into one `nix copy`, reducing Nix and SSH overhead for multi-profile deployments.
 
@@ -71,13 +71,13 @@ The `--build-tree`, `--review-changes`, `--ssh-multiplexing`, and `--rollback-fr
 
 Remote profiles build one at a time in deployment order, followed by the local batch. Copies then run one at a time. Profiles activate in deployment order after all builds, checks, signing, and copies succeed.
 
-With the build display enabled, `nom` writes directly to the terminal for each check or build.
+With the build display enabled, `rom` writes directly to the terminal for each check or build.
 
 For the NixOS system profile, `--test` changes the running system while preserving the system profile and boot default. If a later switch fails, rollback restores the previous boot configuration and the previous running system independently.
 
 ### Logs
 
-Application messages use `[deploy LEVEL]`, `[activate LEVEL]`, or `[revoke LEVEL]` on each line. Interactive deployments show the full preview for confirmation. Non-interactive deployments show a short target summary. Remote stderr has a `[node.profile remote]` label by default to identify the target. Nix logs, `nom` trees, and diff output keep their native formatting.
+Application messages use `[deploy LEVEL]`, `[activate LEVEL]`, or `[revoke LEVEL]` on each line. Interactive deployments show the full preview for confirmation. Non-interactive deployments show a short target summary. Remote stderr has a `[node.profile remote]` label by default to identify the target. Nix logs, `rom` trees, and diff output keep their native formatting.
 
 Use `--no-demarcate-output` to leave remote stderr unchanged or `--debug-logs` to show debug messages on the terminal. Use `--log-dir DIR` to save application logs, including remote activation logs, while keeping terminal output concise.
 

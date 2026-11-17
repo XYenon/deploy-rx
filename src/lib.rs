@@ -217,6 +217,7 @@ mod logger_tests {
 pub mod cli;
 pub mod data;
 pub mod deploy;
+pub mod monitor;
 pub mod push;
 pub mod remote_protocol;
 pub mod ssh;

@@ -5,10 +5,8 @@
 use log::{debug, info, warn};
 use rnix::ast::{self, HasEntry};
 use std::collections::HashMap;
-use std::ffi::OsStr;
-use std::io::Read;
 use std::path::Path;
-use std::process::{Command as StdCommand, Stdio};
+use std::process::Stdio;
 use thiserror::Error;
 use tokio::process::Command;
 
@@ -139,132 +137,26 @@ pub struct PushProfileData<'a> {
     pub build_tree: bool,
 }
 
-async fn command_exists(command: &str, path: Option<&OsStr>) -> std::io::Result<bool> {
-    let mut command = Command::new(command);
-    if let Some(path) = path {
-        command.env("PATH", path);
-    }
-
-    match command
-        .arg("--version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .await
-    {
-        Ok(_) => Ok(true),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(err) => Err(std::io::Error::new(
-            err.kind(),
-            format!("failed to check whether `nom` is available: {err}"),
-        )),
-    }
-}
-
 async fn run_build_command(
     mut build_command: Command,
     build_tree: bool,
 ) -> Result<Vec<u8>, PushProfileError> {
     debug!("build command: {:?}", build_command);
 
-    let path = build_command
-        .as_std()
-        .get_envs()
-        .find(|(key, _)| *key == "PATH")
-        .and_then(|(_, value)| value.map(|value| value.to_os_string()));
-
     if build_tree {
-        let nom_available = command_exists("nom", path.as_deref())
+        let command_debug = format!("{:?}", build_command);
+        let output = crate::monitor::run_async(build_command, "build tree process")
             .await
             .map_err(|err| PushProfileError::Build(command::CommandError::RunError(err)))?;
-        if !nom_available {
-            warn!(
-                "Build tree visualization requested but `nom` is not available in PATH; falling back to regular build logs"
-            );
-        } else {
-            build_command
-                .arg("--log-format")
-                .arg("internal-json")
-                .arg("--verbose")
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped());
 
-            let (nix_status, nom_status, stdout) =
-                tokio::task::spawn_blocking(move || -> Result<_, PushProfileError> {
-                    let mut nix_child = build_command.into_std().spawn().map_err(|err| {
-                        PushProfileError::Build(command::CommandError::RunError(err))
-                    })?;
-
-                    let mut nix_stdout = nix_child.stdout.take().ok_or_else(|| {
-                        PushProfileError::Build(command::CommandError::RunError(
-                            std::io::Error::other("failed to capture nix build stdout"),
-                        ))
-                    })?;
-                    let stdout_task = std::thread::spawn(move || {
-                        let mut stdout = Vec::new();
-                        nix_stdout.read_to_end(&mut stdout).map(|_| stdout)
-                    });
-                    let nix_stderr = nix_child.stderr.take().ok_or_else(|| {
-                        PushProfileError::Build(command::CommandError::RunError(
-                            std::io::Error::other("failed to capture nix build stderr for nom"),
-                        ))
-                    })?;
-
-                    let mut nom_command = StdCommand::new("nom");
-                    if let Some(path) = path {
-                        nom_command.env("PATH", path);
-                    }
-
-                    let nom_status = nom_command
-                        .arg("--json")
-                        .stdin(Stdio::from(nix_stderr))
-                        .stdout(Stdio::inherit())
-                        .stderr(Stdio::inherit())
-                        .status()
-                        .map_err(|err| {
-                            PushProfileError::Build(command::CommandError::RunError(err))
-                        })?;
-
-                    let nix_status = nix_child.wait().map_err(|err| {
-                        PushProfileError::Build(command::CommandError::RunError(err))
-                    })?;
-                    let stdout = stdout_task
-                        .join()
-                        .map_err(|_| {
-                            PushProfileError::Build(command::CommandError::RunError(
-                                std::io::Error::other("failed joining nix build stdout reader"),
-                            ))
-                        })?
-                        .map_err(|err| {
-                            PushProfileError::Build(command::CommandError::RunError(err))
-                        })?;
-
-                    Ok((nix_status, nom_status, stdout))
-                })
-                .await
-                .map_err(|err| {
-                    PushProfileError::Build(command::CommandError::RunError(std::io::Error::other(
-                        format!("failed waiting for build tree process: {}", err),
-                    )))
-                })??;
-
-            if nom_status.code() != Some(0) {
-                warn!(
-                    "`nom` exited with status {:?}; continuing based on Nix build result",
-                    nom_status.code()
-                );
-            }
-
-            return match nix_status.code() {
-                Some(0) => Ok(stdout),
-                a => Err(PushProfileError::Build(command::CommandError::RunError(
-                    std::io::Error::other(format!(
-                        "Nix build command resulted in a bad exit code: {:?}",
-                        a
-                    )),
-                ))),
-            };
+        if !output.status.success() {
+            return Err(PushProfileError::Build(command::CommandError::ExitStatus(
+                output.status,
+                command_debug,
+            )));
         }
+
+        return Ok(output.stdout);
     }
 
     build_command
@@ -1783,60 +1675,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn test_command_exists_propagates_probe_errors() {
-        let dir = tempfile::tempdir().unwrap();
-        let bin = dir.path().join("bin");
-        std::fs::create_dir(&bin).unwrap();
-        std::fs::write(bin.join("nom"), "not executable").unwrap();
-
-        let err = command_exists("nom", Some(bin.as_os_str()))
-            .await
-            .unwrap_err();
-
-        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
-        assert!(err
-            .to_string()
-            .contains("failed to check whether `nom` is available"));
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn test_run_build_command_uses_nom_when_available() {
-        let dir = tempfile::tempdir().unwrap();
-        let bin = dir.path().join("bin");
-        std::fs::create_dir(&bin).unwrap();
-        let nix_args = dir.path().join("nix.args");
-        let nom_args = dir.path().join("nom.args");
-
-        write_executable(
-            &bin.join("nix"),
-            &format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\nprintf '{{\"action\":\"msg\"}}\\n' >&2\nexit 0\n",
-                nix_args.display()
-            ),
-        );
-        write_executable(
-            &bin.join("nom"),
-            &format!(
-                "#!/bin/sh\nif [ \"$1\" = --version ]; then exit 0; fi\nprintf '%s\\n' \"$@\" > {}\nwhile IFS= read -r _; do :; done\nexit 0\n",
-                nom_args.display()
-            ),
-        );
-
-        let mut command = Command::new(bin.join("nix"));
-        command.arg("build").env("PATH", &bin);
-        let result = run_build_command(command, true).await;
-
-        result.unwrap();
-        assert!(std::fs::read_to_string(nix_args)
-            .unwrap()
-            .contains("--log-format\ninternal-json\n--verbose"));
-        assert_eq!(std::fs::read_to_string(nom_args).unwrap(), "--json\n");
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn test_run_build_command_falls_back_without_nom() {
+    async fn test_run_build_command_renders_with_rom() {
         let dir = tempfile::tempdir().unwrap();
         let bin = dir.path().join("bin");
         std::fs::create_dir(&bin).unwrap();
@@ -1845,16 +1684,62 @@ mod tests {
         write_executable(
             &bin.join("nix"),
             &format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\nexit 0\n",
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\nprintf '%s\\n' '@nix {{\"action\":\"msg\",\"level\":3,\"msg\":\"hello\"}}' >&2\nprintf 'build-output'\nexit 0\n",
                 nix_args.display()
             ),
         );
 
         let mut command = Command::new(bin.join("nix"));
         command.arg("build").env("PATH", &bin);
-        let result = run_build_command(command, true).await;
+        let result = run_build_command(command, true).await.unwrap();
 
-        result.unwrap();
+        assert_eq!(result, b"build-output");
+        let args = std::fs::read_to_string(nix_args).unwrap();
+        assert!(args.contains("--log-format\ninternal-json"));
+        assert!(!args.contains("--verbose"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_run_build_command_reports_failed_build() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+
+        write_executable(&bin.join("nix"), "#!/bin/sh\nexit 1\n");
+
+        let mut command = Command::new(bin.join("nix"));
+        command.arg("build").env("PATH", &bin);
+        let err = run_build_command(command, true).await.unwrap_err();
+
+        assert!(matches!(
+            err,
+            PushProfileError::Build(command::CommandError::ExitStatus(status, _))
+                if status.code() == Some(1)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_run_build_command_without_tree_inherits_stderr() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let nix_args = dir.path().join("nix.args");
+
+        write_executable(
+            &bin.join("nix"),
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\nprintf 'plain-output'\nexit 0\n",
+                nix_args.display()
+            ),
+        );
+
+        let mut command = Command::new(bin.join("nix"));
+        command.arg("build").env("PATH", &bin);
+        let result = run_build_command(command, false).await.unwrap();
+
+        assert_eq!(result, b"plain-output");
         assert_eq!(std::fs::read_to_string(nix_args).unwrap(), "build\n");
     }
 
