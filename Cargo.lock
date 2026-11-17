@@ -297,6 +297,7 @@ dependencies = [
  "toml",
  "unescape",
  "whoami",
+ "yansi",
  "yn",
 ]
 

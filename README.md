@@ -64,10 +64,11 @@ First-class support for deploying [system-manager](https://github.com/numtide/sy
 ### Modern Deployment UX
 
 - Nix checks and builds are displayed using `rom`. Disable the display with `--build-tree false`.
-- Derivation changes are shown using `dix` before activation. Disable the review with `--review-changes false`.
+- Derivation changes are shown using `dix` before activation. `--review-changes` accepts `off`, `filtered` (default), or `full`. `true` and `false` are aliases for `filtered` and `off`.
+- `filtered` hides packages whose version did not change unless their size changed by at least 1 MiB; `full` shows them.
 - **Batched Nix Evaluation, Builds & Pushes**: Intelligently groups multiple deployment targets from the same flake into a single `nix eval`, batches local builds into one `nix build`, and batches compatible pushes to the same target into one `nix copy`, reducing Nix and SSH overhead for multi-profile deployments.
 
-The `--build-tree`, `--review-changes`, `--ssh-multiplexing`, and `--rollback-fresh-connection` options accept `true` or `false`. All four default to `true`.
+The `--build-tree`, `--ssh-multiplexing`, and `--rollback-fresh-connection` options accept `true` or `false`. All three default to `true`.
 
 Remote profiles build one at a time in deployment order, followed by the local batch. Copies then run one at a time. Profiles activate in deployment order after all builds, checks, signing, and copies succeed.
 

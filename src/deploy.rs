@@ -13,7 +13,7 @@ use tokio::process::Command;
 
 use crate::remote_protocol::{
     BootstrapRequest, ConfirmRequest, ProfileTarget, RemoteDeployRequest, RemoteEvent,
-    RemoteOperation, RemoteRevokeRequest, RollbackReceipt, REMOTE_PROTOCOL_VERSION,
+    RemoteOperation, RemoteRevokeRequest, ReviewChanges, RollbackReceipt, REMOTE_PROTOCOL_VERSION,
 };
 use crate::{DeployDataDefsError, ProfileInfo};
 
@@ -508,7 +508,7 @@ pub async fn deploy_profile(
     boot: bool,
     test: bool,
     rollback_fresh_connection: bool,
-    review_changes: bool,
+    review_changes: ReviewChanges,
     demarcate_output: bool,
 ) -> Result<Option<RollbackReceipt>, DeployProfileError> {
     let action = if dry_activate {
