@@ -15,9 +15,8 @@ use self::deploy::{command, DeployFlake, ParseFlakeError};
 use futures_util::future::try_join_all;
 use log::{debug, info, warn};
 use serde::Serialize;
-use std::ffi::OsStr;
 use std::path::PathBuf;
-use std::process::{Command as StdCommand, Stdio};
+use std::process::Stdio;
 use thiserror::Error;
 use tokio::process::Command;
 
@@ -74,7 +73,7 @@ pub struct Opts {
     /// Use the interactive prompt before deployment
     #[arg(short, long)]
     interactive: bool,
-    /// Show Nix build trees using nix-output-monitor (`nom`) when available
+    /// Show Nix build trees using rom
     #[arg(long, action = ArgAction::Set, default_value_t = true)]
     build_tree: bool,
     /// Review derivation changes on the target host before activating profiles
@@ -201,117 +200,25 @@ pub enum CheckDeploymentError {
     NixCheck(#[from] command::CommandError<NixCheckError>),
 }
 
-async fn command_exists(command: &str, path: Option<&OsStr>) -> std::io::Result<bool> {
-    let mut command = Command::new(command);
-    if let Some(path) = path {
-        command.env("PATH", path);
-    }
-
-    match command
-        .arg("--version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .status()
-        .await
-    {
-        Ok(_) => Ok(true),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(err) => Err(std::io::Error::new(
-            err.kind(),
-            format!("failed to check whether `nom` is available: {err}"),
-        )),
-    }
-}
-
 async fn run_check_command(
-    mut check_command: Command,
+    check_command: Command,
     build_tree: bool,
 ) -> Result<(), CheckDeploymentError> {
     debug!("check command: {:?}", check_command);
 
-    let path = check_command
-        .as_std()
-        .get_envs()
-        .find(|(key, _)| *key == "PATH")
-        .and_then(|(_, value)| value.map(|value| value.to_os_string()));
-
     if build_tree {
-        let nom_available = command_exists("nom", path.as_deref())
+        let command_debug = format!("{:?}", check_command);
+        let output = crate::monitor::run_async(check_command, "check build tree process")
             .await
             .map_err(|err| CheckDeploymentError::NixCheck(command::CommandError::RunError(err)))?;
-        if !nom_available {
-            warn!(
-                "Build tree visualization requested for checks but `nom` is not available in PATH; falling back to regular check logs"
-            );
-        } else {
-            check_command
-                .arg("--log-format")
-                .arg("internal-json")
-                .arg("--verbose")
-                .stdout(Stdio::null())
-                .stderr(Stdio::piped());
 
-            let (nix_status, nom_status) =
-                tokio::task::spawn_blocking(move || -> Result<_, CheckDeploymentError> {
-                    let mut nix_child = check_command.into_std().spawn().map_err(|err| {
-                        CheckDeploymentError::NixCheck(command::CommandError::RunError(err))
-                    })?;
-
-                    let nix_stderr = nix_child.stderr.take().ok_or_else(|| {
-                        CheckDeploymentError::NixCheck(command::CommandError::RunError(
-                            std::io::Error::other("failed to capture nix check stderr for nom"),
-                        ))
-                    })?;
-
-                    let mut nom_command = StdCommand::new("nom");
-                    if let Some(path) = path {
-                        nom_command.env("PATH", path);
-                    }
-
-                    let nom_status = nom_command
-                        .arg("--json")
-                        .stdin(Stdio::from(nix_stderr))
-                        .stdout(Stdio::inherit())
-                        .stderr(Stdio::inherit())
-                        .status()
-                        .map_err(|err| {
-                            CheckDeploymentError::NixCheck(command::CommandError::RunError(err))
-                        })?;
-
-                    let nix_status = nix_child.wait().map_err(|err| {
-                        CheckDeploymentError::NixCheck(command::CommandError::RunError(err))
-                    })?;
-
-                    Ok((nix_status, nom_status))
-                })
-                .await
-                .map_err(|err| {
-                    CheckDeploymentError::NixCheck(command::CommandError::RunError(
-                        std::io::Error::other(format!(
-                            "failed waiting for check build tree process: {}",
-                            err
-                        )),
-                    ))
-                })??;
-
-            if nom_status.code() != Some(0) {
-                warn!(
-                    "`nom` exited with status {:?}; continuing based on Nix check result",
-                    nom_status.code()
-                );
-            }
-
-            return match nix_status.code() {
-                Some(0) => Ok(()),
-                a => Err(CheckDeploymentError::NixCheck(
-                    command::CommandError::RunError(std::io::Error::other(format!(
-                        "nix check piped to nom resulted in a bad exit code: {:?}",
-                        a
-                    ))),
-                )),
-            };
+        if !output.status.success() {
+            return Err(CheckDeploymentError::NixCheck(
+                command::CommandError::ExitStatus(output.status, command_debug),
+            ));
         }
+
+        return Ok(());
     }
 
     command::Command::new(check_command)
@@ -1835,43 +1742,17 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn test_command_exists_propagates_probe_errors() {
-        let dir = tempfile::tempdir().unwrap();
-        let bin = dir.path().join("bin");
-        std::fs::create_dir(&bin).unwrap();
-        std::fs::write(bin.join("nom"), "not executable").unwrap();
-
-        let err = command_exists("nom", Some(bin.as_os_str()))
-            .await
-            .unwrap_err();
-
-        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
-        assert!(err
-            .to_string()
-            .contains("failed to check whether `nom` is available"));
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn test_run_check_command_uses_nom_from_command_path() {
+    async fn test_run_check_command_renders_with_rom() {
         let dir = tempfile::tempdir().unwrap();
         let bin = dir.path().join("bin");
         std::fs::create_dir(&bin).unwrap();
         let nix_args = dir.path().join("nix.args");
-        let nom_args = dir.path().join("nom.args");
 
         write_executable(
             &bin.join("nix"),
             &format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\nprintf '{{\"action\":\"msg\"}}\\n' >&2\nexit 0\n",
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\nprintf '%s\\n' '@nix {{\"action\":\"msg\",\"level\":3,\"msg\":\"hello\"}}' >&2\nexit 0\n",
                 nix_args.display()
-            ),
-        );
-        write_executable(
-            &bin.join("nom"),
-            &format!(
-                "#!/bin/sh\nif [ \"$1\" = --version ]; then exit 0; fi\nprintf '%s\\n' \"$@\" > {}\nwhile IFS= read -r _; do :; done\nexit 0\n",
-                nom_args.display()
             ),
         );
 
@@ -1880,15 +1761,14 @@ mod tests {
 
         run_check_command(command, true).await.unwrap();
 
-        assert!(std::fs::read_to_string(nix_args)
-            .unwrap()
-            .contains("--log-format\ninternal-json\n--verbose"));
-        assert_eq!(std::fs::read_to_string(nom_args).unwrap(), "--json\n");
+        let args = std::fs::read_to_string(nix_args).unwrap();
+        assert!(args.contains("--log-format\ninternal-json"));
+        assert!(!args.contains("--verbose"));
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn test_run_check_command_falls_back_without_nom_in_command_path() {
+    async fn test_run_check_command_without_tree_keeps_plain_output() {
         let dir = tempfile::tempdir().unwrap();
         let bin = dir.path().join("bin");
         std::fs::create_dir(&bin).unwrap();
@@ -1905,7 +1785,7 @@ mod tests {
         let mut command = Command::new(bin.join("nix"));
         command.arg("flake").arg("check").env("PATH", &bin);
 
-        run_check_command(command, true).await.unwrap();
+        run_check_command(command, false).await.unwrap();
 
         assert_eq!(std::fs::read_to_string(nix_args).unwrap(), "flake\ncheck\n");
     }
