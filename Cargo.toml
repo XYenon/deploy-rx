@@ -41,7 +41,7 @@ exclude = [
 clap = { version = "4", features = [ "wrap_help", "derive" ] }
 clap_complete = "4"
 dirs = "7"
-flexi_logger = "0.31"
+flexi_logger = "0.32"
 fork = "0.12"
 futures-util = "0.3.31"
 libc = "0.2"
