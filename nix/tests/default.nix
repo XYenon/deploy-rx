@@ -334,21 +334,21 @@ in {
         work("deploy -s --build-tree false --review-changes false --dry-activate .#mode-aware -- --offline > /tmp/dry-activate.out 2>&1", timeout=600)
         server.succeed("grep -Fx dry /tmp/mode-select/result")
         server.succeed("test ! -e /home/deploy/.local/state/nix/profiles/mode-aware")
-        client_sh("grep -F 'Dry activation completed for `mode-aware.app`' /tmp/dry-activate.out")
+        client_sh("grep -F '[activate | mode-aware.app] Dry activation completed' /tmp/dry-activate.out")
 
       with subtest("boot-selects-boot-script"):
         server.succeed("rm -rf /tmp/mode-select /home/deploy/.local/state/nix/profiles/mode-aware")
         work("deploy -s --build-tree false --review-changes false --boot .#mode-aware -- --offline > /tmp/boot.out 2>&1", timeout=600)
         server.succeed("grep -Fx boot /tmp/mode-select/result")
         server.succeed("test -L /home/deploy/.local/state/nix/profiles/mode-aware")
-        client_sh("grep -F 'Next-boot activation prepared for `mode-aware.app`' /tmp/boot.out")
+        client_sh("grep -F '[activate | mode-aware.app] Next-boot activation prepared' /tmp/boot.out")
 
       with subtest("test-selects-test-script"):
         server.succeed("rm -rf /tmp/mode-select /home/deploy/.local/state/nix/profiles/mode-aware")
         work("deploy -s --build-tree false --review-changes false --test .#mode-aware -- --offline > /tmp/test.out 2>&1", timeout=600)
         server.succeed("grep -Fx test /tmp/mode-select/result")
         server.succeed("test -L /home/deploy/.local/state/nix/profiles/mode-aware")
-        client_sh("grep -F 'Test activation completed for `mode-aware.app`' /tmp/test.out")
+        client_sh("grep -F '[activate | mode-aware.app] Test activation completed' /tmp/test.out")
 
       with subtest("system-manager-profile"):
         server.succeed("rm -rf /tmp/system-manager && mkdir -p /nix/var/nix/profiles/system-manager-profiles")
@@ -390,7 +390,7 @@ in {
         server.succeed("grep -Fx baseline /tmp/multi-rollback/app")
         server.succeed("grep -Fx baseline /tmp/multi-rollback/bad")
         work_fail("deploy -s --build-tree false --review-changes false --targets .#multi-rollback-ok .#multi-rollback-fail -- --offline > /tmp/multi-rollback.out 2>&1", timeout=600)
-        client_sh("grep -F 'Revoking 1 previously deployed profile(s)' /tmp/multi-rollback.out")
+        client_sh("grep -F '[revoke] Rolling back 1 deployed profile' /tmp/multi-rollback.out")
         server.succeed("grep -Fx baseline /tmp/multi-rollback/app")
         server.succeed("grep -Fx baseline /tmp/multi-rollback/bad")
 
@@ -425,7 +425,7 @@ in {
         server.succeed("grep -Fx baseline /tmp/multi-host/a")
         server2.succeed("grep -Fx baseline /tmp/multi-host/b")
         work_fail("deploy -s --build-tree false --review-changes false --targets .#multi-host-a-updated .#multi-host-b-fail -- --offline > /tmp/multi-host-rollback.out 2>&1", timeout=600)
-        client_sh("grep -F 'Revoking 1 previously deployed profile(s)' /tmp/multi-host-rollback.out")
+        client_sh("grep -F '[revoke] Rolling back 1 deployed profile' /tmp/multi-host-rollback.out")
         server.succeed("grep -Fx baseline /tmp/multi-host/a")
         server2.succeed("grep -Fx baseline /tmp/multi-host/b")
     '';

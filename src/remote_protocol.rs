@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 use crate::sudo::SudoCommand;
 
-pub const REMOTE_PROTOCOL_VERSION: u16 = 4;
+pub const REMOTE_PROTOCOL_VERSION: u16 = 5;
 
 /// How to review derivation changes before activation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
@@ -133,10 +133,37 @@ pub struct ConfirmRequest {
     pub profile_user: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RemoteLogLevel {
+    Error,
+    Warn,
+    Info,
+    Debug,
+    Trace,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RemoteLogSource {
+    Activate,
+    Revoke,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum RemoteEvent {
     Hello {
         protocol_version: u16,
+    },
+    Log {
+        level: RemoteLogLevel,
+        source: RemoteLogSource,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        phase: Option<String>,
+        message: String,
+    },
+    RawOutput {
+        text: String,
     },
     AwaitingConfirm {
         session_id: String,
@@ -148,4 +175,52 @@ pub enum RemoteEvent {
         message: String,
         rollback: Option<RollbackReceipt>,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remote_log_event_round_trips_through_json() {
+        let event = RemoteEvent::Log {
+            level: RemoteLogLevel::Warn,
+            source: RemoteLogSource::Activate,
+            phase: Some("confirm".to_string()),
+            message: "Waiting for confirmation".to_string(),
+        };
+
+        let json = serde_json::to_string(&event).unwrap();
+        let decoded: RemoteEvent = serde_json::from_str(&json).unwrap();
+        match decoded {
+            RemoteEvent::Log {
+                level,
+                source,
+                phase,
+                message,
+            } => {
+                assert_eq!(level, RemoteLogLevel::Warn);
+                assert_eq!(source, RemoteLogSource::Activate);
+                assert_eq!(phase.as_deref(), Some("confirm"));
+                assert_eq!(message, "Waiting for confirmation");
+            }
+            other => panic!("expected Log event, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn remote_raw_output_event_round_trips_through_json() {
+        let event = RemoteEvent::RawOutput {
+            text: "<<< /nix/store/old\n>>> /nix/store/new\n".to_string(),
+        };
+
+        let json = serde_json::to_string(&event).unwrap();
+        let decoded: RemoteEvent = serde_json::from_str(&json).unwrap();
+        match decoded {
+            RemoteEvent::RawOutput { text } => {
+                assert_eq!(text, "<<< /nix/store/old\n>>> /nix/store/new\n");
+            }
+            other => panic!("expected RawOutput event, got {:?}", other),
+        }
+    }
 }

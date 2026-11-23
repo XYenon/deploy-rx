@@ -13,7 +13,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use log::{debug, warn};
 use rom::{
     cache::BuildReportCache,
     display::format_log,
@@ -22,6 +21,7 @@ use rom::{
     EngineConfig, FilesystemResolver, Output, RenderConfig, StreamEngine,
 };
 use tokio::process::Command as TokioCommand;
+use tracing::{debug, warn};
 
 const TIMER_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -64,7 +64,7 @@ pub fn run(mut command: Command) -> io::Result<MonitoredCommand> {
 
     if let Err(error) = result {
         if let Err(kill_error) = child.kill() {
-            warn!("failed to stop monitored Nix command: {kill_error}");
+            warn!("Failed to stop monitored Nix command: {kill_error}");
         }
         let _ = child.wait();
         return Err(error);
@@ -72,7 +72,7 @@ pub fn run(mut command: Command) -> io::Result<MonitoredCommand> {
 
     let status = child.wait()?;
     if let Err(error) = monitor.finish(status.success()) {
-        debug!("rom failed to present the Nix build: {error}");
+        debug!("Rom failed to present Nix build: {error}");
     }
 
     Ok(MonitoredCommand {
@@ -142,7 +142,7 @@ impl Monitor {
         let history = match BuildReportCache::default_cache_path() {
             Ok(path) => Some(BuildReportCache::new(path)),
             Err(error) => {
-                debug!("failed to locate rom build history: {error}");
+                debug!("Failed to locate rom build history: {error}");
                 None
             }
         };
@@ -159,7 +159,7 @@ impl Monitor {
         let mut terminal = LiveTerminal::new(io::stderr());
         if dumb || rom::terminal::admission() != Admission::Live {
             if let Err(error) = terminal.retire() {
-                debug!("failed to retire rom terminal: {error}");
+                debug!("Failed to retire rom terminal: {error}");
             }
         }
 
@@ -268,7 +268,7 @@ impl Monitor {
 
         if let Some(history) = &self.history {
             if let Err(error) = self.stream.engine().save_history(history) {
-                debug!("failed to save rom build history: {error}");
+                debug!("Failed to save rom build history: {error}");
             }
         }
         Ok(())

@@ -78,11 +78,11 @@ For the NixOS system profile, `--test` changes the running system while preservi
 
 ### Logs
 
-Application messages use `[deploy LEVEL]`, `[activate LEVEL]`, or `[revoke LEVEL]` on each line. Interactive deployments show the full preview for confirmation. Non-interactive deployments show a short target summary. Remote stderr has a `[node.profile remote]` label by default to identify the target. Nix logs, `rom` trees, and diff output keep their native formatting.
+Terminal logs use `HH:MM:SS LEVEL [phase | target]` (for example `[eval]`, `[build | node.profile]`, `[ssh | user@host]`, `[activate | node.profile]`, and `[revoke | node.profile]`). Interactive deployments show the full TOML plan for confirmation; non-interactive deployments show a short target summary. Remote child output and `dix` derivation diffs are indented with a `│` gutter under the log column by default, while `rom` build trees keep their native formatting.
 
-Use `--no-demarcate-output` to leave remote stderr unchanged or `--debug-logs` to show debug messages on the terminal. Use `--log-dir DIR` to save application logs, including remote activation logs, while keeping terminal output concise.
+Use `--log-format FORMAT` (`auto`, `pretty`, `compact`, or `json`) to control terminal formatting; `auto` uses colored `pretty` output on interactive terminals and uncolored `compact` output when piped. Use `--no-demarcate-output` to omit the `│` prefix on remote output, `--debug-logs` to show debug messages on the terminal, or `--log-dir DIR` to write JSONL application logs (including remote activation logs) to files.
 
-Remote terminal output uses a bounded buffer and may be dropped if the connection stops consuming stderr. This keeps activation deadlines and rollback independent of log delivery. Application logs saved with `--log-dir` are still written to their files.
+Structured remote logs and `dix` diffs are delivered in order over the remote session event stream. Remote child stderr uses a bounded non-blocking buffer and may be dropped if the connection stops consuming stderr, keeping activation timeouts and rollback independent of log delivery. Application logs saved with `--log-dir` are still written to their files.
 
 ### Sudo Configuration
 

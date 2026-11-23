@@ -14,12 +14,12 @@ use crate as deploy;
 use self::deploy::{command, DeployFlake, ParseFlakeError};
 use crate::remote_protocol::ReviewChanges;
 use futures_util::future::try_join_all;
-use log::{debug, info, warn};
 use serde::Serialize;
 use std::path::PathBuf;
 use std::process::Stdio;
 use thiserror::Error;
 use tokio::process::Command;
+use tracing::{debug, info, warn};
 
 fn add_nix_command_and_flakes(cmd: &mut Command) {
     cmd.args([
@@ -87,6 +87,9 @@ pub struct Opts {
     /// Print debug logs to output
     #[arg(short, long)]
     debug_logs: bool,
+    /// Log output format
+    #[arg(long, value_enum, default_value_t = deploy::logging::LogFormat::Auto)]
+    log_format: deploy::logging::LogFormat,
     /// Directory to print logs to (including the background activation process)
     #[arg(long, value_hint = ValueHint::DirPath)]
     log_dir: Option<String>,
@@ -169,7 +172,7 @@ pub struct Opts {
 
 /// Returns if the available Nix installation supports flakes
 async fn test_flake_support(extra_build_args: &[String]) -> Result<bool, std::io::Error> {
-    debug!("Checking for flake support");
+    debug!("Checking Nix flake support");
 
     let mut cmd = Command::new("nix");
     add_nix_command_and_flakes(&mut cmd);
@@ -205,7 +208,7 @@ async fn run_check_command(
     check_command: Command,
     build_tree: bool,
 ) -> Result<(), CheckDeploymentError> {
-    debug!("check command: {:?}", check_command);
+    debug!("Check command: {:?}", check_command);
 
     if build_tree {
         let command_debug = format!("{:?}", check_command);
@@ -236,7 +239,8 @@ async fn check_deployment(
     extra_build_args: &[String],
     build_tree: bool,
 ) -> Result<(), CheckDeploymentError> {
-    info!("Running checks for flake in {}", repo);
+    let _span = tracing::info_span!("phase", phase = "check").entered();
+    info!("Checking flake {}", repo);
 
     let mut check_command = match supports_flakes {
         true => Command::new("nix"),
@@ -255,9 +259,7 @@ async fn check_deployment(
     check_command.args(extra_build_args);
 
     if build_tree && !supports_flakes {
-        warn!(
-            "Build tree visualization currently requires flake-capable nix checks; continuing without tree output"
-        );
+        warn!("Build tree requires flake-capable Nix; continuing without tree output");
     }
 
     run_check_command(check_command, build_tree && supports_flakes).await
@@ -339,6 +341,7 @@ async fn get_deployment_data(
         return Ok(Vec::new());
     }
 
+    let _span = tracing::info_span!("phase", phase = "eval").entered();
     let flakes_str = flakes
         .iter()
         .map(|f| {
@@ -510,7 +513,7 @@ fn print_deployment(
 
     let toml = toml::to_string(&part_map)?;
 
-    info!("The following profiles are going to be deployed:\n{}", toml);
+    info!("Deployment plan:\n{}", toml);
 
     Ok(())
 }
@@ -866,7 +869,7 @@ async fn run_deploy(
             .unwrap_or(false)
             && deploy_defs.sudo.is_some()
         {
-            warn!("Interactive sudo is enabled! Using a sudo password is less secure than correctly configured SSH keys.\nPlease use keys in production environments.");
+            warn!("Interactive sudo enabled; prefer SSH keys in production");
 
             if deploy_defs
                 .sudo
@@ -874,13 +877,9 @@ async fn run_deploy(
                 .map(|sudo| !sudo.is_sudo())
                 .unwrap_or(false)
             {
-                warn!("Custom sudo commands should be configured to accept password input from stdin when using the 'interactive sudo' option. Deployment may fail if the custom command ignores stdin.");
+                warn!("Custom sudo command must accept password from stdin for interactive sudo");
             }
 
-            info!(
-                "You will now be prompted for the sudo password for {}.",
-                node.node_settings.hostname
-            );
             let sudo_password = rpassword::prompt_password(format!(
                 "(sudo for {}) Password: ",
                 node.node_settings.hostname
@@ -922,16 +921,19 @@ async fn run_deploy(
     };
 
     let push_profile_datas = make_push_profile_datas(&parts, &push_profile_data_options);
-    let closures = deploy::push::build_profiles(&push_profile_datas)
-        .await
-        .map_err(|e| {
-            let node_names = push_profile_datas
-                .iter()
-                .map(|d| d.deploy_data.node_name.to_string())
-                .collect::<Vec<_>>()
-                .join(", ");
-            RunDeployError::BuildProfile(node_names, e)
-        })?;
+    let closures = tracing::Instrument::instrument(
+        deploy::push::build_profiles(&push_profile_datas),
+        tracing::info_span!("phase", phase = "build"),
+    )
+    .await
+    .map_err(|e| {
+        let node_names = push_profile_datas
+            .iter()
+            .map(|d| d.deploy_data.node_name.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        RunDeployError::BuildProfile(node_names, e)
+    })?;
 
     let ssh_multiplexer = if ssh_multiplexing {
         let multiplexer = deploy::ssh::SshMultiplexer::new();
@@ -963,7 +965,12 @@ async fn run_deploy(
 
     let push_profile_datas = make_push_profile_datas(&parts, &push_profile_data_options);
 
-    if let Err(e) = deploy::push::push_profiles(&push_profile_datas, &closures).await {
+    if let Err(e) = tracing::Instrument::instrument(
+        deploy::push::push_profiles(&push_profile_datas, &closures),
+        tracing::info_span!("phase", phase = "push"),
+    )
+    .await
+    {
         if let Some(multiplexer) = &ssh_multiplexer {
             multiplexer.close_all().await;
         }
@@ -1012,9 +1019,15 @@ async fn run_deploy(
                             .map(|(data, _, _, _)| data.merged_settings.auto_rollback),
                     );
                     if !to_revoke.is_empty() {
+                        let _revoke_span = tracing::info_span!("phase", phase = "revoke").entered();
                         info!(
-                            "Revoking {} previously deployed profile(s)",
-                            to_revoke.len()
+                            "Rolling back {} deployed {}",
+                            to_revoke.len(),
+                            if to_revoke.len() > 1 {
+                                "profiles"
+                            } else {
+                                "profile"
+                            }
                         );
                         let (revoked, failures) = revoke_all(&to_revoke, |index| {
                             let (deploy_data, deploy_defs, closure, rollback) = &succeeded[index];
@@ -1191,6 +1204,15 @@ mod tests {
         let opts = Opts::try_parse_from(["deploy", "--no-demarcate-output", "."]).unwrap();
 
         assert!(opts.no_demarcate_output);
+    }
+
+    #[test]
+    fn parses_log_format_flag() {
+        let default_opts = Opts::try_parse_from(["deploy", "."]).unwrap();
+        assert_eq!(default_opts.log_format, deploy::logging::LogFormat::Auto);
+
+        let json_opts = Opts::try_parse_from(["deploy", "--log-format", "json", "."]).unwrap();
+        assert_eq!(json_opts.log_format, deploy::logging::LogFormat::Json);
     }
 
     #[test]
@@ -1993,7 +2015,7 @@ pub enum RunError {
     #[error("Error parsing sudo configuration: {0}")]
     SudoParse(#[from] deploy::sudo::SudoParseError),
     #[error("Error initiating logger: {0}")]
-    Logger(#[from] flexi_logger::FlexiLoggerError),
+    Logger(#[from] deploy::logging::InitLoggerError),
     #[error("{0}")]
     RunDeploy(#[from] RunDeployError),
 }
@@ -2013,6 +2035,7 @@ pub async fn run(args: Option<&ArgMatches>) -> Result<(), RunError> {
         opts.debug_logs,
         opts.log_dir.as_deref(),
         &deploy::LoggerType::Deploy,
+        opts.log_format,
     )?;
 
     // Flake support predates store-derivation output selection (`.drv^out`).
@@ -2077,11 +2100,11 @@ pub async fn run(args: Option<&ArgMatches>) -> Result<(), RunError> {
     let do_not_want_flakes = opts.file.is_some();
 
     if !supports_flakes {
-        warn!("A Nix version without flakes support was detected, support for this is work in progress");
+        warn!("Nix without flakes detected; non-flake mode is experimental");
     }
 
     if do_not_want_flakes {
-        warn!("The --file option for deployments without flakes is experimental");
+        warn!("--file without flakes is experimental");
     }
 
     let using_flakes = supports_flakes && !do_not_want_flakes;

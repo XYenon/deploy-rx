@@ -26,7 +26,7 @@ use std::process::Stdio;
 
 use thiserror::Error;
 
-use log::{debug, error, info, warn};
+use tracing::{debug, error, info, warn};
 use yansi::Paint;
 
 use deploy::command;
@@ -154,7 +154,7 @@ pub enum DeactivateError {
 }
 
 pub async fn deactivate(profile_path: &str) -> Result<(), DeactivateError> {
-    warn!("De-activating due to error");
+    warn!("Rolling back due to error");
 
     let mut nix_env_rollback = Command::new("nix-env");
     nix_env_rollback
@@ -166,7 +166,7 @@ pub async fn deactivate(profile_path: &str) -> Result<(), DeactivateError> {
         .await
         .map_err(DeactivateError::Rollback)?;
 
-    debug!("Listing generations");
+    debug!("Listing profile generations");
 
     let mut nix_env_list_generations = Command::new("nix-env");
     nix_env_list_generations
@@ -192,7 +192,7 @@ pub async fn deactivate(profile_path: &str) -> Result<(), DeactivateError> {
         .expect("Expected to get ID from generation entry");
 
     debug!("Removing generation entry {}", last_generation_line);
-    warn!("Removing generation by ID {}", last_generation_id);
+    warn!("Removing generation {}", last_generation_id);
 
     let mut nix_env_delete_generation = Command::new("nix-env");
     nix_env_delete_generation
@@ -205,7 +205,7 @@ pub async fn deactivate(profile_path: &str) -> Result<(), DeactivateError> {
         .await
         .map_err(DeactivateError::DeleteGen)?;
 
-    info!("Attempting to re-activate the last generation");
+    info!("Re-activating previous generation");
 
     let mut re_activate = Command::new(format!("{}/deploy-rx-activate", profile_path));
     re_activate
@@ -645,10 +645,7 @@ fn resolve_interactive_sudo_password<'a>(
 }
 
 fn send_event(event: &RemoteEvent) -> Result<(), Box<dyn std::error::Error>> {
-    let mut stdout = std::io::stdout();
-    serde_json::to_writer(&mut stdout, event)?;
-    stdout.write_all(b"\n")?;
-    stdout.flush()?;
+    deploy::logging::emit_remote_event(event)?;
     Ok(())
 }
 
@@ -851,6 +848,7 @@ async fn command_status_to_stderr(
         }
         None => execution.await,
     };
+    deploy::flush_remote_stderr();
     status.map(|status| status.code())
 }
 
@@ -993,7 +991,7 @@ fn restore_profile_link(profile_path: &str, target: &Path) -> Result<(), String>
 }
 
 async fn delete_profile_generation(profile_path: &str, generation_id: &str) -> Result<(), String> {
-    warn!("Removing generation by ID {}", generation_id);
+    warn!("Removing generation {}", generation_id);
     let mut delete_generation = Command::new("nix-env");
     delete_generation
         .arg("-p")
@@ -1011,7 +1009,7 @@ async fn delete_profile_generation(profile_path: &str, generation_id: &str) -> R
 }
 
 async fn reactivate_profile(profile_path: &str, boot: bool, test: bool) -> Result<(), String> {
-    info!("Attempting to re-activate the last generation");
+    info!("Re-activating previous generation");
     let deploy_rx_activate = Path::new(profile_path).join("deploy-rx-activate");
     let switch_to_configuration = Path::new(profile_path)
         .join("bin")
@@ -1053,7 +1051,7 @@ async fn reactivate_profile(profile_path: &str, boot: bool, test: bool) -> Resul
 }
 
 async fn deactivate_session(profile_path: &str, receipt: &RollbackReceipt) -> Result<(), String> {
-    warn!("De-activating due to error");
+    warn!("Rolling back due to error");
     let session = std::fs::read_to_string(profile_state_path(profile_path, "session"))
         .map_err(|err| format!("failed to read deployment identity: {}", err))?;
     if session != receipt.session_id
@@ -1171,12 +1169,9 @@ async fn process_deploy_session(
             request.review_changes == ReviewChanges::Full,
         ) {
             Ok(output) => {
-                deploy::write_remote_stderr(output.as_bytes());
+                let _ = send_event(&RemoteEvent::RawOutput { text: output });
             }
-            Err(err) => warn!(
-                "Failed to review derivation changes before activation: {}",
-                err
-            ),
+            Err(err) => warn!("Failed to review derivation changes: {}", err),
         }
     }
 
@@ -1305,11 +1300,18 @@ async fn process_deploy_session(
         }
     }
 
-    info!("Activation script completed");
+    info!(
+        "{} completed",
+        if request.dry_activate {
+            "Dry activation script"
+        } else {
+            "Activation script"
+        }
+    );
 
     if request.magic_rollback && !request.boot && !request.dry_activate {
         info!(
-            "Waiting for fresh SSH confirmation (timeout: {}s)",
+            "Waiting for SSH confirmation ({}s timeout)",
             request.confirm_timeout
         );
         let temp_path = PathBuf::from(&request.temp_path);
@@ -1521,7 +1523,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut signals = Signals::new([SIGHUP])?;
     std::thread::spawn(move || {
         for _ in signals.forever() {
-            debug!("Received SIGHUP; ignoring it to keep activation running");
+            debug!("Ignoring SIGHUP to keep activation running");
         }
     });
 
@@ -1532,12 +1534,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         opts.log_dir.as_deref(),
         &match &opts.subcmd {
             SubCommand::Revoke(_) => deploy::LoggerType::Revoke,
-            SubCommand::DryDiff(_) => deploy::LoggerType::Activate,
-            SubCommand::BootstrapSession => deploy::LoggerType::Activate,
-            SubCommand::PrivilegedSession(_) => deploy::LoggerType::Activate,
-            SubCommand::ConfirmSession => deploy::LoggerType::Activate,
-            SubCommand::WriteConfirmation(_) => deploy::LoggerType::Activate,
+            SubCommand::PrivilegedSession(_) => deploy::LoggerType::RemoteSession,
+            SubCommand::DryDiff(_)
+            | SubCommand::BootstrapSession
+            | SubCommand::ConfirmSession
+            | SubCommand::WriteConfirmation(_) => deploy::LoggerType::Activate,
         },
+        deploy::LogFormat::Auto,
     )?;
 
     let r = match opts.subcmd {
