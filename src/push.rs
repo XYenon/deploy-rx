@@ -2,13 +2,13 @@
 //
 // SPDX-License-Identifier: MPL-2.0
 
-use log::{debug, info, warn};
 use rnix::ast::{self, HasEntry};
 use std::collections::HashMap;
 use std::path::Path;
 use std::process::Stdio;
 use thiserror::Error;
 use tokio::process::Command;
+use tracing::{debug, info, warn};
 
 use crate::command;
 
@@ -141,7 +141,7 @@ async fn run_build_command(
     mut build_command: Command,
     build_tree: bool,
 ) -> Result<Vec<u8>, PushProfileError> {
-    debug!("build command: {:?}", build_command);
+    debug!("Build command: {:?}", build_command);
 
     if build_tree {
         let command_debug = format!("{:?}", build_command);
@@ -260,36 +260,44 @@ pub async fn build_profile_remotely(
     data: &PushProfileData<'_>,
     derivation_name: &str,
 ) -> Result<String, PushProfileError> {
-    info!(
-        "Building profile `{}.{}` on remote host",
+    let target = format!(
+        "{}.{}",
         data.deploy_data.node_name, data.deploy_data.profile_name
     );
+    tracing::Instrument::instrument(
+        async move {
+            info!("Building on remote host");
 
-    let (store_address, ssh_opts_str) = remote_store(data)?;
+            let (store_address, ssh_opts_str) = remote_store(data)?;
 
-    // Flake installables retain dynamic string context. With --eval-store,
-    // Nix transfers their derivations to the build host itself.
-    if !derivation_name.starts_with('(') {
-        command::Command::new(make_remote_derivation_copy_command(
-            &store_address,
-            &ssh_opts_str,
-            derivation_name,
-        ))
-        .status()
-        .await
-        .map_err(PushProfileError::Copy)?;
-    }
+            // Flake installables retain dynamic string context. With --eval-store,
+            // Nix transfers their derivations to the build host itself.
+            if !derivation_name.starts_with('(') {
+                command::Command::new(make_remote_derivation_copy_command(
+                    &store_address,
+                    &ssh_opts_str,
+                    derivation_name,
+                ))
+                .status()
+                .await
+                .map_err(PushProfileError::Copy)?;
+            }
 
-    let build_command = make_remote_build_command(
-        &store_address,
-        &ssh_opts_str,
-        derivation_name,
-        data.extra_build_args,
-    );
+            let build_command = make_remote_build_command(
+                &store_address,
+                &ssh_opts_str,
+                derivation_name,
+                data.extra_build_args,
+            );
 
-    let stdout = run_build_command(build_command, data.build_tree && data.supports_flakes).await?;
+            let stdout =
+                run_build_command(build_command, data.build_tree && data.supports_flakes).await?;
 
-    parse_build_json(&stdout, &[derivation_name]).map(|mut paths| paths.remove(0))
+            parse_build_json(&stdout, &[derivation_name]).map(|mut paths| paths.remove(0))
+        },
+        tracing::info_span!("phase", phase = "build", target = %target),
+    )
+    .await
 }
 
 fn make_remote_store_ls_command(store_address: &str, ssh_opts: &str, path: &str) -> Command {
@@ -356,10 +364,12 @@ async fn check_and_sign_remote_profile(
     }
 
     if let Ok(local_key) = std::env::var("LOCAL_KEY") {
-        info!(
-            "Signing key present! Signing profile `{}` for node `{}`",
-            data.deploy_data.profile_name, data.deploy_data.node_name
+        let target = format!(
+            "{}.{}",
+            data.deploy_data.node_name, data.deploy_data.profile_name
         );
+        let _span = tracing::info_span!("target", target = %target).entered();
+        info!("Signing closure");
         command::Command::new(make_remote_sign_command(
             &store_address,
             &ssh_opts,
@@ -647,10 +657,7 @@ pub async fn resolve_derivation(data: &PushProfileData<'_>) -> Result<String, Pu
         .await;
     }
 
-    debug!(
-        "Finding the deriver of store path for {}",
-        profile_settings.path
-    );
+    debug!("Resolving deriver for {}", profile_settings.path);
 
     // `nix-store --query --deriver` doesn't work on invalid paths, so we parse output of show-derivation :(
     let mut show_derivation_command = Command::new("nix");
@@ -737,10 +744,12 @@ pub async fn check_and_sign_profile(
     }
 
     if let Ok(local_key) = std::env::var("LOCAL_KEY") {
-        info!(
-            "Signing key present! Signing profile `{}` for node `{}`",
-            data.deploy_data.profile_name, data.deploy_data.node_name
+        let target = format!(
+            "{}.{}",
+            data.deploy_data.node_name, data.deploy_data.profile_name
         );
+        let _span = tracing::info_span!("target", target = %target).entered();
+        info!("Signing closure");
 
         let mut sign_command = Command::new("nix");
         enable_nix_command(&mut sign_command)
@@ -990,9 +999,7 @@ pub async fn build_profiles_locally(
         })
         .collect();
     if data.build_tree && !data.supports_flakes {
-        warn!(
-            "Build tree visualization currently requires flake-capable nix builds; continuing without tree output"
-        );
+        warn!("Build tree requires flake-capable Nix; continuing without tree output");
     }
 
     // Dynamic flake installables have no textual derivation identity before
@@ -1074,7 +1081,7 @@ pub async fn build_profiles(
             .unwrap_or(false)
         {
             if !data.supports_flakes {
-                warn!("remote builds using non-flake nix are experimental");
+                warn!("Remote builds without flakes are experimental");
             }
             let closure = build_profile_remotely(data, deriver).await?;
             check_and_sign_remote_profile(data, &closure).await?;
@@ -1213,15 +1220,15 @@ pub async fn push_profiles(
             .join(", ");
         let nodes_str = copy_group_nodes(datas, &group);
         let target = format!("ssh://{}@{}", group.key.ssh_user, group.key.hostname);
+        let _span = tracing::info_span!("target", target = %group.key.hostname).entered();
         info!(
-            "Copying {} {} to node `{}`: {}",
+            "Copying {} {}: {}",
             group.indexes.len(),
             if group.indexes.len() > 1 {
                 "profiles"
             } else {
                 "profile"
             },
-            group.key.hostname,
             profiles_str
         );
 

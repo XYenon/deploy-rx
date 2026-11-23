@@ -11,7 +11,9 @@ use deploy::remote_protocol::{
     RemoteRevokeRequest, ReviewChanges, RollbackReceipt, REMOTE_PROTOCOL_VERSION,
 };
 use std::io::Write;
-use std::os::unix::{fs::PermissionsExt, process::CommandExt};
+use std::os::unix::fs::PermissionsExt;
+#[cfg(target_os = "linux")]
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};

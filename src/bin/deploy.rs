@@ -4,8 +4,8 @@
 // SPDX-License-Identifier: MPL-2.0
 
 use deploy::cli;
-use log::error;
 use std::process::ExitCode;
+use tracing::error;
 
 #[tokio::main]
 async fn main() -> ExitCode {

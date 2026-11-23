@@ -41,11 +41,12 @@ exclude = [
 clap = { version = "4", features = [ "wrap_help", "derive" ] }
 clap_complete = "4"
 dirs = "7"
-flexi_logger = "0.32"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "json", "env-filter", "ansi", "time"] }
+tracing-log = "0.2"
 fork = "0.12"
 futures-util = "0.3.31"
 libc = "0.2"
-log = "0.4"
 merge = "0.2.0"
 rnix = "0.15"
 rom = { version = "0.5.0", default-features = false }

@@ -2,7 +2,6 @@
 //
 // SPDX-License-Identifier: MPL-2.0
 
-use log::{debug, info, warn};
 use std::collections::HashMap;
 use std::env;
 use std::hash::{Hash, Hasher};
@@ -13,6 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tokio::process::Command;
 use tokio::sync::Mutex;
+use tracing::{debug, info, warn};
 
 const MAX_RUNTIME_DIR_LEN: usize = 32;
 static SOCKET_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -128,7 +128,8 @@ impl SshControlMaster {
         }
 
         let ssh_addr = self.ssh_addr();
-        info!("Establishing SSH control master to {}", ssh_addr);
+        let _span = tracing::info_span!("phase", phase = "ssh", target = %ssh_addr).entered();
+        info!("Connecting SSH control master");
 
         let mut cmd = Command::new("ssh");
         cmd.arg("-o")
@@ -165,14 +166,17 @@ impl SshControlMaster {
         }
 
         let ssh_addr = self.ssh_addr();
-        debug!("Closing SSH control master to {}", ssh_addr);
+        let _span = tracing::debug_span!("phase", phase = "ssh", target = %ssh_addr).entered();
+        debug!("Closing SSH control master");
 
         let mut cmd = Command::new("ssh");
         cmd.arg("-o")
             .arg(format!("ControlPath={}", self.control_path.display()))
             .arg("-O")
             .arg("exit")
-            .arg(&ssh_addr);
+            .arg(&ssh_addr)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
 
         let _ = cmd.status().await;
         Ok(())

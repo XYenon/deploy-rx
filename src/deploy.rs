@@ -4,18 +4,20 @@
 //
 // SPDX-License-Identifier: MPL-2.0
 
-use log::{info, warn};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::process::Command;
+use tracing::{info, warn};
 
 use crate::remote_protocol::{
     BootstrapRequest, ConfirmRequest, ProfileTarget, RemoteDeployRequest, RemoteEvent,
-    RemoteOperation, RemoteRevokeRequest, ReviewChanges, RollbackReceipt, REMOTE_PROTOCOL_VERSION,
+    RemoteLogLevel, RemoteLogSource, RemoteOperation, RemoteRevokeRequest, ReviewChanges,
+    RollbackReceipt, REMOTE_PROTOCOL_VERSION,
 };
 use crate::{DeployDataDefsError, ProfileInfo};
+use tracing::Instrument;
 
 fn profile_target(profile_info: ProfileInfo) -> ProfileTarget {
     match profile_info {
@@ -133,7 +135,7 @@ fn decode_remote_event_line(
     match serde_json::from_str::<RemoteEvent>(line) {
         Ok(event) => Ok(Some(event)),
         Err(_) if !saw_protocol_event => {
-            info!("Ignoring unexpected remote stdout before protocol started: {line}");
+            tracing::debug!("Ignoring unexpected remote stdout before protocol start: {line}");
             Ok(None)
         }
         Err(source) => Err(RemoteSessionError::DecodeEvent {
@@ -143,17 +145,65 @@ fn decode_remote_event_line(
     }
 }
 
+fn format_raw_output_bytes(
+    bytes: &[u8],
+    prefix: &str,
+    empty_prefix: &str,
+    previous_byte: &mut u8,
+    out: &mut Vec<u8>,
+) {
+    out.clear();
+    for &byte in bytes {
+        if *previous_byte == b'\n' {
+            if byte == b'\n' {
+                out.extend_from_slice(empty_prefix.as_bytes());
+            } else {
+                out.extend_from_slice(prefix.as_bytes());
+            }
+        }
+        out.push(byte);
+        *previous_byte = byte;
+    }
+}
+
+fn write_remote_raw_event(text: &str, demarcate_output: bool, use_ansi: bool) {
+    use std::io::Write as _;
+
+    let mut stderr = std::io::stderr().lock();
+    if demarcate_output {
+        let prefix = crate::logging::format_remote_raw_prefix(use_ansi);
+        let empty_prefix = crate::logging::format_remote_raw_empty_prefix(use_ansi);
+        let mut previous_byte = b'\n';
+        let mut formatted = Vec::with_capacity(text.len());
+        format_raw_output_bytes(
+            text.as_bytes(),
+            &prefix,
+            &empty_prefix,
+            &mut previous_byte,
+            &mut formatted,
+        );
+        let _ = stderr.write_all(&formatted);
+    } else {
+        let _ = stderr.write_all(text.as_bytes());
+    }
+    if !text.is_empty() && !text.ends_with('\n') {
+        let _ = stderr.write_all(b"\n");
+    }
+    let _ = stderr.flush();
+}
+
 async fn forward_remote_output<R, W>(
     mut reader: R,
     mut writer: W,
-    label: &str,
+    use_ansi: bool,
 ) -> std::io::Result<()>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
     const BUFFER_SIZE: usize = 65536;
-    let prefix = format!("[{label}] ");
+    let prefix = crate::logging::format_remote_raw_prefix(use_ansi);
+    let empty_prefix = crate::logging::format_remote_raw_empty_prefix(use_ansi);
 
     let mut buffer = [0_u8; BUFFER_SIZE];
     let mut output = Vec::with_capacity(BUFFER_SIZE);
@@ -165,14 +215,13 @@ where
             return Ok(());
         }
 
-        output.clear();
-        for &byte in &buffer[..bytes_read] {
-            if previous_byte == b'\n' {
-                output.extend_from_slice(prefix.as_bytes());
-            }
-            output.push(byte);
-            previous_byte = byte;
-        }
+        format_raw_output_bytes(
+            &buffer[..bytes_read],
+            &prefix,
+            &empty_prefix,
+            &mut previous_byte,
+            &mut output,
+        );
 
         if let Err(error) = writer.write_all(&output).await {
             // Keep draining the pipe so the remote process cannot block after
@@ -185,17 +234,17 @@ where
 
 async fn forward_optional_remote_stderr(
     stderr: Option<tokio::process::ChildStderr>,
-    label: &str,
 ) -> std::io::Result<()> {
+    let use_ansi = crate::logging::stderr_supports_ansi(crate::logging::LogFormat::Auto);
     match stderr {
-        Some(stderr) => forward_remote_output(stderr, tokio::io::stderr(), label).await,
+        Some(stderr) => forward_remote_output(stderr, tokio::io::stderr(), use_ansi).await,
         None => Ok(()),
     }
 }
 
 fn warn_remote_stderr_error(result: Result<(), std::io::Error>) {
     if let Err(error) = result {
-        warn!("Error while forwarding remote stderr: {}", error);
+        warn!("Remote stderr forwarding failed: {}", error);
     }
 }
 
@@ -304,12 +353,8 @@ async fn confirm_remote_session(data: RemoteConfirmData<'_>) -> Result<(), Remot
                 .map_err(RemoteConfirmError::WriteRequest)?;
 
             let stderr = child.stderr.take();
-            let label = format!(
-                "{}.{} remote",
-                data.deploy_data.node_name, data.deploy_data.profile_name
-            );
             let (status, stderr_result) =
-                tokio::join!(child.wait(), forward_optional_remote_stderr(stderr, &label),);
+                tokio::join!(child.wait(), forward_optional_remote_stderr(stderr));
             warn_remote_stderr_error(stderr_result);
             let status = status.map_err(RemoteConfirmError::Wait)?;
 
@@ -407,12 +452,8 @@ async fn run_remote_operation(
         .ok_or(RemoteSessionError::MissingStdout)?;
     let stderr = child.stderr.take();
 
-    let label = format!(
-        "{}.{} remote",
-        deploy_data.node_name, deploy_data.profile_name
-    );
-    let stderr_task =
-        tokio::spawn(async move { forward_optional_remote_stderr(stderr, &label).await });
+    let label = format!("{}.{}", deploy_data.node_name, deploy_data.profile_name);
+    let stderr_task = tokio::spawn(async move { forward_optional_remote_stderr(stderr).await });
     let session_result = async {
         let mut lines = BufReader::new(stdout).lines();
         let mut finished: Option<(bool, bool, String)> = None;
@@ -437,6 +478,40 @@ async fn run_remote_operation(
                             remote: protocol_version,
                         });
                     }
+                }
+                RemoteEvent::Log {
+                    level,
+                    source,
+                    phase,
+                    message,
+                } => {
+                    let source_str = match source {
+                        RemoteLogSource::Activate => "activate",
+                        RemoteLogSource::Revoke => "revoke",
+                    };
+                    let phase_str = phase.as_deref().unwrap_or(source_str);
+                    match level {
+                        RemoteLogLevel::Error => {
+                            tracing::error!(source = source_str, phase = phase_str, target = %label, "{message}");
+                        }
+                        RemoteLogLevel::Warn => {
+                            tracing::warn!(source = source_str, phase = phase_str, target = %label, "{message}");
+                        }
+                        RemoteLogLevel::Info => {
+                            tracing::info!(source = source_str, phase = phase_str, target = %label, "{message}");
+                        }
+                        RemoteLogLevel::Debug => {
+                            tracing::debug!(source = source_str, phase = phase_str, target = %label, "{message}");
+                        }
+                        RemoteLogLevel::Trace => {
+                            tracing::trace!(source = source_str, phase = phase_str, target = %label, "{message}");
+                        }
+                    }
+                }
+                RemoteEvent::RawOutput { text } => {
+                    let use_ansi =
+                        crate::logging::stderr_supports_ansi(crate::logging::LogFormat::Auto);
+                    write_remote_raw_event(&text, demarcate_output, use_ansi);
                 }
                 RemoteEvent::AwaitingConfirm { session_id, nonce } => {
                     if let Err(err) = confirm_remote_session(RemoteConfirmData {
@@ -486,7 +561,7 @@ async fn run_remote_operation(
 
     match stderr_task.await {
         Ok(stderr_result) => warn_remote_stderr_error(stderr_result),
-        Err(error) => warn!("Remote stderr forwarding task failed: {}", error),
+        Err(error) => warn!("Remote stderr task failed: {}", error),
     }
     session_result
 }
@@ -511,79 +586,71 @@ pub async fn deploy_profile(
     review_changes: ReviewChanges,
     demarcate_output: bool,
 ) -> Result<Option<RollbackReceipt>, DeployProfileError> {
-    let action = if dry_activate {
-        "Dry-activating"
-    } else if boot {
-        "Preparing next-boot activation for"
-    } else if test {
-        "Testing activation of"
-    } else {
-        "Activating"
-    };
-    info!(
-        "{} profile `{}.{}`",
-        action, deploy_data.node_name, deploy_data.profile_name
-    );
+    let target_label = format!("{}.{}", deploy_data.node_name, deploy_data.profile_name);
+    let span = tracing::info_span!("phase", phase = "activate", target = %target_label);
 
-    let temp_path: &Path = match &deploy_data.merged_settings.temp_path {
-        Some(x) => x,
-        None => Path::new("/tmp"),
-    };
+    async move {
+        let action = if dry_activate {
+            "Dry-activating profile"
+        } else if boot {
+            "Preparing next-boot activation"
+        } else if test {
+            "Testing activation"
+        } else {
+            "Activating profile"
+        };
+        info!("{action}");
 
-    let request = RemoteDeployRequest {
-        closure: closure.to_string(),
-        profile: profile_target(deploy_data.get_profile_info()?),
-        profile_user: deploy_defs.profile_user.clone(),
-        review_changes,
-        dry_activate,
-        boot,
-        test,
-        auto_rollback: deploy_data.merged_settings.auto_rollback.unwrap_or(true),
-        magic_rollback: deploy_data.merged_settings.magic_rollback.unwrap_or(true),
-        confirm_timeout: deploy_data.merged_settings.confirm_timeout.unwrap_or(30),
-        activation_timeout: Some(
-            deploy_data
-                .merged_settings
-                .activation_timeout
-                .unwrap_or(240),
-        ),
-        temp_path: temp_path.display().to_string(),
-        debug_logs: deploy_data.debug_logs,
-        log_dir: deploy_data.log_dir.map(|log_dir| log_dir.to_string()),
-    };
+        let temp_path: &Path = match &deploy_data.merged_settings.temp_path {
+            Some(x) => x,
+            None => Path::new("/tmp"),
+        };
 
-    let rollback = run_remote_operation(
-        deploy_data,
-        deploy_defs,
-        RemoteOperation::Deploy(request),
-        rollback_fresh_connection,
-        demarcate_output,
-    )
-    .await?;
+        let request = RemoteDeployRequest {
+            closure: closure.to_string(),
+            profile: profile_target(deploy_data.get_profile_info()?),
+            profile_user: deploy_defs.profile_user.clone(),
+            review_changes,
+            dry_activate,
+            boot,
+            test,
+            auto_rollback: deploy_data.merged_settings.auto_rollback.unwrap_or(true),
+            magic_rollback: deploy_data.merged_settings.magic_rollback.unwrap_or(true),
+            confirm_timeout: deploy_data.merged_settings.confirm_timeout.unwrap_or(30),
+            activation_timeout: Some(
+                deploy_data
+                    .merged_settings
+                    .activation_timeout
+                    .unwrap_or(240),
+            ),
+            temp_path: temp_path.display().to_string(),
+            debug_logs: deploy_data.debug_logs,
+            log_dir: deploy_data.log_dir.map(|log_dir| log_dir.to_string()),
+        };
 
-    if dry_activate {
-        info!(
-            "Dry activation completed for `{}.{}`",
-            deploy_data.node_name, deploy_data.profile_name
-        );
-    } else if boot {
-        info!(
-            "Next-boot activation prepared for `{}.{}`",
-            deploy_data.node_name, deploy_data.profile_name
-        );
-    } else if test {
-        info!(
-            "Test activation completed for `{}.{}`",
-            deploy_data.node_name, deploy_data.profile_name
-        );
-    } else {
-        info!(
-            "Activation completed for `{}.{}`",
-            deploy_data.node_name, deploy_data.profile_name
-        );
+        let rollback = run_remote_operation(
+            deploy_data,
+            deploy_defs,
+            RemoteOperation::Deploy(request),
+            rollback_fresh_connection,
+            demarcate_output,
+        )
+        .await?;
+
+        if dry_activate {
+            info!("Dry activation completed");
+        } else if boot {
+            info!("Next-boot activation prepared");
+        } else if test {
+            info!("Test activation completed");
+        } else {
+            info!("Activation completed");
+        }
+
+        Ok(rollback)
     }
-
-    Ok(rollback)
+    .instrument(span)
+    .await
 }
 
 #[derive(Error, Debug)]
@@ -601,31 +668,41 @@ pub async fn revoke(
     rollback: &RollbackReceipt,
     demarcate_output: bool,
 ) -> Result<(), RevokeProfileError> {
-    let temp_path: &Path = match &deploy_data.merged_settings.temp_path {
-        Some(x) => x,
-        None => Path::new("/tmp"),
-    };
+    let target_label = format!("{}.{}", deploy_data.node_name, deploy_data.profile_name);
+    let span = tracing::info_span!("phase", phase = "revoke", target = %target_label);
 
-    let request = RemoteRevokeRequest {
-        closure: closure.to_string(),
-        profile: profile_target(deploy_data.get_profile_info()?),
-        rollback: rollback.clone(),
-        profile_user: deploy_defs.profile_user.clone(),
-        temp_path: temp_path.display().to_string(),
-        debug_logs: deploy_data.debug_logs,
-        log_dir: deploy_data.log_dir.map(|log_dir| log_dir.to_string()),
-    };
+    async move {
+        info!("Revoking profile");
 
-    run_remote_operation(
-        deploy_data,
-        deploy_defs,
-        RemoteOperation::Revoke(request),
-        true,
-        demarcate_output,
-    )
-    .await?;
+        let temp_path: &Path = match &deploy_data.merged_settings.temp_path {
+            Some(x) => x,
+            None => Path::new("/tmp"),
+        };
 
-    Ok(())
+        let request = RemoteRevokeRequest {
+            closure: closure.to_string(),
+            profile: profile_target(deploy_data.get_profile_info()?),
+            rollback: rollback.clone(),
+            profile_user: deploy_defs.profile_user.clone(),
+            temp_path: temp_path.display().to_string(),
+            debug_logs: deploy_data.debug_logs,
+            log_dir: deploy_data.log_dir.map(|log_dir| log_dir.to_string()),
+        };
+
+        run_remote_operation(
+            deploy_data,
+            deploy_defs,
+            RemoteOperation::Revoke(request),
+            true,
+            demarcate_output,
+        )
+        .await?;
+
+        info!("Revoke completed");
+        Ok(())
+    }
+    .instrument(span)
+    .await
 }
 
 #[cfg(test)]
@@ -763,12 +840,12 @@ mod tests {
 
         let write_input = async move {
             input_writer
-                .write_all(b"first line\nsecond line\nunterminated")
+                .write_all(b"first line\n\nsecond line\nunterminated")
                 .await
                 .unwrap();
             input_writer.shutdown().await.unwrap();
         };
-        let forward = forward_remote_output(input_reader, output_writer, "node.system remote");
+        let forward = forward_remote_output(input_reader, output_writer, false);
         let read_output = async move {
             let mut output = Vec::new();
             output_reader.read_to_end(&mut output).await.unwrap();
@@ -780,7 +857,7 @@ mod tests {
 
         assert_eq!(
             output,
-            "[node.system remote] first line\n[node.system remote] second line\n[node.system remote] unterminated".as_bytes()
+            "               │ first line\n               │\n               │ second line\n               │ unterminated".as_bytes()
         );
     }
 }
